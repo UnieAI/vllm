@@ -5,7 +5,6 @@
 import gc
 import os
 from contextlib import AbstractContextManager, nullcontext
-from types import NoneType
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -630,25 +629,99 @@ class Worker(WorkerBase):
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )
-            if isinstance(
-                output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
-            ):
-                return output
 
-        assert isinstance(output, IntermediateTensors)
-        parallel_config = self.vllm_config.parallel_config
-        assert (
-            parallel_config.distributed_executor_backend != "external_launcher"
-            and not get_pp_group().is_last_rank
-        )
+        if isinstance(output, IntermediateTensors):
+            parallel_config = self.vllm_config.parallel_config
+            assert (
+                parallel_config.distributed_executor_backend != "external_launcher"
+                and not get_pp_group().is_last_rank
+            )
 
-        get_pp_group().send_tensor_dict(
-            output.tensors,
-            all_gather_group=get_tp_group(),
-            all_gather_tensors=all_gather_tensors,
-        )
+            get_pp_group().send_tensor_dict(
+                output.tensors,
+                all_gather_group=get_tp_group(),
+                all_gather_tensors=all_gather_tensors,
+            )
+            output = None
 
-        return None
+        jacobi_ctx = self.model_runner.get_jacobi_refine_ctx()
+        if (
+            forward_pass
+            and self.vllm_config.parallel_config.pipeline_parallel_size > 1
+            and jacobi_ctx is not None
+        ):
+            spec_config = self.vllm_config.speculative_config
+            jacobi_steps = 1
+            if spec_config is not None and spec_config.method == "jacobi":
+                jacobi_steps = max(spec_config.jacobi_steps_per_yield, 1)
+            if jacobi_steps > 1:
+                pp_group = get_pp_group()
+                device = self.model_runner.device
+                for _ in range(jacobi_steps - 1):
+                    all_converged = True
+                    if pp_group.is_last_rank:
+                        state = self.model_runner.execute_model_state
+                        if (
+                            state is not None
+                            and state.spec_decode_metadata is not None
+                            and state.spec_decode_metadata.max_spec_len > 0
+                        ):
+                            refined_ids, all_converged = (
+                                self.model_runner.drafter.refine_drafts(
+                                    self.model_runner.input_batch,
+                                    state.logits,
+                                    state.spec_decode_metadata,
+                                )
+                            )
+                            if not all_converged:
+                                state.spec_decode_metadata.draft_token_ids.copy_(
+                                    refined_ids.to(
+                                        state.spec_decode_metadata.draft_token_ids.dtype
+                                    )
+                                )
+
+                    flag = torch.tensor(
+                        [1 if all_converged else 0],
+                        device=device,
+                        dtype=torch.int32,
+                    )
+                    pp_group.broadcast(flag, src=pp_group.world_size - 1)
+                    if flag.item() == 1:
+                        break
+
+                    draft_token_ids = jacobi_ctx.spec_decode_metadata.draft_token_ids
+                    pp_group.broadcast(
+                        draft_token_ids, src=pp_group.world_size - 1
+                    )
+                    self.model_runner.jacobi_refine_update_inputs()
+
+                    intermediate_tensors = None
+                    if not pp_group.is_first_rank:
+                        tensor_dict = pp_group.recv_tensor_dict(
+                            all_gather_group=get_tp_group(),
+                            all_gather_tensors=all_gather_tensors,
+                        )
+                        assert tensor_dict is not None
+                        intermediate_tensors = IntermediateTensors(tensor_dict)
+
+                    refine_output = self.model_runner.jacobi_refine_forward(
+                        intermediate_tensors
+                    )
+                    if isinstance(refine_output, IntermediateTensors):
+                        parallel_config = self.vllm_config.parallel_config
+                        assert (
+                            parallel_config.distributed_executor_backend
+                            != "external_launcher"
+                            and not pp_group.is_last_rank
+                        )
+                        pp_group.send_tensor_dict(
+                            refine_output.tensors,
+                            all_gather_group=get_tp_group(),
+                            all_gather_tensors=all_gather_tensors,
+                        )
+
+        self.model_runner.clear_jacobi_refine_ctx()
+        return output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()

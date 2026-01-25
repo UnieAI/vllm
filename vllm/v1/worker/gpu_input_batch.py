@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Datastructures defining a GPU input batch
 
+from collections import deque
 from dataclasses import dataclass, field
 from typing import cast
 
@@ -39,7 +40,7 @@ class CachedRequestState:
     output_token_ids: list[int]
 
     jacobi_needs_bootstrap: bool = False
-    jacobi_ngram_pool: list[list[int]] = field(default_factory=list)
+    jacobi_ngram_pool: deque[list[int]] = field(default_factory=deque)
 
     mrope_positions: torch.Tensor | None = None
     mrope_position_delta: int | None = None

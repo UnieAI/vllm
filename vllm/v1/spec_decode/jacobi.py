@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+from collections import deque
+from dataclasses import dataclass
+
 import torch
 
 from vllm.config import VllmConfig
@@ -12,6 +15,12 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 logger = init_logger(__name__)
 
 _SAMPLING_EPS = 1e-5
+
+
+@dataclass
+class JacobiDraftTokenIds:
+    tokens: torch.Tensor
+    lengths: list[int]
 
 
 class JacobiProposer:
@@ -46,11 +55,9 @@ class JacobiProposer:
         self.gate_open = True
         self.probe_counter = 0
 
-        if self.steps_per_yield > 1:
-            logger.warning(
-                "Jacobi steps_per_yield > 1 is not supported in vLLM v1; "
-                "using a single step per iteration."
-            )
+        self._offsets_buf: torch.Tensor | None = None
+        self._idx_buf: torch.Tensor | None = None
+        self._mask_buf: torch.Tensor | None = None
 
     def propose(
         self,
@@ -58,16 +65,30 @@ class JacobiProposer:
         request_states: dict[str, CachedRequestState],
         logits: torch.Tensor,
         spec_decode_metadata: SpecDecodeMetadata | None,
-    ) -> list[list[int]]:
+        return_device: torch.device | None = None,
+    ) -> JacobiDraftTokenIds:
         num_reqs = input_batch.num_reqs
         if not self._use_jacobi_for_decode(input_batch, request_states):
-            return [[] for _ in range(num_reqs)]
+            return JacobiDraftTokenIds(
+                tokens=torch.empty(
+                    (num_reqs, 0),
+                    device=return_device or "cpu",
+                    dtype=torch.int32,
+                ),
+                lengths=[0] * num_reqs,
+            )
 
         if spec_decode_metadata is None:
-            return self._init_drafts(input_batch, request_states)
+            return self._init_drafts(
+                input_batch, request_states, return_device=return_device
+            )
 
         return self._update_drafts(
-            input_batch, request_states, logits, spec_decode_metadata
+            input_batch,
+            request_states,
+            logits,
+            spec_decode_metadata,
+            return_device=return_device,
         )
 
     def _use_jacobi_for_decode(
@@ -114,6 +135,50 @@ class JacobiProposer:
 
         return self.gate_open
 
+    def refine_drafts(
+        self,
+        input_batch: InputBatch,
+        logits: torch.Tensor,
+        spec_decode_metadata: SpecDecodeMetadata,
+    ) -> tuple[torch.Tensor, bool]:
+        num_reqs = input_batch.num_reqs
+        if num_reqs == 0:
+            return torch.empty((0,), device=logits.device, dtype=torch.int32), True
+
+        max_spec_len = spec_decode_metadata.max_spec_len
+        if max_spec_len == 0:
+            return torch.empty((0,), device=logits.device, dtype=torch.int32), True
+
+        target_logits = logits[spec_decode_metadata.target_logits_indices]
+        greedy_flat = target_logits.argmax(dim=-1)
+
+        lengths = torch.tensor(
+            spec_decode_metadata.num_draft_tokens,
+            device=logits.device,
+            dtype=torch.int64,
+        )
+        start_indices = torch.zeros_like(lengths)
+        cu_num_draft_tokens = spec_decode_metadata.cu_num_draft_tokens.to(
+            device=logits.device, dtype=lengths.dtype
+        )
+        if num_reqs > 1:
+            start_indices[1:] = cu_num_draft_tokens[:-1]
+
+        offsets, idx, mask = self._get_index_buffers(
+            num_reqs, max_spec_len, logits.device
+        )
+        idx.copy_(start_indices.unsqueeze(1).expand_as(idx))
+        idx.add_(offsets)
+        torch.lt(offsets, lengths.unsqueeze(1), out=mask)
+        idx.masked_fill_(~mask, 0)
+
+        draft_padded = spec_decode_metadata.draft_token_ids[idx]
+        greedy_padded = greedy_flat[idx]
+        mismatch = (draft_padded != greedy_padded) & mask
+        all_converged = not mismatch.any().item()
+
+        return greedy_flat.to(torch.int32), all_converged
+
     def _is_greedy_sampling(
         self,
         input_batch: InputBatch,
@@ -147,19 +212,21 @@ class JacobiProposer:
         self,
         input_batch: InputBatch,
         request_states: dict[str, CachedRequestState],
-    ) -> list[list[int]]:
-        draft_token_ids: list[list[int]] = []
+        return_device: torch.device | None = None,
+    ) -> JacobiDraftTokenIds:
+        num_reqs = input_batch.num_reqs
+        lengths = [0] * num_reqs
+        max_spec_len = 0
+        use_gpu = return_device is not None and return_device.type == "cuda"
+        drafts = [None] * num_reqs
         for i, req_id in enumerate(input_batch.req_ids):
             req_state = request_states[req_id]
             num_tokens = input_batch.num_tokens_no_spec[i]
             if num_tokens <= input_batch.num_prompt_tokens[i]:
-                draft_token_ids.append([])
                 continue
             if num_tokens <= 0:
-                draft_token_ids.append([])
                 continue
             if num_tokens >= self.max_model_len:
-                draft_token_ids.append([])
                 continue
 
             draft_len = min(
@@ -167,7 +234,6 @@ class JacobiProposer:
                 max(self.max_model_len - num_tokens, 0),
             )
             if draft_len <= 0:
-                draft_token_ids.append([])
                 continue
 
             if self.prefill_random and self.vocab_size > 0:
@@ -184,10 +250,41 @@ class JacobiProposer:
                 )
 
             req_state.jacobi_needs_bootstrap = True
-            req_state.jacobi_ngram_pool.clear()
-            draft_token_ids.append(draft.tolist())
+            if self.ngram_pool_size > 0:
+                req_state.jacobi_ngram_pool = deque(
+                    maxlen=self.ngram_pool_size
+                )
+            else:
+                req_state.jacobi_ngram_pool.clear()
+            if use_gpu:
+                drafts[i] = draft.to(torch.int32)
+            else:
+                drafts[i] = draft.to(torch.int32).cpu()
+            lengths[i] = draft_len
+            if draft_len > max_spec_len:
+                max_spec_len = draft_len
 
-        return draft_token_ids
+        if max_spec_len == 0:
+            return JacobiDraftTokenIds(
+                tokens=torch.empty(
+                    (num_reqs, 0),
+                    device=return_device or "cpu",
+                    dtype=torch.int32,
+                ),
+                lengths=lengths,
+            )
+
+        padded = torch.zeros(
+            (num_reqs, max_spec_len),
+            dtype=torch.int32,
+            device=return_device if use_gpu else "cpu",
+        )
+        for i, draft in enumerate(drafts):
+            if draft is None:
+                continue
+            padded[i, : lengths[i]] = draft
+
+        return JacobiDraftTokenIds(tokens=padded, lengths=lengths)
 
     def _update_drafts(
         self,
@@ -195,10 +292,16 @@ class JacobiProposer:
         request_states: dict[str, CachedRequestState],
         logits: torch.Tensor,
         spec_decode_metadata: SpecDecodeMetadata,
-    ) -> list[list[int]]:
+        return_device: torch.device | None = None,
+    ) -> JacobiDraftTokenIds:
         num_reqs = input_batch.num_reqs
         if num_reqs == 0:
-            return []
+            return JacobiDraftTokenIds(
+                tokens=torch.empty(
+                    (0, 0), device=return_device or "cpu", dtype=torch.int32
+                ),
+                lengths=[],
+            )
 
         target_logits = logits[spec_decode_metadata.target_logits_indices]
         bonus_logits = logits[spec_decode_metadata.bonus_logits_indices]
@@ -207,106 +310,141 @@ class JacobiProposer:
         num_draft_tokens = spec_decode_metadata.num_draft_tokens
         max_spec_len = spec_decode_metadata.max_spec_len
         if max_spec_len == 0:
-            return [[] for _ in range(num_reqs)]
+            return JacobiDraftTokenIds(
+                tokens=torch.empty(
+                    (num_reqs, 0),
+                    device=return_device or "cpu",
+                    dtype=torch.int32,
+                ),
+                lengths=num_draft_tokens,
+            )
 
         lengths = torch.tensor(
-            num_draft_tokens, device=logits.device, dtype=torch.int32
+            num_draft_tokens, device=logits.device, dtype=torch.int64
         )
         start_indices = torch.zeros_like(lengths)
         cu_num_draft_tokens = spec_decode_metadata.cu_num_draft_tokens.to(
-            device=logits.device
+            device=logits.device, dtype=lengths.dtype
         )
         if num_reqs > 1:
             start_indices[1:] = cu_num_draft_tokens[:-1]
 
-        offsets = torch.arange(max_spec_len, device=logits.device, dtype=torch.int32)
-        idx = start_indices.unsqueeze(1) + offsets.unsqueeze(0)
-        mask = offsets.unsqueeze(0) < lengths.unsqueeze(1)
-        idx_safe = torch.where(mask, idx, torch.zeros_like(idx))
+        offsets, idx, mask = self._get_index_buffers(
+            num_reqs, max_spec_len, logits.device
+        )
+        idx.copy_(start_indices.unsqueeze(1).expand_as(idx))
+        idx.add_(offsets)
+        torch.lt(offsets, lengths.unsqueeze(1), out=mask)
+        idx.masked_fill_(~mask, 0)
 
         greedy_flat = target_logits.argmax(dim=-1)
-        draft_padded = draft_token_ids[idx_safe]
-        greedy_padded = greedy_flat[idx_safe]
+        draft_padded = draft_token_ids[idx]
+        greedy_padded = greedy_flat[idx]
 
         mismatch = (draft_padded != greedy_padded) & mask
         has_mismatch = mismatch.any(dim=1)
-        first_mismatch = mismatch.float().argmax(dim=1)
+        first_mismatch = mismatch.float().argmax(dim=1).to(lengths.dtype)
         accepted_lens = torch.where(has_mismatch, first_mismatch, lengths)
-        accepted_lens_cpu = accepted_lens.cpu().tolist()
-        bonus_tokens = bonus_logits.argmax(dim=-1)
+        bonus_tokens = bonus_logits.argmax(dim=-1).to(torch.int64)
+
+        bootstrap_mask = torch.tensor(
+            [
+                request_states[req_id].jacobi_needs_bootstrap
+                for req_id in input_batch.req_ids
+            ],
+            device=logits.device,
+            dtype=torch.bool,
+        )
+
+        safe_lengths = torch.maximum(lengths, torch.ones_like(lengths))
+        shift_indices = accepted_lens.unsqueeze(1) + offsets.unsqueeze(0)
+        clamp_shift = torch.minimum(
+            shift_indices, (safe_lengths - 1).unsqueeze(1)
+        ).to(torch.int64)
+        greedy_shifted = torch.gather(greedy_padded, 1, clamp_shift)
+
+        accept_all_mask = accepted_lens == lengths
+        base_drafts = torch.where(
+            accept_all_mask.unsqueeze(1),
+            bonus_tokens.unsqueeze(1),
+            greedy_shifted,
+        )
+        base_drafts = torch.where(
+            bootstrap_mask.unsqueeze(1), greedy_padded, base_drafts
+        )
+        padded_drafts = torch.where(
+            mask, base_drafts, torch.zeros_like(base_drafts)
+        ).to(torch.int32)
+
+        combined = torch.cat(
+            [accepted_lens.to(torch.int32).unsqueeze(1), padded_drafts], dim=1
+        ).cpu()
+        accepted_lens_cpu = combined[:, 0].tolist()
+        padded_tensor = combined[:, 1:].to(torch.int32)
 
         total_accepted_tokens = 0
         total_drafted_tokens = 0
-        padded_drafts = torch.zeros(
-            (num_reqs, max_spec_len),
-            dtype=torch.int32,
-            device=logits.device,
-        )
-        append_pool = [False] * num_reqs
-
         for i, req_id in enumerate(input_batch.req_ids):
-            req_state = request_states[req_id]
             draft_len = num_draft_tokens[i]
             if draft_len <= 0:
                 continue
 
-            cur_draft = draft_padded[i, :draft_len]
-            greedy_tokens = greedy_padded[i, :draft_len]
-
+            req_state = request_states[req_id]
             if req_state.jacobi_needs_bootstrap:
-                new_draft = greedy_tokens.to(torch.int32)
                 req_state.jacobi_needs_bootstrap = False
-                padded_drafts[i, :draft_len] = new_draft
                 continue
 
             accepted_len = accepted_lens_cpu[i]
-
-            had_rejection = accepted_len < draft_len
             total_accepted_tokens += accepted_len
             total_drafted_tokens += draft_len
 
-            if accepted_len < draft_len:
-                next_token = greedy_tokens[accepted_len : accepted_len + 1]
-                tail_tokens = greedy_tokens[accepted_len + 1 : draft_len]
-                new_draft = (
-                    torch.cat([next_token, tail_tokens], dim=0)
-                    if tail_tokens.numel() > 0
-                    else next_token
-                )
-            else:
-                new_draft = bonus_tokens[i].view(1)
-
-            if had_rejection and self.ngram_pool_size > 0:
-                pool_tail = self._select_ngram_tail(req_state, draft_len - 1)
-                if pool_tail is not None:
-                    pool_tail_tensor = torch.tensor(
-                        pool_tail, dtype=new_draft.dtype, device=self.device
-                    )
-                    new_draft = torch.cat([new_draft[:1], pool_tail_tensor], dim=0)
-
-            new_draft = self._pad_or_truncate(new_draft, draft_len).to(torch.int32)
-
-            padded_drafts[i, :draft_len] = new_draft
             if self.ngram_pool_size > 0:
-                append_pool[i] = True
+                if accepted_len < draft_len:
+                    pool_tail = self._select_ngram_tail(req_state, draft_len - 1)
+                    if pool_tail is not None:
+                        padded_tensor[i, 1:draft_len] = torch.tensor(
+                            pool_tail, dtype=padded_tensor.dtype
+                        )
+                self._append_ngram_pool(
+                    req_state, padded_tensor[i, :draft_len].tolist()
+                )
 
         if self.accept_rate_low is not None:
             self._update_acceptance_rate(total_accepted_tokens, total_drafted_tokens)
 
-        padded_drafts_cpu = padded_drafts.cpu().tolist()
-        if self.ngram_pool_size > 0:
-            for i, req_id in enumerate(input_batch.req_ids):
-                if not append_pool[i]:
-                    continue
-                draft_len = num_draft_tokens[i]
-                if draft_len <= 0:
-                    continue
-                self._append_ngram_pool(
-                    request_states[req_id], padded_drafts_cpu[i][:draft_len]
-                )
-        return [
-            padded_drafts_cpu[i][: num_draft_tokens[i]] for i in range(num_reqs)
-        ]
+        if return_device is not None and return_device.type == "cuda":
+            return JacobiDraftTokenIds(
+                tokens=padded_drafts, lengths=num_draft_tokens
+            )
+        return JacobiDraftTokenIds(tokens=padded_tensor, lengths=num_draft_tokens)
+
+    def _get_index_buffers(
+        self, num_reqs: int, max_spec_len: int, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if (self._offsets_buf is None or self._offsets_buf.device != device
+                or self._offsets_buf.numel() < max_spec_len):
+            self._offsets_buf = torch.arange(
+                max_spec_len, device=device, dtype=torch.int64
+            )
+        offsets = self._offsets_buf[:max_spec_len]
+
+        if (self._idx_buf is None or self._idx_buf.device != device
+                or self._idx_buf.shape[0] < num_reqs
+                or self._idx_buf.shape[1] < max_spec_len):
+            self._idx_buf = torch.empty(
+                (num_reqs, max_spec_len), device=device, dtype=torch.int64
+            )
+        idx = self._idx_buf[:num_reqs, :max_spec_len]
+
+        if (self._mask_buf is None or self._mask_buf.device != device
+                or self._mask_buf.shape[0] < num_reqs
+                or self._mask_buf.shape[1] < max_spec_len):
+            self._mask_buf = torch.empty(
+                (num_reqs, max_spec_len), device=device, dtype=torch.bool
+            )
+        mask = self._mask_buf[:num_reqs, :max_spec_len]
+
+        return offsets, idx, mask
 
     def _pad_or_truncate(self, tokens: torch.Tensor, draft_len: int) -> torch.Tensor:
         if tokens.numel() < draft_len:
@@ -330,9 +468,10 @@ class JacobiProposer:
         if self.ngram_pool_size <= 0:
             return
         pool = req_state.jacobi_ngram_pool
+        if pool.maxlen != self.ngram_pool_size:
+            pool = deque(pool, maxlen=self.ngram_pool_size)
+            req_state.jacobi_ngram_pool = pool
         pool.append(tokens)
-        if len(pool) > self.ngram_pool_size:
-            del pool[0]
 
     def _select_ngram_tail(
         self, req_state: CachedRequestState, length: int

@@ -147,7 +147,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
-from vllm.v1.spec_decode.jacobi import JacobiProposer
+from vllm.v1.spec_decode.jacobi import JacobiDraftTokenIds, JacobiProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -319,6 +319,25 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+
+
+@dataclass
+class JacobiRefineContext:
+    attn_metadata: PerLayerAttnMetadata
+    num_tokens_padded: int
+    num_tokens_across_dp: int
+    cudagraph_mode: CUDAGraphMode
+    batch_desc: BatchDescriptor
+    ubatch_slices_padded: UBatchSlices | None
+    slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+    skip_compiled: bool
+    input_ids: torch.Tensor | None
+    inputs_embeds: torch.Tensor | None
+    positions: torch.Tensor
+    model_kwargs: dict[str, Any]
+    logits_indices: torch.Tensor
+    spec_decode_metadata: SpecDecodeMetadata
+    draft_token_indices: torch.Tensor
 
 
 class GPUModelRunner(
@@ -662,6 +681,7 @@ class GPUModelRunner(
 
         # Cached outputs.
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
+        self._draft_token_ids_lens: list[int] | None = None
         self._draft_token_req_ids: list[str] | None = None
         self.transfer_event = torch.Event()
         self.sampled_token_ids_pinned_cpu = torch.empty(
@@ -702,6 +722,7 @@ class GPUModelRunner(
 
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
+        self._jacobi_refine_ctx: JacobiRefineContext | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
         self.layerwise_nvtx_hooks_registered = False
@@ -1876,6 +1897,144 @@ class GPUModelRunner(
             )
 
         return attn_metadata, spec_decode_common_attn_metadata
+
+    def _maybe_set_jacobi_refine_ctx(
+        self,
+        attn_metadata: PerLayerAttnMetadata,
+        num_tokens_padded: int,
+        num_tokens_across_dp: int,
+        cudagraph_mode: CUDAGraphMode,
+        batch_desc: BatchDescriptor,
+        ubatch_slices_padded: UBatchSlices | None,
+        slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
+        skip_compiled: bool,
+        input_ids: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
+        positions: torch.Tensor,
+        model_kwargs: dict[str, Any],
+        logits_indices: torch.Tensor,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> None:
+        self._jacobi_refine_ctx = None
+        spec_config = self.speculative_config
+        if (
+            spec_config is None
+            or spec_config.method != "jacobi"
+            or self.parallel_config.pipeline_parallel_size <= 1
+        ):
+            return
+        if spec_config.jacobi_steps_per_yield <= 1:
+            return
+        if self.broadcast_pp_output:
+            return
+        if spec_decode_metadata is None or spec_decode_metadata.max_spec_len == 0:
+            return
+        draft_token_indices = spec_decode_metadata.logits_indices[
+            spec_decode_metadata.target_logits_indices + 1
+        ].to(torch.int64)
+        self._jacobi_refine_ctx = JacobiRefineContext(
+            attn_metadata=attn_metadata,
+            num_tokens_padded=num_tokens_padded,
+            num_tokens_across_dp=num_tokens_across_dp,
+            cudagraph_mode=cudagraph_mode,
+            batch_desc=batch_desc,
+            ubatch_slices_padded=ubatch_slices_padded,
+            slot_mappings=slot_mappings,
+            skip_compiled=skip_compiled,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            positions=positions,
+            model_kwargs=model_kwargs,
+            logits_indices=logits_indices,
+            spec_decode_metadata=spec_decode_metadata,
+            draft_token_indices=draft_token_indices,
+        )
+
+    def get_jacobi_refine_ctx(self) -> JacobiRefineContext | None:
+        return self._jacobi_refine_ctx
+
+    def clear_jacobi_refine_ctx(self) -> None:
+        self._jacobi_refine_ctx = None
+
+    def jacobi_refine_update_inputs(self) -> None:
+        ctx = self._jacobi_refine_ctx
+        if ctx is None:
+            return
+        draft_ids = ctx.spec_decode_metadata.draft_token_ids
+        if draft_ids.numel() == 0:
+            return
+        if ctx.input_ids is not None:
+            ctx.input_ids.index_copy_(0, ctx.draft_token_indices, draft_ids)
+            return
+        if ctx.inputs_embeds is None:
+            return
+        refined_embeds = self.model.embed_input_ids(
+            input_ids=draft_ids.to(torch.long)
+        )
+        ctx.inputs_embeds.index_copy_(
+            0,
+            ctx.draft_token_indices,
+            refined_embeds,
+        )
+
+    def jacobi_refine_forward(
+        self, intermediate_tensors: IntermediateTensors | None
+    ) -> IntermediateTensors | None:
+        ctx = self._jacobi_refine_ctx
+        if ctx is None:
+            return None
+        with set_forward_context(
+            ctx.attn_metadata,
+            self.vllm_config,
+            num_tokens=ctx.num_tokens_padded,
+            num_tokens_across_dp=ctx.num_tokens_across_dp,
+            cudagraph_runtime_mode=ctx.cudagraph_mode,
+            batch_descriptor=ctx.batch_desc,
+            ubatch_slices=ctx.ubatch_slices_padded,
+            slot_mapping=ctx.slot_mappings,
+            skip_compiled=ctx.skip_compiled,
+        ):
+            with record_function_or_nullcontext(
+                "gpu_model_runner: jacobi_refine_forward"
+            ):
+                model_output = self._model_forward(
+                    input_ids=ctx.input_ids,
+                    positions=ctx.positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=ctx.inputs_embeds,
+                    **ctx.model_kwargs,
+                )
+
+        if self.broadcast_pp_output:
+            return None
+
+        if not get_pp_group().is_last_rank:
+            assert isinstance(model_output, IntermediateTensors)
+            return model_output
+
+        if self.use_aux_hidden_state_outputs:
+            hidden_states, aux_hidden_states = model_output
+        else:
+            hidden_states = model_output
+            aux_hidden_states = None
+
+        sample_hidden_states = hidden_states[ctx.logits_indices]
+        logits = self.model.compute_logits(sample_hidden_states)
+        if self.execute_model_state is not None:
+            state = self.execute_model_state
+            self.execute_model_state = ExecuteModelState(
+                scheduler_output=state.scheduler_output,
+                logits=logits,
+                spec_decode_metadata=state.spec_decode_metadata,
+                spec_decode_common_attn_metadata=state.spec_decode_common_attn_metadata,
+                hidden_states=hidden_states,
+                sample_hidden_states=sample_hidden_states,
+                aux_hidden_states=aux_hidden_states,
+                ec_connector_output=state.ec_connector_output,
+                cudagraph_stats=state.cudagraph_stats,
+                slot_mappings=state.slot_mappings,
+            )
+        return None
 
     def _compute_cascade_attn_prefix_lens(
         self,
@@ -3466,89 +3625,195 @@ class GPUModelRunner(
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
+        self._maybe_set_jacobi_refine_ctx(
+            attn_metadata=attn_metadata,
+            num_tokens_padded=num_tokens_padded,
+            num_tokens_across_dp=num_tokens_across_dp,
+            cudagraph_mode=cudagraph_mode,
+            batch_desc=batch_desc,
+            ubatch_slices_padded=ubatch_slices_padded,
+            slot_mappings=slot_mappings,
+            skip_compiled=has_encoder_input,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            positions=positions,
+            model_kwargs=model_kwargs,
+            logits_indices=logits_indices,
+            spec_decode_metadata=spec_decode_metadata,
+        )
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
-        with (
-            set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens_padded,
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=cudagraph_mode,
-                batch_descriptor=batch_desc,
-                ubatch_slices=ubatch_slices_padded,
-                slot_mapping=slot_mappings,
-                skip_compiled=has_encoder_input,
-            ),
-            record_function_or_nullcontext("gpu_model_runner: forward"),
-            self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
+        with set_forward_context(
+            attn_metadata,
+            self.vllm_config,
+            num_tokens=num_tokens_padded,
+            num_tokens_across_dp=num_tokens_across_dp,
+            cudagraph_runtime_mode=cudagraph_mode,
+            batch_descriptor=batch_desc,
+            ubatch_slices=ubatch_slices_padded,
+            slot_mapping=slot_mappings,
+            skip_compiled=has_encoder_input,
         ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
-
-        with record_function_or_nullcontext("gpu_model_runner: postprocess"):
-            if self.use_aux_hidden_state_outputs:
-                # True when EAGLE 3 is used.
-                hidden_states, aux_hidden_states = model_output
-            else:
-                # Common case.
-                hidden_states = model_output
-                aux_hidden_states = None
-
-            if not self.broadcast_pp_output:
-                # Common case.
-                if not get_pp_group().is_last_rank:
-                    # Return the intermediate tensors.
-                    assert isinstance(hidden_states, IntermediateTensors)
-                    hidden_states.kv_connector_output = kv_connector_output
-                    self.kv_connector_output = kv_connector_output
-                    return hidden_states
-
-                if self.is_pooling_model:
-                    # Return the pooling output.
-                    return self._pool(
-                        hidden_states,
-                        num_scheduled_tokens,
-                        num_scheduled_tokens_np,
-                        kv_connector_output,
-                    )
-
-                sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
-            else:
-                # Rare case.
-                assert not self.is_pooling_model
-
-                sample_hidden_states = hidden_states[logits_indices]
-                if not get_pp_group().is_last_rank:
-                    all_gather_tensors = {
-                        "residual": not is_residual_scattered_for_sp(
-                            self.vllm_config, num_tokens_padded
+            with self.maybe_get_kv_connector_output(
+                scheduler_output
+            ) as kv_connector_output:
+                def run_forward():
+                    with record_function_or_nullcontext(
+                        "gpu_model_runner: forward"
+                    ):
+                        return self._model_forward(
+                            input_ids=input_ids,
+                            positions=positions,
+                            intermediate_tensors=intermediate_tensors,
+                            inputs_embeds=inputs_embeds,
+                            **model_kwargs,
                         )
-                    }
-                    get_pp_group().send_tensor_dict(
-                        hidden_states.tensors,
-                        all_gather_group=get_tp_group(),
-                        all_gather_tensors=all_gather_tensors,
-                    )
-                    logits = None
-                else:
-                    logits = self.model.compute_logits(sample_hidden_states)
 
-                model_output_broadcast_data: dict[str, Any] = {}
-                if logits is not None:
-                    model_output_broadcast_data["logits"] = logits.contiguous()
+                model_output = run_forward()
 
-                broadcasted = get_pp_group().broadcast_tensor_dict(
-                    model_output_broadcast_data, src=len(get_pp_group().ranks) - 1
-                )
-                assert broadcasted is not None
-                logits = broadcasted["logits"]
+                with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+                    if self.use_aux_hidden_state_outputs:
+                        # True when EAGLE 3 is used.
+                        hidden_states, aux_hidden_states = model_output
+                    else:
+                        # Common case.
+                        hidden_states = model_output
+                        aux_hidden_states = None
+
+                    if not self.broadcast_pp_output:
+                        # Common case.
+                        if not get_pp_group().is_last_rank:
+                            # Return the intermediate tensors.
+                            assert isinstance(hidden_states, IntermediateTensors)
+                            hidden_states.kv_connector_output = kv_connector_output
+                            self.kv_connector_output = kv_connector_output
+                            return hidden_states
+
+                        if self.is_pooling_model:
+                            # Return the pooling output.
+                            return self._pool(
+                                hidden_states,
+                                num_scheduled_tokens,
+                                num_scheduled_tokens_np,
+                                kv_connector_output,
+                            )
+
+                        sample_hidden_states = hidden_states[logits_indices]
+                        logits = self.model.compute_logits(sample_hidden_states)
+
+                        spec_config = self.speculative_config
+                        jacobi_steps = 1
+                        if spec_config is not None and spec_config.method == "jacobi":
+                            jacobi_steps = max(
+                                spec_config.jacobi_steps_per_yield, 1
+                            )
+
+                        jacobi_allowed = True
+                        if spec_config is not None and spec_config.method == "jacobi":
+                            if not isinstance(self.drafter, JacobiProposer):
+                                jacobi_allowed = False
+                            else:
+                                if (
+                                    self.drafter.max_batch_size is not None
+                                    and self.input_batch.num_reqs
+                                    > self.drafter.max_batch_size
+                                ):
+                                    jacobi_allowed = False
+                                if (
+                                    self.drafter.accept_rate_low is not None
+                                    and not self.drafter.gate_open
+                                ):
+                                    jacobi_allowed = False
+
+                        if (
+                            jacobi_steps > 1
+                            and jacobi_allowed
+                            and spec_decode_metadata is not None
+                            and spec_decode_metadata.max_spec_len > 0
+                            and self.parallel_config.pipeline_parallel_size == 1
+                        ):
+                            draft_token_indices = (
+                                spec_decode_metadata.logits_indices[
+                                    spec_decode_metadata.target_logits_indices + 1
+                                ]
+                            ).to(torch.int64)
+                            for _ in range(jacobi_steps - 1):
+                                refined_ids, all_converged = (
+                                    self.drafter.refine_drafts(
+                                        self.input_batch,
+                                        logits,
+                                        spec_decode_metadata,
+                                    )
+                                )
+                                if all_converged:
+                                    break
+                                refined_ids = refined_ids.to(torch.int32)
+                                spec_decode_metadata.draft_token_ids.copy_(
+                                    refined_ids
+                                )
+                                if refined_ids.numel() > 0:
+                                    if input_ids is not None:
+                                        input_ids.index_copy_(
+                                            0,
+                                            draft_token_indices,
+                                            refined_ids,
+                                        )
+                                    elif inputs_embeds is not None:
+                                        refined_embeds = (
+                                            self.model.embed_input_ids(
+                                                input_ids=refined_ids.to(
+                                                    torch.long
+                                                )
+                                            )
+                                        )
+                                        inputs_embeds.index_copy_(
+                                            0,
+                                            draft_token_indices,
+                                            refined_embeds,
+                                        )
+                                model_output = run_forward()
+                                if self.use_aux_hidden_state_outputs:
+                                    hidden_states, aux_hidden_states = model_output
+                                else:
+                                    hidden_states = model_output
+                                    aux_hidden_states = None
+                                sample_hidden_states = hidden_states[logits_indices]
+                                logits = self.model.compute_logits(
+                                    sample_hidden_states
+                                )
+                    else:
+                        # Rare case.
+                        assert not self.is_pooling_model
+
+                        sample_hidden_states = hidden_states[logits_indices]
+                        if not get_pp_group().is_last_rank:
+                            all_gather_tensors = {
+                                "residual": not is_residual_scattered_for_sp(
+                                    self.vllm_config, num_tokens_padded
+                                )
+                            }
+                            get_pp_group().send_tensor_dict(
+                                hidden_states.tensors,
+                                all_gather_group=get_tp_group(),
+                                all_gather_tensors=all_gather_tensors,
+                            )
+                            logits = None
+                        else:
+                            logits = self.model.compute_logits(
+                                sample_hidden_states
+                            )
+
+                        model_output_broadcast_data: dict[str, Any] = {}
+                        if logits is not None:
+                            model_output_broadcast_data["logits"] = logits.contiguous()
+
+                        broadcasted = get_pp_group().broadcast_tensor_dict(
+                            model_output_broadcast_data,
+                            src=len(get_pp_group().ranks) - 1,
+                        )
+                        assert broadcasted is not None
+                        logits = broadcasted["logits"]
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
@@ -3601,6 +3866,7 @@ class GPUModelRunner(
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
+        self._jacobi_refine_ctx = None
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -3616,6 +3882,7 @@ class GPUModelRunner(
         )
 
         self._draft_token_ids = None
+        self._draft_token_ids_lens = None
         self._draft_token_req_ids = None
         self.input_batch.prev_sampled_token_ids = None
 
@@ -3772,6 +4039,8 @@ class GPUModelRunner(
         draft_token_ids: torch.Tensor = self._draft_token_ids
         if not torch.is_tensor(draft_token_ids):
             return
+        if draft_token_ids.device.type != "cuda":
+            return
         assert self.draft_token_ids_event is not None
         assert self.draft_token_ids_copy_stream is not None
         assert self.draft_token_ids_cpu is not None
@@ -3792,12 +4061,29 @@ class GPUModelRunner(
     def _get_draft_token_ids_cpu(self) -> tuple[list[list[int]], list[str]]:
         if isinstance(self._draft_token_ids, list):
             return self._draft_token_ids, self.input_batch.req_ids
-        req_ids = self._draft_token_req_ids
-        if req_ids is None:
+        req_ids = self._draft_token_req_ids or []
+        if not req_ids:
             return [], []
+        if isinstance(self._draft_token_ids, torch.Tensor):
+            if self._draft_token_ids.device.type == "cpu":
+                if self._draft_token_ids_lens is not None:
+                    lens = self._draft_token_ids_lens[: len(req_ids)]
+                    drafts = [
+                        self._draft_token_ids[i, : lens[i]].tolist()
+                        for i in range(len(req_ids))
+                    ]
+                    return drafts, req_ids
+                return self._draft_token_ids[: len(req_ids)].tolist(), req_ids
         assert self.draft_token_ids_event is not None
         assert self.draft_token_ids_cpu is not None
         self.draft_token_ids_event.synchronize()
+        if self._draft_token_ids_lens is not None:
+            lens = self._draft_token_ids_lens[: len(req_ids)]
+            drafts = [
+                self.draft_token_ids_cpu[i, : lens[i]].tolist()
+                for i in range(len(req_ids))
+            ]
+            return drafts, req_ids
         return self.draft_token_ids_cpu[: len(req_ids)].tolist(), req_ids
 
     def _copy_valid_sampled_token_count(
@@ -3847,6 +4133,7 @@ class GPUModelRunner(
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
         assert spec_config is not None
+        self._draft_token_ids_lens = None
         if spec_config.method == "ngram":
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, NgramProposer)
@@ -3870,7 +4157,35 @@ class GPUModelRunner(
                 self.requests,
                 logits,
                 spec_decode_metadata,
+                return_device=self.device if self.use_async_scheduling else None,
             )
+            if isinstance(draft_token_ids, JacobiDraftTokenIds):
+                self._draft_token_ids_lens = draft_token_ids.lengths
+                draft_tokens = draft_token_ids.tokens
+                if self.use_async_scheduling:
+                    if draft_tokens.shape[1] > self.num_spec_tokens:
+                        if self._draft_token_ids_lens is not None:
+                            self._draft_token_ids_lens = [
+                                min(length, self.num_spec_tokens)
+                                for length in self._draft_token_ids_lens
+                            ]
+                        draft_tokens = draft_tokens[:, : self.num_spec_tokens]
+                    if draft_tokens.shape[1] < self.num_spec_tokens:
+                        padded = torch.zeros(
+                            (draft_tokens.shape[0], self.num_spec_tokens),
+                            device=draft_tokens.device,
+                            dtype=draft_tokens.dtype,
+                        )
+                        if draft_tokens.numel():
+                            padded[:, : draft_tokens.shape[1]] = draft_tokens
+                        draft_tokens = padded
+                    if draft_tokens.device.type != "cuda":
+                        if not draft_tokens.is_pinned():
+                            draft_tokens = draft_tokens.pin_memory()
+                        draft_tokens = draft_tokens.to(
+                            self.device, non_blocking=True
+                        )
+                draft_token_ids = draft_tokens
         elif spec_config.method == "medusa":
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, MedusaProposer)

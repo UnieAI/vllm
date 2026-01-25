@@ -187,7 +187,9 @@ optionally recycle draft tails via an n-gram pool.
   by `jacobi_num_blocks`.
 - `jacobi_num_blocks` is kept for compatibility with block-based Jacobi schemes.
   In vLLM v1, the total draft length is still `num_speculative_tokens`.
-- `jacobi_steps_per_yield` is accepted but currently limited to 1 in vLLM v1.
+- `jacobi_steps_per_yield` controls how many fixed-point refinement steps run
+  before yielding back to the scheduler (multiple steps are supported in vLLM v1,
+  including pipeline-parallel runs).
 - Dynamic Strategy Control (DSC) gates can disable Jacobi at runtime:
   - `jacobi_max_batch_size`: disable when batch size exceeds the threshold.
   - `jacobi_accept_rate_*`: EMA-based acceptance gate with optional probing.
