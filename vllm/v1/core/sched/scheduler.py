@@ -205,8 +205,13 @@ class Scheduler(SchedulerInterface):
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
         self.num_spec_tokens = self.num_lookahead_tokens = 0
+        self.spec_decode_enabled = speculative_config is not None
+        self.spec_batch_max_size: int | None = None
+        self.spec_batch_min_size: int | None = None
         if speculative_config:
             self.num_spec_tokens = speculative_config.num_speculative_tokens
+            self.spec_batch_max_size = speculative_config.batch_max_size
+            self.spec_batch_min_size = speculative_config.batch_min_size
             if speculative_config.use_eagle():
                 self.use_eagle = True
                 self.num_lookahead_tokens = self.num_spec_tokens
@@ -335,6 +340,7 @@ class Scheduler(SchedulerInterface):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+        enable_spec_decode = self._should_enable_spec_decode_for_batch()
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -480,7 +486,7 @@ class Scheduler(SchedulerInterface):
             req_index += 1
 
             # Speculative decode related.
-            if request.spec_token_ids:
+            if enable_spec_decode and request.spec_token_ids:
                 num_scheduled_spec_tokens = (
                     num_new_tokens
                     + request.num_computed_tokens
@@ -495,6 +501,8 @@ class Scheduler(SchedulerInterface):
                     )
                 # New spec tokens will be set in `update_draft_token_ids` before the
                 # next step when applicable.
+                request.spec_token_ids = []
+            elif request.spec_token_ids:
                 request.spec_token_ids = []
 
             # Encoder-related.
@@ -853,6 +861,7 @@ class Scheduler(SchedulerInterface):
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
             preempted_req_ids={req.request_id for req in preempted_reqs},
+            enable_spec_decode=enable_spec_decode,
             # finished_req_ids is an existing state in the scheduler,
             # instead of being newly scheduled in this step.
             # It contains the request IDs that are finished in between
@@ -881,6 +890,30 @@ class Scheduler(SchedulerInterface):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
+
+    def _should_enable_spec_decode_for_batch(self) -> bool:
+        """Apply hysteresis controls for speculative decoding.
+
+        If configured, disable speculative decoding when running+queued
+        requests exceed `batch_max_size`, and re-enable only when the count
+        drops below `batch_min_size`. Counts between thresholds preserve the
+        previous decision.
+        """
+        if (
+            self.vllm_config.speculative_config is None
+            or self.spec_batch_max_size is None
+            or self.spec_batch_min_size is None
+        ):
+            return self.spec_decode_enabled
+
+        total_requests = len(self.running) + len(self.waiting)
+        if total_requests > self.spec_batch_max_size and self.spec_decode_enabled:
+            self.spec_decode_enabled = False
+            logger.info("disable specilative decoding")
+        elif total_requests < self.spec_batch_min_size and not self.spec_decode_enabled:
+            self.spec_decode_enabled = True
+            logger.info("enable specilative decoding")
+        return self.spec_decode_enabled
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.

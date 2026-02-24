@@ -307,7 +307,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self.kv_connector.set_disabled(False)
         assert self.execute_model_state is not None
-        hidden_states, input_batch, _ = self.execute_model_state
+        hidden_states, input_batch, _, _ = self.execute_model_state
         sample_hidden_states = hidden_states[input_batch.logits_indices]
         return hidden_states, sample_hidden_states
 
@@ -884,7 +884,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
 
         kv_connector_output = self.kv_connector.post_forward(scheduler_output)
-        self.execute_model_state = hidden_states, input_batch, kv_connector_output
+        self.execute_model_state = (
+            hidden_states,
+            input_batch,
+            kv_connector_output,
+            scheduler_output.enable_spec_decode,
+        )
         return None
 
     @torch.inference_mode()
@@ -892,7 +897,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self, grammar_output: GrammarOutput | None
     ) -> AsyncOutput | ModelRunnerOutput:
         assert self.execute_model_state is not None
-        hidden_states, input_batch, kv_connector_output = self.execute_model_state
+        (
+            hidden_states,
+            input_batch,
+            kv_connector_output,
+            enable_spec_decode,
+        ) = self.execute_model_state
         self.execute_model_state = None  # type: ignore
 
         sampler_output, num_sampled, num_rejected = self.sample(
@@ -935,7 +945,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.postprocess(
             input_batch, sampler_output.sampled_token_ids, num_sampled, num_rejected
         )
-        if self.do_spec_decode:
+        if self.do_spec_decode and enable_spec_decode:
             draft_tokens = self.propose_draft(
                 input_batch,
                 hidden_states,

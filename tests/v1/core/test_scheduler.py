@@ -885,6 +885,50 @@ def test_schedule_spec_decoding_stats(spec_tokens, output_tokens, expected):
         assert stats.num_accepted_tokens_per_pos == expected[3]
 
 
+def test_spec_decode_batch_hysteresis():
+    scheduler = create_scheduler(
+        num_speculative_tokens=2,
+        speculative_batch_max_size=3,
+        speculative_batch_min_size=2,
+    )
+    requests = create_requests(num_requests=4, num_tokens=1)
+    req_ids = []
+    req_id_to_index = {}
+    for i, request in enumerate(requests):
+        scheduler.add_request(request)
+        req_ids.append(request.request_id)
+        req_id_to_index[request.request_id] = i
+
+    # Above max threshold: disable speculative decoding.
+    output = scheduler.schedule()
+    assert not output.enable_spec_decode
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+            sampled_token_ids=[[0] for _ in req_ids],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    scheduler.update_draft_token_ids(DraftTokenIds(req_ids, [[10, 11]] * len(req_ids)))
+
+    # Still above max threshold: keep disabled and do not schedule spec tokens.
+    output = scheduler.schedule()
+    assert not output.enable_spec_decode
+    assert output.scheduled_spec_decode_tokens == {}
+
+    # Drop below min threshold and provide drafts for the remaining request.
+    scheduler.finish_requests(req_ids[1:], RequestStatus.FINISHED_ABORTED)
+    scheduler.update_draft_token_ids(DraftTokenIds([req_ids[0]], [[12, 13]]))
+
+    output = scheduler.schedule()
+    assert output.enable_spec_decode
+    assert output.scheduled_spec_decode_tokens.get(req_ids[0]) == [12, 13]
+
+
 def _assert_right_scheduler_output(
     output: SchedulerOutput,
     num_requests: int,

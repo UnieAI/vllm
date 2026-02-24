@@ -507,6 +507,8 @@ class EngineArgs:
     logits_processor_pattern: str | None = ModelConfig.logits_processor_pattern
 
     speculative_config: dict[str, Any] | None = None
+    speculative_batch_max_size: int | None = None
+    speculative_batch_min_size: int | None = None
 
     show_hidden_metrics_for_version: str | None = (
         ObservabilityConfig.show_hidden_metrics_for_version
@@ -1163,6 +1165,26 @@ class EngineArgs:
             "--speculative-config", **vllm_kwargs["speculative_config"]
         )
         vllm_group.add_argument(
+            "--speculative-batch-max-size",
+            type=optional_type(int),
+            default=EngineArgs.speculative_batch_max_size,
+            help=(
+                "Disable speculative decoding when running+queued requests "
+                "exceed this threshold. Only active when --speculative-config "
+                "is set."
+            ),
+        )
+        vllm_group.add_argument(
+            "--speculative-batch-min-size",
+            type=optional_type(int),
+            default=EngineArgs.speculative_batch_min_size,
+            help=(
+                "Re-enable speculative decoding when running+queued requests "
+                "drop below this threshold. Only active when "
+                "--speculative-config is set."
+            ),
+        )
+        vllm_group.add_argument(
             "--kv-transfer-config", **vllm_kwargs["kv_transfer_config"]
         )
         vllm_group.add_argument("--kv-events-config", **vllm_kwargs["kv_events_config"])
@@ -1328,6 +1350,14 @@ class EngineArgs:
         dictionary from the engine.
         """
         if self.speculative_config is None:
+            if (
+                self.speculative_batch_max_size is not None
+                or self.speculative_batch_min_size is not None
+            ):
+                logger.warning(
+                    "--speculative-batch-max-size/--speculative-batch-min-size "
+                    "are ignored because --speculative-config is not set."
+                )
             return None
 
         # Note(Shangming): These parameters are not obtained from the cli arg
@@ -1337,6 +1367,8 @@ class EngineArgs:
             {
                 "target_model_config": target_model_config,
                 "target_parallel_config": target_parallel_config,
+                "batch_max_size": self.speculative_batch_max_size,
+                "batch_min_size": self.speculative_batch_min_size,
             }
         )
         return SpeculativeConfig(**self.speculative_config)

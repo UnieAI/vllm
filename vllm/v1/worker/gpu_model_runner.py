@@ -3688,8 +3688,9 @@ class GPUModelRunner(
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         spec_config = self.speculative_config
+        spec_decode_enabled = scheduler_output.enable_spec_decode
         propose_drafts_after_bookkeeping = False
-        if spec_config is not None:
+        if spec_config is not None and spec_decode_enabled:
             input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
                 spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
                 <= self.effective_drafter_max_model_len
