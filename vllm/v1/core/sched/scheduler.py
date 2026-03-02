@@ -206,12 +206,20 @@ class Scheduler(SchedulerInterface):
         self.use_eagle = False
         self.num_spec_tokens = self.num_lookahead_tokens = 0
         self.spec_decode_enabled = speculative_config is not None
+        self.spec_enable_load: int = 120000
+        self.spec_disable_load: int = 180000
+        self.spec_cooldown_sec: int = 30
+        self.spec_last_switch_time: float | None = None
+        self.spec_error_recovery_until: float = 0.0
         self.spec_batch_max_size: int | None = None
         self.spec_batch_min_size: int | None = None
         if speculative_config:
             self.num_spec_tokens = speculative_config.num_speculative_tokens
             self.spec_batch_max_size = speculative_config.batch_max_size
             self.spec_batch_min_size = speculative_config.batch_min_size
+            self.spec_enable_load = speculative_config.enable_load
+            self.spec_disable_load = speculative_config.disable_load
+            self.spec_cooldown_sec = speculative_config.cooldown_sec
             if speculative_config.use_eagle():
                 self.use_eagle = True
                 self.num_lookahead_tokens = self.num_spec_tokens
@@ -451,6 +459,17 @@ class Scheduler(SchedulerInterface):
                         request.num_tokens_with_spec,
                         request.num_output_placeholders,
                     )
+                    if self.spec_decode_enabled:
+                        self.spec_decode_enabled = False
+                        self.spec_last_switch_time = time.monotonic()
+                        self.spec_error_recovery_until = (
+                            self.spec_last_switch_time + 60.0
+                        )
+                        self.kv_cache_manager.set_use_eagle(False)
+                        logger.warning(
+                            "Disable speculative decoding due to scheduler "
+                            "accounting anomaly; recovery allowed after 60s."
+                        )
                 req_index += 1
                 continue
 
@@ -924,32 +943,98 @@ class Scheduler(SchedulerInterface):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
 
-    def _should_enable_spec_decode_for_batch(self) -> bool:
-        """Apply hysteresis controls for speculative decoding.
+    def _estimated_spec_decode_load(self) -> int:
+        # Estimate pressure from all active requests using the remaining
+        # scheduler-visible tokens (prompt + decode + placeholders).
+        requests = itertools.chain(self.running, self.waiting)
+        return sum(
+            max(
+                0,
+                request.num_tokens_with_spec
+                + request.num_output_placeholders
+                - request.num_computed_tokens,
+            )
+            for request in requests
+        )
 
-        If configured, disable speculative decoding when running+queued
-        requests exceed `batch_max_size`, and re-enable only when the count
-        drops below `batch_min_size`. Counts between thresholds preserve the
-        previous decision.
-        """
+    def _maybe_switch_spec_decode(self, enable: bool, reason: str) -> None:
+        if self.spec_decode_enabled == enable:
+            return
+        now = time.monotonic()
         if (
-            self.vllm_config.speculative_config is None
-            or self.spec_batch_max_size is None
-            or self.spec_batch_min_size is None
+            self.spec_last_switch_time is not None
+            and now - self.spec_last_switch_time < self.spec_cooldown_sec
         ):
+            return
+        self.spec_decode_enabled = enable
+        self.spec_last_switch_time = now
+        if enable:
+            logger.info("enable speculative decoding: %s", reason)
+        else:
+            logger.info("disable speculative decoding: %s", reason)
+
+    def _should_enable_spec_decode_for_batch(self) -> bool:
+        """Apply speculative decoding controls.
+
+        Priority:
+        1) If batch_max_size/batch_min_size are both configured, use request
+           count hysteresis (legacy behavior).
+        2) Otherwise use token-load hysteresis with cooldown.
+        """
+        if self.vllm_config.speculative_config is None:
             self.kv_cache_manager.set_use_eagle(
                 self.use_eagle and self.spec_decode_enabled
             )
             return self.spec_decode_enabled
 
-        total_requests = len(self.running) + len(self.waiting)
-        if total_requests > self.spec_batch_max_size and self.spec_decode_enabled:
-            self.spec_decode_enabled = False
-            logger.info("disable specilative decoding")
-        elif total_requests < self.spec_batch_min_size and not self.spec_decode_enabled:
-            self.spec_decode_enabled = True
-            logger.info("enable specilative decoding")
-        self.kv_cache_manager.set_use_eagle(self.use_eagle and self.spec_decode_enabled)
+        now = time.monotonic()
+        if not self.spec_decode_enabled and now < self.spec_error_recovery_until:
+            self.kv_cache_manager.set_use_eagle(False)
+            return False
+
+        if (
+            self.spec_batch_max_size is not None
+            and self.spec_batch_min_size is not None
+        ):
+            total_requests = len(self.running) + len(self.waiting)
+            if total_requests > self.spec_batch_max_size:
+                self._maybe_switch_spec_decode(
+                    enable=False,
+                    reason=(
+                        f"total_requests={total_requests} > "
+                        f"batch_max_size={self.spec_batch_max_size}"
+                    ),
+                )
+            elif total_requests < self.spec_batch_min_size:
+                self._maybe_switch_spec_decode(
+                    enable=True,
+                    reason=(
+                        f"total_requests={total_requests} < "
+                        f"batch_min_size={self.spec_batch_min_size}"
+                    ),
+                )
+            self.kv_cache_manager.set_use_eagle(
+                self.use_eagle and self.spec_decode_enabled
+            )
+            return self.spec_decode_enabled
+
+        total_load = self._estimated_spec_decode_load()
+        if total_load > self.spec_disable_load:
+            self._maybe_switch_spec_decode(
+                enable=False,
+                reason=(
+                    f"load={total_load} > disable_load={self.spec_disable_load}"
+                ),
+            )
+        elif total_load < self.spec_enable_load:
+            self._maybe_switch_spec_decode(
+                enable=True,
+                reason=(f"load={total_load} < enable_load={self.spec_enable_load}"),
+            )
+
+        self.kv_cache_manager.set_use_eagle(
+            self.use_eagle and self.spec_decode_enabled
+        )
         return self.spec_decode_enabled
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:

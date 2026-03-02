@@ -54,6 +54,9 @@ def create_scheduler(
     num_speculative_tokens: int | None = None,
     speculative_batch_max_size: int | None = None,
     speculative_batch_min_size: int | None = None,
+    speculative_enable_load: int = 120000,
+    speculative_disable_load: int = 180000,
+    speculative_cooldown_sec: int = 30,
     skip_tokenizer_init: bool = False,
     async_scheduling: bool = False,
     pipeline_parallel_size: int = 1,
@@ -124,6 +127,9 @@ def create_scheduler(
             num_speculative_tokens=num_speculative_tokens,
             batch_max_size=speculative_batch_max_size,
             batch_min_size=speculative_batch_min_size,
+            enable_load=speculative_enable_load,
+            disable_load=speculative_disable_load,
+            cooldown_sec=speculative_cooldown_sec,
         )
 
     ec_transfer_config = (

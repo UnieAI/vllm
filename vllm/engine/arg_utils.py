@@ -509,6 +509,9 @@ class EngineArgs:
     speculative_config: dict[str, Any] | None = None
     speculative_batch_max_size: int | None = None
     speculative_batch_min_size: int | None = None
+    speculative_enable_load: int = 120000
+    speculative_disable_load: int = 180000
+    speculative_cooldown_sec: int = 30
 
     show_hidden_metrics_for_version: str | None = (
         ObservabilityConfig.show_hidden_metrics_for_version
@@ -1185,6 +1188,35 @@ class EngineArgs:
             ),
         )
         vllm_group.add_argument(
+            "--speculative-enable-load",
+            type=int,
+            default=EngineArgs.speculative_enable_load,
+            help=(
+                "Enable speculative decoding when estimated token load drops "
+                "below this threshold. Only active when --speculative-config "
+                "is set and --speculative-batch-{min,max}-size are not both set."
+            ),
+        )
+        vllm_group.add_argument(
+            "--speculative-disable-load",
+            type=int,
+            default=EngineArgs.speculative_disable_load,
+            help=(
+                "Disable speculative decoding when estimated token load exceeds "
+                "this threshold. Only active when --speculative-config is set "
+                "and --speculative-batch-{min,max}-size are not both set."
+            ),
+        )
+        vllm_group.add_argument(
+            "--speculative-cooldown-sec",
+            type=int,
+            default=EngineArgs.speculative_cooldown_sec,
+            help=(
+                "Minimum seconds between speculative on/off mode switches. "
+                "Only active when --speculative-config is set."
+            ),
+        )
+        vllm_group.add_argument(
             "--kv-transfer-config", **vllm_kwargs["kv_transfer_config"]
         )
         vllm_group.add_argument("--kv-events-config", **vllm_kwargs["kv_events_config"])
@@ -1358,6 +1390,16 @@ class EngineArgs:
                     "--speculative-batch-max-size/--speculative-batch-min-size "
                     "are ignored because --speculative-config is not set."
                 )
+            if (
+                self.speculative_enable_load != 120000
+                or self.speculative_disable_load != 180000
+                or self.speculative_cooldown_sec != 30
+            ):
+                logger.warning(
+                    "--speculative-enable-load/--speculative-disable-load/"
+                    "--speculative-cooldown-sec are ignored because "
+                    "--speculative-config is not set."
+                )
             return None
 
         # Note(Shangming): These parameters are not obtained from the cli arg
@@ -1369,6 +1411,9 @@ class EngineArgs:
                 "target_parallel_config": target_parallel_config,
                 "batch_max_size": self.speculative_batch_max_size,
                 "batch_min_size": self.speculative_batch_min_size,
+                "enable_load": self.speculative_enable_load,
+                "disable_load": self.speculative_disable_load,
+                "cooldown_sec": self.speculative_cooldown_sec,
             }
         )
         return SpeculativeConfig(**self.speculative_config)
