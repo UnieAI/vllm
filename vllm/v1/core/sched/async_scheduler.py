@@ -15,13 +15,16 @@ class AsyncScheduler(Scheduler):
         has_structured_output_requests = False
         pending_structured_output_tokens = False
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
+        enable_spec_decode = scheduler_output.enable_spec_decode
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests[req_id]
             has_structured_output_requests |= request.use_structured_output
             pending_structured_output_tokens |= (
                 request.use_structured_output and request.num_output_placeholders > 0
             )
-            cur_num_spec_tokens = len(spec_decode_tokens.get(req_id, ()))
+            cur_num_spec_tokens = (
+                len(spec_decode_tokens.get(req_id, ())) if enable_spec_decode else 0
+            )
             if (
                 request.num_computed_tokens
                 == request.num_tokens
@@ -33,7 +36,7 @@ class AsyncScheduler(Scheduler):
                 request.num_output_placeholders += 1 + cur_num_spec_tokens
                 # Add placeholders for the new tokens in spec_token_ids.
                 # We will update the actual spec token ids in the worker process.
-                request.spec_token_ids = [-1] * self.num_spec_tokens
+                request.spec_token_ids = [-1] * cur_num_spec_tokens
 
         scheduler_output.has_structured_output_requests = has_structured_output_requests
         scheduler_output.pending_structured_output_tokens = (
@@ -55,8 +58,19 @@ class AsyncScheduler(Scheduler):
         )
 
         # Update the number of output placeholders.
+        # In async + speculative fallback paths, accounting can transiently
+        # drift and produce more returned tokens than placeholders.
+        # Clamp to zero to keep the scheduler alive.
         request.num_output_placeholders -= len(new_token_ids)
-        assert request.num_output_placeholders >= 0
+        if request.num_output_placeholders < 0:
+            logger.warning(
+                "Clamp negative num_output_placeholders for req %s: %d "
+                "(returned_tokens=%d).",
+                request.request_id,
+                request.num_output_placeholders,
+                len(new_token_ids),
+            )
+            request.num_output_placeholders = 0
 
         # Cache the new tokens. Preempted requests should be skipped.
         if status_before_update == RequestStatus.RUNNING:

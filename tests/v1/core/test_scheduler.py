@@ -899,9 +899,16 @@ def test_spec_decode_batch_hysteresis():
         req_ids.append(request.request_id)
         req_id_to_index[request.request_id] = i
 
+    # Simulate EAGLE mode to verify that hysteresis toggles both
+    # speculative proposing and EAGLE-specific KV behavior.
+    scheduler.use_eagle = True
+    scheduler.num_lookahead_tokens = scheduler.num_spec_tokens
+    scheduler.kv_cache_manager.set_use_eagle(True)
+
     # Above max threshold: disable speculative decoding.
     output = scheduler.schedule()
     assert not output.enable_spec_decode
+    assert not scheduler.kv_cache_manager.use_eagle
     scheduler.update_from_output(
         output,
         ModelRunnerOutput(
@@ -927,6 +934,7 @@ def test_spec_decode_batch_hysteresis():
     output = scheduler.schedule()
     assert output.enable_spec_decode
     assert output.scheduled_spec_decode_tokens.get(req_ids[0]) == [12, 13]
+    assert scheduler.kv_cache_manager.use_eagle
 
 
 def _assert_right_scheduler_output(

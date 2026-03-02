@@ -274,6 +274,7 @@ class Scheduler(SchedulerInterface):
         num_new_tokens: int,
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
+        use_eagle: bool = False,
     ) -> int:
         assert num_external_computed_tokens == 0, (
             "External KV connector is not verified yet"
@@ -292,7 +293,7 @@ class Scheduler(SchedulerInterface):
                 request.num_prompt_tokens - request.num_prompt_tokens % block_size
             )
             # eagle prune
-            if self.use_eagle:
+            if use_eagle:
                 last_cache_position = max(last_cache_position - block_size, 0)
             num_computed_tokens = (
                 request.num_computed_tokens
@@ -341,6 +342,8 @@ class Scheduler(SchedulerInterface):
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
         enable_spec_decode = self._should_enable_spec_decode_for_batch()
+        use_eagle = self.use_eagle and enable_spec_decode
+        num_lookahead_tokens = self.num_lookahead_tokens if enable_spec_decode else 0
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -349,6 +352,25 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            # Speculative-to-non-spec mode switches can temporarily leave
+            # request accounting inconsistent (computed tokens ahead of
+            # num_tokens_with_spec + placeholders). Normalize to keep
+            # scheduling math non-negative.
+            expected_computed = (
+                request.num_tokens_with_spec + request.num_output_placeholders
+            )
+            if request.num_computed_tokens > expected_computed:
+                logger.warning(
+                    "Normalize req %s computed tokens from %d to %d "
+                    "(num_tokens_with_spec=%d, placeholders=%d).",
+                    request.request_id,
+                    request.num_computed_tokens,
+                    expected_computed,
+                    request.num_tokens_with_spec,
+                    request.num_output_placeholders,
+                )
+                request.num_computed_tokens = expected_computed
 
             if (
                 request.num_output_placeholders > 0
@@ -396,15 +418,15 @@ class Scheduler(SchedulerInterface):
                     request.num_computed_tokens,
                     num_new_tokens,
                     encoder_compute_budget,
-                    shift_computed_tokens=1 if self.use_eagle else 0,
+                    shift_computed_tokens=1 if use_eagle else 0,
                 )
 
             if self.need_mamba_block_aligned_split:
                 num_new_tokens = self._mamba_block_aligned_split(
-                    request, num_new_tokens
+                    request, num_new_tokens, use_eagle=use_eagle
                 )
 
-            if num_new_tokens == 0:
+            if num_new_tokens <= 0:
                 # The request cannot be scheduled because one of the following
                 # reasons:
                 # 1. No new tokens to schedule. This may happen when
@@ -419,6 +441,16 @@ class Scheduler(SchedulerInterface):
                 # NOTE(woosuk): Here, by doing `continue` instead of `break`,
                 # we do not strictly follow the FCFS scheduling policy and
                 # allow the lower-priority requests to be scheduled.
+                if num_new_tokens < 0:
+                    logger.warning(
+                        "Skip scheduling req %s due to negative num_new_tokens=%d "
+                        "(computed=%d, num_tokens_with_spec=%d, placeholders=%d).",
+                        request.request_id,
+                        num_new_tokens,
+                        request.num_computed_tokens,
+                        request.num_tokens_with_spec,
+                        request.num_output_placeholders,
+                    )
                 req_index += 1
                 continue
 
@@ -428,7 +460,7 @@ class Scheduler(SchedulerInterface):
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens,
+                        num_lookahead_tokens=num_lookahead_tokens,
                     )
 
                     if new_blocks is not None:
@@ -677,7 +709,7 @@ class Scheduler(SchedulerInterface):
                             num_computed_tokens,
                             num_new_tokens,
                             encoder_compute_budget,
-                            shift_computed_tokens=1 if self.use_eagle else 0,
+                            shift_computed_tokens=1 if use_eagle else 0,
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
@@ -689,6 +721,7 @@ class Scheduler(SchedulerInterface):
                         num_new_tokens,
                         num_new_local_computed_tokens,
                         num_external_computed_tokens,
+                        use_eagle=use_eagle,
                     )
                     if num_new_tokens == 0:
                         break
@@ -699,7 +732,7 @@ class Scheduler(SchedulerInterface):
                 # creates a mismatch between the number
                 # of local and remote blocks.
                 effective_lookahead_tokens = (
-                    0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
+                    0 if request.num_computed_tokens == 0 else num_lookahead_tokens
                 )
 
                 num_encoder_tokens = (
@@ -904,6 +937,9 @@ class Scheduler(SchedulerInterface):
             or self.spec_batch_max_size is None
             or self.spec_batch_min_size is None
         ):
+            self.kv_cache_manager.set_use_eagle(
+                self.use_eagle and self.spec_decode_enabled
+            )
             return self.spec_decode_enabled
 
         total_requests = len(self.running) + len(self.waiting)
@@ -913,6 +949,7 @@ class Scheduler(SchedulerInterface):
         elif total_requests < self.spec_batch_min_size and not self.spec_decode_enabled:
             self.spec_decode_enabled = True
             logger.info("enable specilative decoding")
+        self.kv_cache_manager.set_use_eagle(self.use_eagle and self.spec_decode_enabled)
         return self.spec_decode_enabled
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:

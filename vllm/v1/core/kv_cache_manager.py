@@ -161,6 +161,16 @@ class KVCacheManager:
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
 
+    def set_use_eagle(self, use_eagle: bool) -> None:
+        """Toggle EAGLE-specific KV cache handling at runtime.
+
+        This is used by scheduler-side speculative batch hysteresis so that
+        crossing `batch_max_size` can disable both speculative proposing and
+        EAGLE-specific KV/prefix-cache behavior.
+        """
+        self.use_eagle = use_eagle
+        self.coordinator.use_eagle = use_eagle
+
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
