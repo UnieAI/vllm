@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -58,6 +59,31 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def _read_bool_env(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _read_int_env(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+SPEC_DECODE_DEBUG = _read_bool_env("VLLM_SPEC_DECODE_DEBUG", False)
+SPEC_DECODE_DEBUG_LOG_ALL = _read_bool_env("VLLM_SPEC_DECODE_DEBUG_LOG_ALL", False)
+SPEC_DECODE_DEBUG_MAX_REQS = max(1, _read_int_env("VLLM_SPEC_DECODE_DEBUG_MAX_REQS", 8))
+SPEC_DECODE_DEBUG_MAX_TOKENS = max(
+    1, _read_int_env("VLLM_SPEC_DECODE_DEBUG_MAX_TOKENS", 16)
+)
 
 
 class Scheduler(SchedulerInterface):
@@ -1386,6 +1412,10 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        draft_token_ids = model_runner_output.draft_token_ids
+
+        if self.scheduler_config.async_scheduling and draft_token_ids is not None:
+            self.update_draft_token_ids(draft_token_ids)
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -1415,6 +1445,7 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        debug_emitted = 0
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
@@ -1437,7 +1468,12 @@ class Scheduler(SchedulerInterface):
             )
             if scheduled_spec_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
-                num_accepted = len(generated_token_ids) - 1
+                # `generated_token_ids` can be empty for an invalid/aborted async
+                # request in a speculative step. Clamp to keep stats/counters sane.
+                num_accepted = max(
+                    0,
+                    min(len(generated_token_ids) - 1, num_draft_tokens),
+                )
                 num_rejected = num_draft_tokens - num_accepted
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
@@ -1457,6 +1493,39 @@ class Scheduler(SchedulerInterface):
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
                 )
+                if SPEC_DECODE_DEBUG and debug_emitted < SPEC_DECODE_DEBUG_MAX_REQS:
+                    if SPEC_DECODE_DEBUG_LOG_ALL or num_rejected > 0:
+                        draft_preview = scheduled_spec_token_ids[
+                            :SPEC_DECODE_DEBUG_MAX_TOKENS
+                        ]
+                        generated_preview = generated_token_ids[
+                            :SPEC_DECODE_DEBUG_MAX_TOKENS
+                        ]
+                        if num_rejected > 0:
+                            logger.info(
+                                "spec decode rejected draft tokens: req_id=%s "
+                                "draft=%d accepted=%d rejected=%d "
+                                "scheduled_draft_preview=%s generated_preview=%s",
+                                req_id,
+                                num_draft_tokens,
+                                num_accepted,
+                                num_rejected,
+                                draft_preview,
+                                generated_preview,
+                            )
+                        else:
+                            logger.info(
+                                "spec decode accepted all drafts: req_id=%s "
+                                "draft=%d accepted=%d rejected=%d "
+                                "scheduled_draft_preview=%s generated_preview=%s",
+                                req_id,
+                                num_draft_tokens,
+                                num_accepted,
+                                num_rejected,
+                                draft_preview,
+                                generated_preview,
+                            )
+                        debug_emitted += 1
 
             stopped = False
             new_logprobs = None

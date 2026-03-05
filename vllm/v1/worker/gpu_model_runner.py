@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -192,6 +193,31 @@ if TYPE_CHECKING:
     from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
 logger = init_logger(__name__)
+
+
+def _read_bool_env(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _read_int_env(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+SPEC_DECODE_DEBUG = _read_bool_env("VLLM_SPEC_DECODE_DEBUG", False)
+SPEC_DECODE_DEBUG_MAX_REQS = max(1, _read_int_env("VLLM_SPEC_DECODE_DEBUG_MAX_REQS", 8))
+SPEC_DECODE_DEBUG_MAX_TOKENS = max(
+    1, _read_int_env("VLLM_SPEC_DECODE_DEBUG_MAX_TOKENS", 16)
+)
+
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -1017,11 +1043,25 @@ class GPUModelRunner(
                     req_state.prev_num_draft_len = 0
                 else:
                     assert self.input_batch.prev_req_id_to_index is not None
-                    prev_req_index = self.input_batch.prev_req_id_to_index[req_id]
-                    num_accepted = valid_sampled_token_count[prev_req_index] - 1
+                    prev_req_index = self.input_batch.prev_req_id_to_index.get(req_id)
+                    if (
+                        prev_req_index is None
+                        or prev_req_index >= len(valid_sampled_token_count)
+                    ):
+                        # The request can be filtered from previous-step sampled
+                        # outputs (e.g. discarded/invalid in async scheduling).
+                        # Treat this as zero accepted draft tokens instead of
+                        # crashing on a missing index.
+                        num_accepted = 0
+                    else:
+                        num_accepted = max(
+                            valid_sampled_token_count[prev_req_index] - 1, 0
+                        )
+                    num_accepted = min(num_accepted, req_state.prev_num_draft_len)
                     num_rejected = req_state.prev_num_draft_len - num_accepted
-                    num_computed_tokens -= num_rejected
-                    req_state.output_token_ids.extend([-1] * num_accepted)
+                    num_computed_tokens = max(num_computed_tokens - num_rejected, 0)
+                    if num_accepted > 0:
+                        req_state.output_token_ids.extend([-1] * num_accepted)
 
             # Update the cached states.
             req_state.num_computed_tokens = num_computed_tokens
@@ -1384,22 +1424,41 @@ class GPUModelRunner(
         if self._draft_token_ids is None or not spec_flattened_indices:
             return
 
-        assert isinstance(self._draft_token_ids, torch.Tensor)
         draft_tokens_index_tensor = torch.tensor(
             spec_flattened_indices, dtype=torch.int64, pin_memory=self.pin_memory
         ).to(self.device, non_blocking=True)
-        prev_draft_token_indices_tensor = torch.tensor(
-            prev_draft_token_indices, dtype=torch.int64, pin_memory=self.pin_memory
-        ).to(self.device, non_blocking=True)
-
-        # because input_ids dtype is torch.int32,
-        # so convert draft_token_ids to torch.int32 here.
-        draft_token_ids = self._draft_token_ids.to(dtype=torch.int32)
+        if isinstance(self._draft_token_ids, list):
+            selected_draft_token_ids: list[int] = []
+            for flat_idx in prev_draft_token_indices:
+                req_idx = flat_idx // self.num_spec_tokens
+                tok_idx = flat_idx % self.num_spec_tokens
+                req_drafts = (
+                    self._draft_token_ids[req_idx]
+                    if req_idx < len(self._draft_token_ids)
+                    else []
+                )
+                selected_draft_token_ids.append(
+                    req_drafts[tok_idx] if tok_idx < len(req_drafts) else -1
+                )
+            draft_token_src = torch.tensor(
+                selected_draft_token_ids,
+                dtype=torch.int32,
+                pin_memory=self.pin_memory,
+            ).to(self.device, non_blocking=True)
+        else:
+            assert isinstance(self._draft_token_ids, torch.Tensor)
+            prev_draft_token_indices_tensor = torch.tensor(
+                prev_draft_token_indices, dtype=torch.int64, pin_memory=self.pin_memory
+            ).to(self.device, non_blocking=True)
+            # input_ids dtype is torch.int32, so convert before scatter.
+            draft_token_src = self._draft_token_ids.to(dtype=torch.int32).flatten()[
+                prev_draft_token_indices_tensor
+            ]
 
         self.input_ids.gpu.scatter_(
             dim=0,
             index=draft_tokens_index_tensor,
-            src=draft_token_ids.flatten()[prev_draft_token_indices_tensor],
+            src=draft_token_src,
         )
 
     def _get_encoder_seq_lens(
@@ -2882,6 +2941,7 @@ class GPUModelRunner(
         hidden_states: torch.Tensor,
         num_scheduled_tokens: int,
         spec_decode_metadata: SpecDecodeMetadata | None,
+        require_valid_sampled_token_ids_for_proposer: bool = False,
     ) -> tuple[
         dict[str, int],
         LogprobsLists | None,
@@ -2935,17 +2995,50 @@ class GPUModelRunner(
                     logprobs_tensors=logprobs_tensors,
                 )
         else:
-            valid_sampled_token_ids = []
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
             invalid_req_indices_set = set(invalid_req_indices)
+            if require_valid_sampled_token_ids_for_proposer:
+                # Ngram/suffix/medusa speculative paths need real sampled token IDs
+                # from this step to build draft proposals.
+                max_gen_len = sampled_token_ids.shape[-1]
+                if max_gen_len == 1:
+                    valid_sampled_token_ids = self._to_list(sampled_token_ids)
+                    for i in discard_sampled_tokens_req_indices:
+                        valid_sampled_token_ids[int(i)].clear()
+                else:
+                    valid_sampled_token_ids, _ = RejectionSampler.parse_output(
+                        sampled_token_ids,
+                        self.input_batch.vocab_size,
+                        discard_sampled_tokens_req_indices,
+                    )
+            else:
+                valid_sampled_token_ids = []
 
             # Cache the sampled tokens on the GPU and avoid CPU sync.
             # These will be copied into input_ids in the next step
             # when preparing inputs.
             # With spec decoding, this is done in propose_draft_token_ids().
             if self.input_batch.prev_sampled_token_ids is None:
-                assert sampled_token_ids.shape[-1] == 1
-                self.input_batch.prev_sampled_token_ids = sampled_token_ids
+                if sampled_token_ids.shape[-1] == 1:
+                    self.input_batch.prev_sampled_token_ids = sampled_token_ids
+                elif require_valid_sampled_token_ids_for_proposer:
+                    # For async + ngram/suffix/medusa, rejection sampling can
+                    # return multiple valid tokens. Keep one token per request
+                    # (the last valid token) for next-step input preparation.
+                    valid_mask = (sampled_token_ids != -1) & (
+                        sampled_token_ids < self.input_batch.vocab_size
+                    )
+                    last_valid_idx = torch.clamp(
+                        valid_mask.sum(dim=1).to(torch.int64) - 1,
+                        min=0,
+                    )
+                    self.input_batch.prev_sampled_token_ids = torch.gather(
+                        sampled_token_ids,
+                        dim=1,
+                        index=last_valid_idx.unsqueeze(1),
+                    )
+                else:
+                    assert sampled_token_ids.shape[-1] == 1
             self.input_batch.prev_req_id_to_index = {
                 req_id: i
                 for i, req_id in enumerate(self.input_batch.req_ids)
@@ -2960,7 +3053,12 @@ class GPUModelRunner(
         req_ids = self.input_batch.req_ids
         for req_idx in range(num_sampled_tokens):
             if self.use_async_scheduling:
-                sampled_ids = [-1] if req_idx not in invalid_req_indices_set else None
+                if require_valid_sampled_token_ids_for_proposer:
+                    sampled_ids = valid_sampled_token_ids[req_idx]
+                else:
+                    sampled_ids = (
+                        [-1] if req_idx not in invalid_req_indices_set else None
+                    )
             else:
                 sampled_ids = valid_sampled_token_ids[req_idx]
 
@@ -3744,12 +3842,36 @@ class GPUModelRunner(
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
                 spec_decode_metadata,
+                require_valid_sampled_token_ids_for_proposer=(
+                    propose_drafts_after_bookkeeping
+                ),
             )
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
             # tokens on the CPU, so they are run after bookkeeping.
             propose_draft_token_ids(valid_sampled_token_ids)
+
+        async_scheduler_draft_token_ids: DraftTokenIds | None = None
+        if (
+            self.use_async_scheduling
+            and spec_config is not None
+            and spec_decode_enabled
+            and spec_config.method in ("ngram", "suffix", "medusa")
+            and self._draft_token_ids is not None
+        ):
+            if isinstance(self._draft_token_ids, list):
+                async_scheduler_draft_token_ids = DraftTokenIds(
+                    req_ids_output_copy,
+                    [token_ids.copy() for token_ids in self._draft_token_ids],
+                )
+            else:
+                draft_token_ids, draft_req_ids = self._get_draft_token_ids_cpu()
+                if draft_req_ids:
+                    async_scheduler_draft_token_ids = DraftTokenIds(
+                        draft_req_ids,
+                        draft_token_ids,
+                    )
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
@@ -3766,6 +3888,7 @@ class GPUModelRunner(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
                 sampled_token_ids=valid_sampled_token_ids,
+                draft_token_ids=async_scheduler_draft_token_ids,
                 logprobs=logprobs_lists,
                 prompt_logprobs_dict=prompt_logprobs_dict,
                 kv_connector_output=kv_connector_output,
@@ -3850,9 +3973,16 @@ class GPUModelRunner(
     def _copy_draft_token_ids_to_cpu(
         self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
     ) -> None:
+        needs_async_scheduler_draft_handoff = (
+            self.use_async_scheduling
+            and self.speculative_config is not None
+            and self.speculative_config.method in ("ngram", "suffix", "medusa")
+        )
         # Check if we need to copy draft tokens to CPU. In async scheduling,
         # we only copy when needed for structured output, penalties or bad_words.
         if self.use_async_scheduling and not (
+            needs_async_scheduler_draft_handoff
+            or
             scheduler_output.has_structured_output_requests
             or self.input_batch.sampling_metadata.output_token_ids
         ):
@@ -4091,6 +4221,44 @@ class GPUModelRunner(
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 slot_mappings=slot_mappings,
             )
+
+        if SPEC_DECODE_DEBUG and isinstance(sampled_token_ids, list):
+            sampled_non_empty = [
+                i for i, token_ids in enumerate(sampled_token_ids) if len(token_ids) > 0
+            ]
+            sampled_preview = [
+                (i, sampled_token_ids[i][:SPEC_DECODE_DEBUG_MAX_TOKENS])
+                for i in sampled_non_empty[:SPEC_DECODE_DEBUG_MAX_REQS]
+            ]
+            if isinstance(draft_token_ids, list):
+                draft_non_empty = [
+                    i for i, token_ids in enumerate(draft_token_ids) if len(token_ids) > 0
+                ]
+                draft_preview = [
+                    (i, draft_token_ids[i][:SPEC_DECODE_DEBUG_MAX_TOKENS])
+                    for i in draft_non_empty[:SPEC_DECODE_DEBUG_MAX_REQS]
+                ]
+                logger.info(
+                    "spec decode proposer summary: method=%s sampled_non_empty=%d/%d "
+                    "draft_non_empty=%d/%d sampled_preview=%s draft_preview=%s",
+                    spec_config.method,
+                    len(sampled_non_empty),
+                    len(sampled_token_ids),
+                    len(draft_non_empty),
+                    len(draft_token_ids),
+                    sampled_preview,
+                    draft_preview,
+                )
+            else:
+                logger.info(
+                    "spec decode proposer summary: method=%s sampled_non_empty=%d/%d "
+                    "draft_tensor_shape=%s sampled_preview=%s",
+                    spec_config.method,
+                    len(sampled_non_empty),
+                    len(sampled_token_ids),
+                    tuple(draft_token_ids.shape),
+                    sampled_preview,
+                )
 
         return draft_token_ids
 
