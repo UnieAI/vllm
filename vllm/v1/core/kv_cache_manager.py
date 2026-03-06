@@ -164,9 +164,9 @@ class KVCacheManager:
     def set_use_eagle(self, use_eagle: bool) -> None:
         """Toggle EAGLE-specific KV cache handling at runtime.
 
-        This is used by scheduler-side speculative batch hysteresis so that
-        crossing `batch_max_size` can disable both speculative proposing and
-        EAGLE-specific KV/prefix-cache behavior.
+        This is used by scheduler-side speculative mode controls so that
+        disabling speculative proposing also disables EAGLE-specific
+        KV/prefix-cache behavior.
         """
         self.use_eagle = use_eagle
         self.coordinator.use_eagle = use_eagle

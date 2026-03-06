@@ -92,16 +92,12 @@ def test_defaults_with_usage_context():
     assert vllm_config.scheduler_config.max_num_batched_tokens == default_server_tokens  # noqa: E501
 
 
-def test_speculative_batch_hysteresis_args():
+def test_speculative_load_hysteresis_args():
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
     args = parser.parse_args(
         [
             "--speculative-config",
             '{"model":"ngram","num_speculative_tokens":2}',
-            "--speculative-batch-max-size",
-            "16",
-            "--speculative-batch-min-size",
-            "8",
             "--speculative-enable-load",
             "123",
             "--speculative-disable-load",
@@ -112,25 +108,9 @@ def test_speculative_batch_hysteresis_args():
     )
     vllm_config = EngineArgs.from_cli_args(args=args).create_engine_config()
     assert vllm_config.speculative_config is not None
-    assert vllm_config.speculative_config.batch_max_size == 16
-    assert vllm_config.speculative_config.batch_min_size == 8
     assert vllm_config.speculative_config.enable_load == 123
     assert vllm_config.speculative_config.disable_load == 234
     assert vllm_config.speculative_config.cooldown_sec == 45
-
-
-def test_speculative_batch_hysteresis_requires_pair():
-    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
-    args = parser.parse_args(
-        [
-            "--speculative-config",
-            '{"model":"ngram","num_speculative_tokens":2}',
-            "--speculative-batch-max-size",
-            "16",
-        ]
-    )
-    with pytest.raises(ValueError, match="must be set together"):
-        EngineArgs.from_cli_args(args=args).create_engine_config()
 
 
 def test_speculative_load_defaults():

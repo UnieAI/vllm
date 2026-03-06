@@ -104,19 +104,12 @@ class SpeculativeConfig:
     disable_by_batch_size: int | None = Field(default=None, ge=2)
     """Disable speculative decoding for new incoming requests when the number
     of enqueued requests is larger than this value, if provided."""
-    batch_max_size: int | None = Field(default=None, ge=1)
-    """Temporarily disable speculative decoding when running+queued requests
-    exceed this threshold."""
-    batch_min_size: int | None = Field(default=None, ge=1)
-    """Re-enable speculative decoding when running+queued requests drop below
-    this threshold. Values between [batch_min_size, batch_max_size] keep the
-    previous state."""
     enable_load: int = Field(default=120000, ge=1)
     """Enable speculative decoding when estimated token load drops below this
-    threshold. Only applies when batch_{min,max}_size are not both set."""
+    threshold."""
     disable_load: int = Field(default=180000, ge=1)
     """Disable speculative decoding when estimated token load exceeds this
-    threshold. Only applies when batch_{min,max}_size are not both set."""
+    threshold."""
     cooldown_sec: int = Field(default=30, ge=0)
     """Minimum seconds between speculative on/off mode switches."""
     disable_padded_drafter_batch: bool = False
@@ -694,19 +687,6 @@ class SpeculativeConfig:
                 "Expect the batch size threshold of disabling "
                 "speculative decoding is > 1, but got "
                 f"{self.disable_by_batch_size=}"
-            )
-        if (self.batch_max_size is None) != (self.batch_min_size is None):
-            raise ValueError(
-                "batch_max_size and batch_min_size must be set together."
-            )
-        if (
-            self.batch_max_size is not None
-            and self.batch_min_size is not None
-            and self.batch_min_size > self.batch_max_size
-        ):
-            raise ValueError(
-                f"batch_min_size={self.batch_min_size} must be <= "
-                f"batch_max_size={self.batch_max_size}"
             )
         if self.enable_load >= self.disable_load:
             raise ValueError(

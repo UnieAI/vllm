@@ -237,12 +237,8 @@ class Scheduler(SchedulerInterface):
         self.spec_cooldown_sec: int = 30
         self.spec_last_switch_time: float | None = None
         self.spec_error_recovery_until: float = 0.0
-        self.spec_batch_max_size: int | None = None
-        self.spec_batch_min_size: int | None = None
         if speculative_config:
             self.num_spec_tokens = speculative_config.num_speculative_tokens
-            self.spec_batch_max_size = speculative_config.batch_max_size
-            self.spec_batch_min_size = speculative_config.batch_min_size
             self.spec_enable_load = speculative_config.enable_load
             self.spec_disable_load = speculative_config.disable_load
             self.spec_cooldown_sec = speculative_config.cooldown_sec
@@ -997,15 +993,28 @@ class Scheduler(SchedulerInterface):
         if enable:
             logger.info("enable speculative decoding: %s", reason)
         else:
+            # Drop pending draft tokens when switching to non-spec mode.
+            # Otherwise, stale drafts can leak into non-spec scheduling math.
+            num_cleared_tokens = 0
+            num_affected_reqs = 0
+            for request in itertools.chain(self.running, self.waiting):
+                if request.spec_token_ids:
+                    num_cleared_tokens += len(request.spec_token_ids)
+                    num_affected_reqs += 1
+                    request.spec_token_ids = []
             logger.info("disable speculative decoding: %s", reason)
+            if num_cleared_tokens:
+                logger.info(
+                    "cleared pending draft tokens on spec-disable: "
+                    "affected_reqs=%d tokens=%d",
+                    num_affected_reqs,
+                    num_cleared_tokens,
+                )
 
     def _should_enable_spec_decode_for_batch(self) -> bool:
         """Apply speculative decoding controls.
 
-        Priority:
-        1) If batch_max_size/batch_min_size are both configured, use request
-           count hysteresis (legacy behavior).
-        2) Otherwise use token-load hysteresis with cooldown.
+        Use token-load hysteresis with cooldown.
         """
         if self.vllm_config.speculative_config is None:
             self.kv_cache_manager.set_use_eagle(
@@ -1017,32 +1026,6 @@ class Scheduler(SchedulerInterface):
         if not self.spec_decode_enabled and now < self.spec_error_recovery_until:
             self.kv_cache_manager.set_use_eagle(False)
             return False
-
-        if (
-            self.spec_batch_max_size is not None
-            and self.spec_batch_min_size is not None
-        ):
-            total_requests = len(self.running) + len(self.waiting)
-            if total_requests > self.spec_batch_max_size:
-                self._maybe_switch_spec_decode(
-                    enable=False,
-                    reason=(
-                        f"total_requests={total_requests} > "
-                        f"batch_max_size={self.spec_batch_max_size}"
-                    ),
-                )
-            elif total_requests < self.spec_batch_min_size:
-                self._maybe_switch_spec_decode(
-                    enable=True,
-                    reason=(
-                        f"total_requests={total_requests} < "
-                        f"batch_min_size={self.spec_batch_min_size}"
-                    ),
-                )
-            self.kv_cache_manager.set_use_eagle(
-                self.use_eagle and self.spec_decode_enabled
-            )
-            return self.spec_decode_enabled
 
         total_load = self._estimated_spec_decode_load()
         if total_load > self.spec_disable_load:

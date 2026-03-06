@@ -74,7 +74,32 @@ class AsyncScheduler(Scheduler):
 
         # Cache the new tokens. Preempted requests should be skipped.
         if status_before_update == RequestStatus.RUNNING:
-            self.kv_cache_manager.cache_blocks(
-                request, request.num_computed_tokens - request.num_output_placeholders
+            num_tokens_to_cache = (
+                request.num_computed_tokens - request.num_output_placeholders
             )
+            if num_tokens_to_cache < 0:
+                logger.warning(
+                    "Clamp negative num_tokens_to_cache for req %s: %d "
+                    "(computed=%d placeholders=%d).",
+                    request.request_id,
+                    num_tokens_to_cache,
+                    request.num_computed_tokens,
+                    request.num_output_placeholders,
+                )
+                num_tokens_to_cache = 0
+            elif num_tokens_to_cache > request.num_tokens:
+                logger.warning(
+                    "Clamp overflow num_tokens_to_cache for req %s: %d -> %d "
+                    "(computed=%d placeholders=%d num_tokens=%d).",
+                    request.request_id,
+                    num_tokens_to_cache,
+                    request.num_tokens,
+                    request.num_computed_tokens,
+                    request.num_output_placeholders,
+                    request.num_tokens,
+                )
+                num_tokens_to_cache = request.num_tokens
+
+            if num_tokens_to_cache:
+                self.kv_cache_manager.cache_blocks(request, num_tokens_to_cache)
         return new_token_ids, stopped
