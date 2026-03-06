@@ -597,17 +597,35 @@ class VllmConfig:
             "uni",
             "external_launcher",
         )
+        allow_async_with_non_eagle_spec = (
+            os.environ.get("VLLM_ALLOW_ASYNC_WITH_NON_EAGLE_SPEC", "0")
+            .strip()
+            .lower()
+            in ("1", "true", "yes", "on")
+        )
+        has_non_eagle_spec = (
+            self.speculative_config is not None
+            and self.speculative_config.method not in get_args(EagleModelTypes)
+        )
 
         if self.scheduler_config.async_scheduling:
             # Async scheduling explicitly enabled, hard fail any incompatibilities.
             # Currently, async scheduling only support eagle speculative
             # decoding.
-            if self.speculative_config is not None:
-                if self.speculative_config.method not in get_args(EagleModelTypes):
+            if has_non_eagle_spec:
+                if not allow_async_with_non_eagle_spec:
                     raise ValueError(
                         "Currently, async scheduling is only supported "
                         "with EAGLE/MTP kind of speculative decoding."
                     )
+                logger.warning_once(
+                    "Experimental mode: enabling async scheduling with "
+                    "%s-based speculative decoding "
+                    "(VLLM_ALLOW_ASYNC_WITH_NON_EAGLE_SPEC=1).",
+                    self.speculative_config.method,
+                    scope="local",
+                )
+            if self.speculative_config is not None:
                 if self.speculative_config.disable_padded_drafter_batch:
                     raise ValueError(
                         "Async scheduling is not compatible with "
@@ -627,8 +645,8 @@ class VllmConfig:
         elif self.scheduler_config.async_scheduling is None:
             # Enable async scheduling unless there is an incompatible option.
             if (
-                self.speculative_config is not None
-                and self.speculative_config.method not in get_args(EagleModelTypes)
+                has_non_eagle_spec
+                and not allow_async_with_non_eagle_spec
             ):
                 logger.warning_once(
                     "Async scheduling not supported with %s-based "
@@ -664,6 +682,14 @@ class VllmConfig:
                 )
                 self.scheduler_config.async_scheduling = False
             else:
+                if has_non_eagle_spec and allow_async_with_non_eagle_spec:
+                    logger.warning_once(
+                        "Experimental mode: enabling async scheduling with "
+                        "%s-based speculative decoding "
+                        "(VLLM_ALLOW_ASYNC_WITH_NON_EAGLE_SPEC=1).",
+                        self.speculative_config.method,
+                        scope="local",
+                    )
                 self.scheduler_config.async_scheduling = True
 
         logger.info_once(

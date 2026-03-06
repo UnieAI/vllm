@@ -104,6 +104,14 @@ class SpeculativeConfig:
     disable_by_batch_size: int | None = Field(default=None, ge=2)
     """Disable speculative decoding for new incoming requests when the number
     of enqueued requests is larger than this value, if provided."""
+    enable_load: int = Field(default=120000, ge=1)
+    """Enable speculative decoding when estimated token load drops below this
+    threshold."""
+    disable_load: int = Field(default=180000, ge=1)
+    """Disable speculative decoding when estimated token load exceeds this
+    threshold."""
+    cooldown_sec: int = Field(default=30, ge=0)
+    """Minimum seconds between speculative on/off mode switches."""
     disable_padded_drafter_batch: bool = False
     """Disable input padding for speculative decoding. If set to True,
     speculative input batches can contain sequences of different lengths,
@@ -679,6 +687,11 @@ class SpeculativeConfig:
                 "Expect the batch size threshold of disabling "
                 "speculative decoding is > 1, but got "
                 f"{self.disable_by_batch_size=}"
+            )
+        if self.enable_load >= self.disable_load:
+            raise ValueError(
+                f"enable_load={self.enable_load} must be < "
+                f"disable_load={self.disable_load}"
             )
 
         eagle3_target_supported = [

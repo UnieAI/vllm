@@ -885,6 +885,44 @@ def test_schedule_spec_decoding_stats(spec_tokens, output_tokens, expected):
         assert stats.num_accepted_tokens_per_pos == expected[3]
 
 
+def test_spec_decode_load_hysteresis():
+    scheduler = create_scheduler(
+        num_speculative_tokens=2,
+        speculative_enable_load=4,
+        speculative_disable_load=6,
+        speculative_cooldown_sec=0,
+    )
+    requests = create_requests(num_requests=4, num_tokens=2)
+    req_ids = []
+    req_id_to_index = {}
+    for i, request in enumerate(requests):
+        scheduler.add_request(request)
+        req_ids.append(request.request_id)
+        req_id_to_index[request.request_id] = i
+
+    # Above disable threshold: disable speculative decoding.
+    output = scheduler.schedule()
+    assert not output.enable_spec_decode
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+            sampled_token_ids=[[0] for _ in req_ids],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    # Drop load below enable threshold: speculative decoding turns back on.
+    scheduler.finish_requests(req_ids[1:], RequestStatus.FINISHED_ABORTED)
+    scheduler.update_draft_token_ids(DraftTokenIds([req_ids[0]], [[12, 13]]))
+    output = scheduler.schedule()
+    assert output.enable_spec_decode
+    assert output.scheduled_spec_decode_tokens.get(req_ids[0]) == [12, 13]
+
+
 def _assert_right_scheduler_output(
     output: SchedulerOutput,
     num_requests: int,

@@ -169,6 +169,11 @@ class ModelRunnerOutput:
     # each request due to speculative/jump decoding.
     sampled_token_ids: list[list[int]] = field(default_factory=list)
 
+    # Draft tokens generated for the next scheduler step.
+    # Used by async speculative decoding paths that need scheduler-side
+    # request.spec_token_ids to be updated without an extra RPC.
+    draft_token_ids: "DraftTokenIds | None" = None
+
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs]

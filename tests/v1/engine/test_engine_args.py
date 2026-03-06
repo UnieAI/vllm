@@ -90,3 +90,36 @@ def test_defaults_with_usage_context():
     vllm_config = engine_args.create_engine_config(UsageContext.OPENAI_API_SERVER)
     assert vllm_config.scheduler_config.max_num_seqs == default_max_num_seqs
     assert vllm_config.scheduler_config.max_num_batched_tokens == default_server_tokens  # noqa: E501
+
+
+def test_speculative_load_hysteresis_args():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--speculative-config",
+            '{"model":"ngram","num_speculative_tokens":2}',
+            "--speculative-enable-load",
+            "123",
+            "--speculative-disable-load",
+            "234",
+            "--speculative-cooldown-sec",
+            "45",
+        ]
+    )
+    vllm_config = EngineArgs.from_cli_args(args=args).create_engine_config()
+    assert vllm_config.speculative_config is not None
+    assert vllm_config.speculative_config.enable_load == 123
+    assert vllm_config.speculative_config.disable_load == 234
+    assert vllm_config.speculative_config.cooldown_sec == 45
+
+
+def test_speculative_load_defaults():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        ["--speculative-config", '{"model":"ngram","num_speculative_tokens":2}']
+    )
+    vllm_config = EngineArgs.from_cli_args(args=args).create_engine_config()
+    assert vllm_config.speculative_config is not None
+    assert vllm_config.speculative_config.enable_load == 120000
+    assert vllm_config.speculative_config.disable_load == 180000
+    assert vllm_config.speculative_config.cooldown_sec == 30

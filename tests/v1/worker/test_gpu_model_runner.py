@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -35,6 +37,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheTensor,
 )
+from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.worker.gpu_input_batch import InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -337,6 +340,152 @@ def test_update_states_request_resumed(model_runner, dist_init):
     assert _is_req_added(model_runner, req_id)
     assert _is_req_scheduled(model_runner, req_id)
     assert _is_req_state_block_table_match(model_runner, req_id)
+
+
+def _make_fake_runner_for_bookkeeping(
+    sampled_token_ids: torch.Tensor,
+    num_tokens_no_spec: np.ndarray,
+    discard_mask: np.ndarray,
+):
+    num_reqs = sampled_token_ids.shape[0]
+    max_model_len = 64
+    req_ids = [f"req_{i}" for i in range(num_reqs)]
+    req_id_to_index = {req_id: i for i, req_id in enumerate(req_ids)}
+    token_ids_cpu = np.zeros((num_reqs, max_model_len), dtype=np.int32)
+    is_token_ids = np.zeros((num_reqs, max_model_len), dtype=bool)
+    requests = {
+        req_id: SimpleNamespace(output_token_ids=[]) for req_id in req_ids
+    }
+    input_batch = SimpleNamespace(
+        num_reqs=num_reqs,
+        generators={},
+        req_ids=req_ids,
+        req_id_to_index=req_id_to_index,
+        prev_sampled_token_ids=None,
+        prev_req_id_to_index=None,
+        token_ids_cpu=token_ids_cpu,
+        is_token_ids=is_token_ids,
+        num_tokens_no_spec=num_tokens_no_spec.copy(),
+        vocab_size=1000,
+    )
+    fake_runner = SimpleNamespace(
+        use_async_scheduling=True,
+        input_batch=input_batch,
+        discard_request_mask=SimpleNamespace(np=discard_mask),
+        max_model_len=max_model_len,
+        requests=requests,
+        _to_list=lambda x: x.tolist(),
+        _get_prompt_logprobs_dict=lambda _hidden, _scheduled: {},
+    )
+    return fake_runner
+
+
+def test_bookkeeping_sync_async_returns_real_tokens_for_cpu_proposer():
+    sampled = torch.tensor(
+        [
+            [11, -1, -1],
+            [21, 22, -1],
+            [31, 32, 33],
+        ],
+        dtype=torch.int32,
+    )
+    starts = np.array([5, 7, 2], dtype=np.int32)
+    # Discard request index 1.
+    discard_mask = np.array([False, True, False], dtype=bool)
+    fake_runner = _make_fake_runner_for_bookkeeping(sampled, starts, discard_mask)
+    sampler_output = SamplerOutput(sampled_token_ids=sampled, logprobs_tensors=None)
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"req_0": 1, "req_1": 1, "req_2": 1}
+    )
+
+    (
+        _num_nans,
+        _logprobs,
+        valid_sampled_token_ids,
+        _prompt_logprobs,
+        _req_ids_copy,
+        _req_id_to_index_copy,
+        invalid_req_indices,
+    ) = GPUModelRunner._bookkeeping_sync(
+        fake_runner,
+        scheduler_output,
+        sampler_output,
+        logits=None,
+        hidden_states=torch.zeros(1, 1),
+        num_scheduled_tokens=1,
+        spec_decode_metadata=None,
+        require_valid_sampled_token_ids_for_proposer=True,
+    )
+
+    assert invalid_req_indices == [1]
+    assert valid_sampled_token_ids == [[11], [], [31, 32, 33]]
+    # Request 0: append one real token
+    assert fake_runner.input_batch.token_ids_cpu[0, 5:6].tolist() == [11]
+    # Request 1: discarded, unchanged
+    assert fake_runner.input_batch.num_tokens_no_spec[1] == 7
+    # Request 2: append three real tokens
+    assert fake_runner.input_batch.token_ids_cpu[2, 2:5].tolist() == [31, 32, 33]
+    assert fake_runner.input_batch.num_tokens_no_spec.tolist() == [6, 7, 5]
+
+
+def test_bookkeeping_sync_async_keeps_placeholder_when_not_required():
+    sampled = torch.tensor(
+        [
+            [11],
+            [21],
+        ],
+        dtype=torch.int32,
+    )
+    starts = np.array([3, 4], dtype=np.int32)
+    discard_mask = np.array([False, False], dtype=bool)
+    fake_runner = _make_fake_runner_for_bookkeeping(sampled, starts, discard_mask)
+    sampler_output = SamplerOutput(sampled_token_ids=sampled, logprobs_tensors=None)
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"req_0": 1, "req_1": 1}
+    )
+
+    (
+        _num_nans,
+        _logprobs,
+        valid_sampled_token_ids,
+        _prompt_logprobs,
+        _req_ids_copy,
+        _req_id_to_index_copy,
+        _invalid_req_indices,
+    ) = GPUModelRunner._bookkeeping_sync(
+        fake_runner,
+        scheduler_output,
+        sampler_output,
+        logits=None,
+        hidden_states=torch.zeros(1, 1),
+        num_scheduled_tokens=1,
+        spec_decode_metadata=None,
+        require_valid_sampled_token_ids_for_proposer=False,
+    )
+
+    assert valid_sampled_token_ids == []
+    # Legacy async path: append a single placeholder token per request.
+    assert fake_runner.input_batch.token_ids_cpu[0, 3:4].tolist() == [-1]
+    assert fake_runner.input_batch.token_ids_cpu[1, 4:5].tolist() == [-1]
+    assert fake_runner.input_batch.num_tokens_no_spec.tolist() == [4, 5]
+
+
+def test_copy_draft_token_ids_async_ngram_sets_req_ids_for_next_step():
+    fake_runner = SimpleNamespace(
+        use_async_scheduling=True,
+        speculative_config=SimpleNamespace(method="ngram"),
+        input_batch=SimpleNamespace(
+            req_ids=["req_0", "req_1"],
+            sampling_metadata=SimpleNamespace(output_token_ids=[]),
+        ),
+        _draft_token_ids=[[101, 102], [201, 202]],
+        _draft_token_req_ids=None,
+    )
+    scheduler_output = SimpleNamespace(has_structured_output_requests=False)
+
+    GPUModelRunner._copy_draft_token_ids_to_cpu(fake_runner, scheduler_output)
+
+    assert fake_runner._draft_token_req_ids == ["req_0", "req_1"]
 
 
 def test_get_nans_in_logits(model_runner, dist_init):

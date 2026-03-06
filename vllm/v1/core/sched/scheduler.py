@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -58,6 +59,31 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def _read_bool_env(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _read_int_env(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+SPEC_DECODE_DEBUG = _read_bool_env("VLLM_SPEC_DECODE_DEBUG", False)
+SPEC_DECODE_DEBUG_LOG_ALL = _read_bool_env("VLLM_SPEC_DECODE_DEBUG_LOG_ALL", False)
+SPEC_DECODE_DEBUG_MAX_REQS = max(1, _read_int_env("VLLM_SPEC_DECODE_DEBUG_MAX_REQS", 8))
+SPEC_DECODE_DEBUG_MAX_TOKENS = max(
+    1, _read_int_env("VLLM_SPEC_DECODE_DEBUG_MAX_TOKENS", 16)
+)
 
 
 class Scheduler(SchedulerInterface):
@@ -205,8 +231,17 @@ class Scheduler(SchedulerInterface):
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
         self.num_spec_tokens = self.num_lookahead_tokens = 0
+        self.spec_decode_enabled = speculative_config is not None
+        self.spec_enable_load: int = 120000
+        self.spec_disable_load: int = 180000
+        self.spec_cooldown_sec: int = 30
+        self.spec_last_switch_time: float | None = None
+        self.spec_error_recovery_until: float = 0.0
         if speculative_config:
             self.num_spec_tokens = speculative_config.num_speculative_tokens
+            self.spec_enable_load = speculative_config.enable_load
+            self.spec_disable_load = speculative_config.disable_load
+            self.spec_cooldown_sec = speculative_config.cooldown_sec
             if speculative_config.use_eagle():
                 self.use_eagle = True
                 self.num_lookahead_tokens = self.num_spec_tokens
@@ -269,6 +304,7 @@ class Scheduler(SchedulerInterface):
         num_new_tokens: int,
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
+        use_eagle: bool = False,
     ) -> int:
         assert num_external_computed_tokens == 0, (
             "External KV connector is not verified yet"
@@ -287,7 +323,7 @@ class Scheduler(SchedulerInterface):
                 request.num_prompt_tokens - request.num_prompt_tokens % block_size
             )
             # eagle prune
-            if self.use_eagle:
+            if use_eagle:
                 last_cache_position = max(last_cache_position - block_size, 0)
             num_computed_tokens = (
                 request.num_computed_tokens
@@ -335,6 +371,9 @@ class Scheduler(SchedulerInterface):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+        enable_spec_decode = self._should_enable_spec_decode_for_batch()
+        use_eagle = self.use_eagle and enable_spec_decode
+        num_lookahead_tokens = self.num_lookahead_tokens if enable_spec_decode else 0
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -343,6 +382,25 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            # Speculative-to-non-spec mode switches can temporarily leave
+            # request accounting inconsistent (computed tokens ahead of
+            # num_tokens_with_spec + placeholders). Normalize to keep
+            # scheduling math non-negative.
+            expected_computed = (
+                request.num_tokens_with_spec + request.num_output_placeholders
+            )
+            if request.num_computed_tokens > expected_computed:
+                logger.warning(
+                    "Normalize req %s computed tokens from %d to %d "
+                    "(num_tokens_with_spec=%d, placeholders=%d).",
+                    request.request_id,
+                    request.num_computed_tokens,
+                    expected_computed,
+                    request.num_tokens_with_spec,
+                    request.num_output_placeholders,
+                )
+                request.num_computed_tokens = expected_computed
 
             if (
                 request.num_output_placeholders > 0
@@ -390,15 +448,15 @@ class Scheduler(SchedulerInterface):
                     request.num_computed_tokens,
                     num_new_tokens,
                     encoder_compute_budget,
-                    shift_computed_tokens=1 if self.use_eagle else 0,
+                    shift_computed_tokens=1 if use_eagle else 0,
                 )
 
             if self.need_mamba_block_aligned_split:
                 num_new_tokens = self._mamba_block_aligned_split(
-                    request, num_new_tokens
+                    request, num_new_tokens, use_eagle=use_eagle
                 )
 
-            if num_new_tokens == 0:
+            if num_new_tokens <= 0:
                 # The request cannot be scheduled because one of the following
                 # reasons:
                 # 1. No new tokens to schedule. This may happen when
@@ -413,6 +471,27 @@ class Scheduler(SchedulerInterface):
                 # NOTE(woosuk): Here, by doing `continue` instead of `break`,
                 # we do not strictly follow the FCFS scheduling policy and
                 # allow the lower-priority requests to be scheduled.
+                if num_new_tokens < 0:
+                    logger.warning(
+                        "Skip scheduling req %s due to negative num_new_tokens=%d "
+                        "(computed=%d, num_tokens_with_spec=%d, placeholders=%d).",
+                        request.request_id,
+                        num_new_tokens,
+                        request.num_computed_tokens,
+                        request.num_tokens_with_spec,
+                        request.num_output_placeholders,
+                    )
+                    if self.spec_decode_enabled:
+                        self.spec_decode_enabled = False
+                        self.spec_last_switch_time = time.monotonic()
+                        self.spec_error_recovery_until = (
+                            self.spec_last_switch_time + 60.0
+                        )
+                        self.kv_cache_manager.set_use_eagle(False)
+                        logger.warning(
+                            "Disable speculative decoding due to scheduler "
+                            "accounting anomaly; recovery allowed after 60s."
+                        )
                 req_index += 1
                 continue
 
@@ -422,7 +501,7 @@ class Scheduler(SchedulerInterface):
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens,
+                        num_lookahead_tokens=num_lookahead_tokens,
                     )
 
                     if new_blocks is not None:
@@ -480,7 +559,7 @@ class Scheduler(SchedulerInterface):
             req_index += 1
 
             # Speculative decode related.
-            if request.spec_token_ids:
+            if enable_spec_decode and request.spec_token_ids:
                 num_scheduled_spec_tokens = (
                     num_new_tokens
                     + request.num_computed_tokens
@@ -495,6 +574,8 @@ class Scheduler(SchedulerInterface):
                     )
                 # New spec tokens will be set in `update_draft_token_ids` before the
                 # next step when applicable.
+                request.spec_token_ids = []
+            elif request.spec_token_ids:
                 request.spec_token_ids = []
 
             # Encoder-related.
@@ -669,7 +750,7 @@ class Scheduler(SchedulerInterface):
                             num_computed_tokens,
                             num_new_tokens,
                             encoder_compute_budget,
-                            shift_computed_tokens=1 if self.use_eagle else 0,
+                            shift_computed_tokens=1 if use_eagle else 0,
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
@@ -681,6 +762,7 @@ class Scheduler(SchedulerInterface):
                         num_new_tokens,
                         num_new_local_computed_tokens,
                         num_external_computed_tokens,
+                        use_eagle=use_eagle,
                     )
                     if num_new_tokens == 0:
                         break
@@ -691,7 +773,7 @@ class Scheduler(SchedulerInterface):
                 # creates a mismatch between the number
                 # of local and remote blocks.
                 effective_lookahead_tokens = (
-                    0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
+                    0 if request.num_computed_tokens == 0 else num_lookahead_tokens
                 )
 
                 num_encoder_tokens = (
@@ -853,6 +935,7 @@ class Scheduler(SchedulerInterface):
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
             preempted_req_ids={req.request_id for req in preempted_reqs},
+            enable_spec_decode=enable_spec_decode,
             # finished_req_ids is an existing state in the scheduler,
             # instead of being newly scheduled in this step.
             # It contains the request IDs that are finished in between
@@ -881,6 +964,87 @@ class Scheduler(SchedulerInterface):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
+
+    def _estimated_spec_decode_load(self) -> int:
+        # Estimate pressure from all active requests using the remaining
+        # scheduler-visible tokens (prompt + decode + placeholders).
+        requests = itertools.chain(self.running, self.waiting)
+        return sum(
+            max(
+                0,
+                request.num_tokens_with_spec
+                + request.num_output_placeholders
+                - request.num_computed_tokens,
+            )
+            for request in requests
+        )
+
+    def _maybe_switch_spec_decode(self, enable: bool, reason: str) -> None:
+        if self.spec_decode_enabled == enable:
+            return
+        now = time.monotonic()
+        if (
+            self.spec_last_switch_time is not None
+            and now - self.spec_last_switch_time < self.spec_cooldown_sec
+        ):
+            return
+        self.spec_decode_enabled = enable
+        self.spec_last_switch_time = now
+        if enable:
+            logger.info("enable speculative decoding: %s", reason)
+        else:
+            # Drop pending draft tokens when switching to non-spec mode.
+            # Otherwise, stale drafts can leak into non-spec scheduling math.
+            num_cleared_tokens = 0
+            num_affected_reqs = 0
+            for request in itertools.chain(self.running, self.waiting):
+                if request.spec_token_ids:
+                    num_cleared_tokens += len(request.spec_token_ids)
+                    num_affected_reqs += 1
+                    request.spec_token_ids = []
+            logger.info("disable speculative decoding: %s", reason)
+            if num_cleared_tokens:
+                logger.info(
+                    "cleared pending draft tokens on spec-disable: "
+                    "affected_reqs=%d tokens=%d",
+                    num_affected_reqs,
+                    num_cleared_tokens,
+                )
+
+    def _should_enable_spec_decode_for_batch(self) -> bool:
+        """Apply speculative decoding controls.
+
+        Use token-load hysteresis with cooldown.
+        """
+        if self.vllm_config.speculative_config is None:
+            self.kv_cache_manager.set_use_eagle(
+                self.use_eagle and self.spec_decode_enabled
+            )
+            return self.spec_decode_enabled
+
+        now = time.monotonic()
+        if not self.spec_decode_enabled and now < self.spec_error_recovery_until:
+            self.kv_cache_manager.set_use_eagle(False)
+            return False
+
+        total_load = self._estimated_spec_decode_load()
+        if total_load > self.spec_disable_load:
+            self._maybe_switch_spec_decode(
+                enable=False,
+                reason=(
+                    f"load={total_load} > disable_load={self.spec_disable_load}"
+                ),
+            )
+        elif total_load < self.spec_enable_load:
+            self._maybe_switch_spec_decode(
+                enable=True,
+                reason=(f"load={total_load} < enable_load={self.spec_enable_load}"),
+            )
+
+        self.kv_cache_manager.set_use_eagle(
+            self.use_eagle and self.spec_decode_enabled
+        )
+        return self.spec_decode_enabled
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.
@@ -1231,6 +1395,10 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        draft_token_ids = model_runner_output.draft_token_ids
+
+        if self.scheduler_config.async_scheduling and draft_token_ids is not None:
+            self.update_draft_token_ids(draft_token_ids)
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -1260,6 +1428,7 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        debug_emitted = 0
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
@@ -1282,7 +1451,12 @@ class Scheduler(SchedulerInterface):
             )
             if scheduled_spec_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
-                num_accepted = len(generated_token_ids) - 1
+                # `generated_token_ids` can be empty for an invalid/aborted async
+                # request in a speculative step. Clamp to keep stats/counters sane.
+                num_accepted = max(
+                    0,
+                    min(len(generated_token_ids) - 1, num_draft_tokens),
+                )
                 num_rejected = num_draft_tokens - num_accepted
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
@@ -1302,6 +1476,39 @@ class Scheduler(SchedulerInterface):
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
                 )
+                if SPEC_DECODE_DEBUG and debug_emitted < SPEC_DECODE_DEBUG_MAX_REQS:
+                    if SPEC_DECODE_DEBUG_LOG_ALL or num_rejected > 0:
+                        draft_preview = scheduled_spec_token_ids[
+                            :SPEC_DECODE_DEBUG_MAX_TOKENS
+                        ]
+                        generated_preview = generated_token_ids[
+                            :SPEC_DECODE_DEBUG_MAX_TOKENS
+                        ]
+                        if num_rejected > 0:
+                            logger.info(
+                                "spec decode rejected draft tokens: req_id=%s "
+                                "draft=%d accepted=%d rejected=%d "
+                                "scheduled_draft_preview=%s generated_preview=%s",
+                                req_id,
+                                num_draft_tokens,
+                                num_accepted,
+                                num_rejected,
+                                draft_preview,
+                                generated_preview,
+                            )
+                        else:
+                            logger.info(
+                                "spec decode accepted all drafts: req_id=%s "
+                                "draft=%d accepted=%d rejected=%d "
+                                "scheduled_draft_preview=%s generated_preview=%s",
+                                req_id,
+                                num_draft_tokens,
+                                num_accepted,
+                                num_rejected,
+                                draft_preview,
+                                generated_preview,
+                            )
+                        debug_emitted += 1
 
             stopped = False
             new_logprobs = None
