@@ -16,6 +16,13 @@ class AsyncScheduler(Scheduler):
         pending_structured_output_tokens = False
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
         enable_spec_decode = scheduler_output.enable_spec_decode
+        speculative_config = self.vllm_config.speculative_config
+        # In async + ngram mode, placeholder draft ids (-1) can be scheduled
+        # before fresh drafts arrive, which may corrupt decoding quality.
+        # Keep async output placeholders, but skip speculative placeholders.
+        skip_ngram_spec_placeholders = (
+            speculative_config is not None and speculative_config.method == "ngram"
+        )
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests[req_id]
             has_structured_output_requests |= request.use_structured_output
@@ -36,7 +43,11 @@ class AsyncScheduler(Scheduler):
                 request.num_output_placeholders += 1 + cur_num_spec_tokens
                 # Add placeholders for the new tokens in spec_token_ids.
                 # We will update the actual spec token ids in the worker process.
-                request.spec_token_ids = [-1] * cur_num_spec_tokens
+                request.spec_token_ids = (
+                    []
+                    if skip_ngram_spec_placeholders
+                    else [-1] * cur_num_spec_tokens
+                )
 
         scheduler_output.has_structured_output_requests = has_structured_output_requests
         scheduler_output.pending_structured_output_tokens = (

@@ -237,6 +237,10 @@ class Scheduler(SchedulerInterface):
         self.spec_cooldown_sec: int = 30
         self.spec_last_switch_time: float | None = None
         self.spec_error_recovery_until: float = 0.0
+        # For async+ngram, repeated enable/disable flips can destabilize
+        # placeholder accounting in-flight. Hold non-spec mode until the
+        # current active batch drains once we disable due to load.
+        self.spec_hold_disabled_until_idle: bool = False
         if speculative_config:
             self.num_spec_tokens = speculative_config.num_speculative_tokens
             self.spec_enable_load = speculative_config.enable_load
@@ -966,8 +970,14 @@ class Scheduler(SchedulerInterface):
         return scheduler_output
 
     def _estimated_spec_decode_load(self) -> int:
-        # Estimate pressure from all active requests using the remaining
-        # scheduler-visible tokens (prompt + decode + placeholders).
+        # Estimate pressure from all active requests.
+        #
+        # scheduler_visible_remaining captures immediate scheduling pressure
+        # (prompt + decode + placeholders not yet computed).
+        # decode_remaining captures tail decode work, which can stay large in
+        # high-concurrency decode-heavy phases where scheduler-visible deltas
+        # are small (e.g. ~1 token/request). Without this term, we can
+        # prematurely re-enable spec decode under heavy load.
         requests = itertools.chain(self.running, self.waiting)
         return sum(
             max(
@@ -976,10 +986,28 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens,
             )
+            + max(
+                0,
+                request.max_tokens
+                - request.num_output_tokens
+                - request.num_output_placeholders,
+            )
             for request in requests
         )
 
-    def _maybe_switch_spec_decode(self, enable: bool, reason: str) -> None:
+    @staticmethod
+    def _request_uses_stochastic_sampling(request: Request) -> bool:
+        sampling_params = request.sampling_params
+        if sampling_params is None:
+            return False
+        return sampling_params.temperature > 0.0
+
+    def _maybe_switch_spec_decode(
+        self,
+        enable: bool,
+        reason: str,
+        hold_disabled_until_idle: bool = False,
+    ) -> None:
         if self.spec_decode_enabled == enable:
             return
         now = time.monotonic()
@@ -991,8 +1019,11 @@ class Scheduler(SchedulerInterface):
         self.spec_decode_enabled = enable
         self.spec_last_switch_time = now
         if enable:
+            self.spec_hold_disabled_until_idle = False
             logger.info("enable speculative decoding: %s", reason)
         else:
+            if hold_disabled_until_idle:
+                self.spec_hold_disabled_until_idle = True
             # Drop pending draft tokens when switching to non-spec mode.
             # Otherwise, stale drafts can leak into non-spec scheduling math.
             num_cleared_tokens = 0
@@ -1027,13 +1058,40 @@ class Scheduler(SchedulerInterface):
             self.kv_cache_manager.set_use_eagle(False)
             return False
 
+        speculative_config = self.vllm_config.speculative_config
+        if (
+            speculative_config is not None
+            and speculative_config.method == "ngram"
+            and any(
+                self._request_uses_stochastic_sampling(request)
+                for request in itertools.chain(self.running, self.waiting)
+            )
+        ):
+            # Keep ngram speculative decoding on the deterministic path.
+            # Stochastic sampling is currently unstable under async+ngram.
+            self.kv_cache_manager.set_use_eagle(False)
+            return False
+
+        if self.spec_hold_disabled_until_idle:
+            # Lift the hold only when there is no in-flight request.
+            if self.running or self.waiting:
+                self.kv_cache_manager.set_use_eagle(False)
+                return False
+            self.spec_hold_disabled_until_idle = False
+
         total_load = self._estimated_spec_decode_load()
         if total_load > self.spec_disable_load:
+            hold_disabled_until_idle = (
+                speculative_config is not None
+                and speculative_config.method == "ngram"
+                and self.scheduler_config.async_scheduling
+            )
             self._maybe_switch_spec_decode(
                 enable=False,
                 reason=(
                     f"load={total_load} > disable_load={self.spec_disable_load}"
                 ),
+                hold_disabled_until_idle=hold_disabled_until_idle,
             )
         elif total_load < self.spec_enable_load:
             self._maybe_switch_spec_decode(
