@@ -923,6 +923,38 @@ def test_spec_decode_load_hysteresis():
     assert output.scheduled_spec_decode_tokens.get(req_ids[0]) == [12, 13]
 
 
+def test_ngram_stochastic_sampling_disables_spec_and_clears_waiting_drafts(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_ALLOW_ASYNC_WITH_NON_EAGLE_SPEC", "1")
+    scheduler = create_scheduler(
+        num_speculative_tokens=2,
+        async_scheduling=True,
+        max_num_seqs=1,
+    )
+    requests = create_requests(num_requests=2, num_tokens=2, max_tokens=8)
+
+    # Make one request stochastic (temperature > 0) and leave one deterministic.
+    requests[0].sampling_params = SamplingParams(max_tokens=8, temperature=0.0)
+    requests[1].sampling_params = SamplingParams(max_tokens=8, temperature=0.7)
+
+    # Simulate stale drafts carried from a previous speculative step.
+    requests[0].spec_token_ids = [101, 102]
+    requests[1].spec_token_ids = [201, 202]
+
+    for request in requests:
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert not output.enable_spec_decode
+    assert not scheduler.spec_decode_enabled
+    # One request stays in waiting queue due max_num_seqs=1; stale drafts
+    # must still be cleared for both running and waiting requests.
+    assert len(scheduler.waiting) == 1
+    assert requests[0].spec_token_ids == []
+    assert requests[1].spec_token_ids == []
+
+
 def _assert_right_scheduler_output(
     output: SchedulerOutput,
     num_requests: int,

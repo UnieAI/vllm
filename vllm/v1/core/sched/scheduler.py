@@ -1024,23 +1024,26 @@ class Scheduler(SchedulerInterface):
         else:
             if hold_disabled_until_idle:
                 self.spec_hold_disabled_until_idle = True
+            logger.info("disable speculative decoding: %s", reason)
             # Drop pending draft tokens when switching to non-spec mode.
             # Otherwise, stale drafts can leak into non-spec scheduling math.
-            num_cleared_tokens = 0
-            num_affected_reqs = 0
-            for request in itertools.chain(self.running, self.waiting):
-                if request.spec_token_ids:
-                    num_cleared_tokens += len(request.spec_token_ids)
-                    num_affected_reqs += 1
-                    request.spec_token_ids = []
-            logger.info("disable speculative decoding: %s", reason)
-            if num_cleared_tokens:
-                logger.info(
-                    "cleared pending draft tokens on spec-disable: "
-                    "affected_reqs=%d tokens=%d",
-                    num_affected_reqs,
-                    num_cleared_tokens,
-                )
+            self._clear_pending_spec_tokens()
+
+    def _clear_pending_spec_tokens(self) -> None:
+        num_cleared_tokens = 0
+        num_affected_reqs = 0
+        for request in itertools.chain(self.running, self.waiting):
+            if request.spec_token_ids:
+                num_cleared_tokens += len(request.spec_token_ids)
+                num_affected_reqs += 1
+                request.spec_token_ids = []
+        if num_cleared_tokens:
+            logger.info(
+                "cleared pending draft tokens on spec-disable: "
+                "affected_reqs=%d tokens=%d",
+                num_affected_reqs,
+                num_cleared_tokens,
+            )
 
     def _should_enable_spec_decode_for_batch(self) -> bool:
         """Apply speculative decoding controls.
@@ -1062,6 +1065,7 @@ class Scheduler(SchedulerInterface):
         if (
             speculative_config is not None
             and speculative_config.method == "ngram"
+            and self.scheduler_config.async_scheduling
             and any(
                 self._request_uses_stochastic_sampling(request)
                 for request in itertools.chain(self.running, self.waiting)
@@ -1069,6 +1073,16 @@ class Scheduler(SchedulerInterface):
         ):
             # Keep ngram speculative decoding on the deterministic path.
             # Stochastic sampling is currently unstable under async+ngram.
+            # Force non-spec mode and scrub stale drafts immediately.
+            if self.spec_decode_enabled:
+                self.spec_decode_enabled = False
+                self.spec_last_switch_time = now
+                self.spec_hold_disabled_until_idle = False
+                logger.info(
+                    "disable speculative decoding: ngram with stochastic "
+                    "sampling (temperature > 0)"
+                )
+            self._clear_pending_spec_tokens()
             self.kv_cache_manager.set_use_eagle(False)
             return False
 
