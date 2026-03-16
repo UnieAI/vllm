@@ -2923,15 +2923,20 @@ class GPUModelRunner(
         logprobs_tensors = sampler_output.logprobs_tensors
         invalid_req_indices = []
         logprobs_lists = None
+        sampled_token_ids_cpu: torch.Tensor | None = None
+        discard_req_indices_set: set[int] = set()
         if not self.use_async_scheduling:
             # Get the valid generated tokens.
             max_gen_len = sampled_token_ids.shape[-1]
             if max_gen_len == 1:
                 # No spec decode tokens.
-                valid_sampled_token_ids = self._to_list(sampled_token_ids)
-                # Mask out the sampled tokens that should not be sampled.
-                for i in discard_sampled_tokens_req_indices:
-                    valid_sampled_token_ids[int(i)].clear()
+                sampled_token_ids_cpu = self._copy_sampled_token_ids_to_cpu_tensor(
+                    sampled_token_ids
+                )
+                discard_req_indices_set = {
+                    int(i) for i in discard_sampled_tokens_req_indices.tolist()
+                }
+                valid_sampled_token_ids = [[] for _ in range(num_sampled_tokens)]
 
                 if logprobs_tensors is not None:
                     logprobs_lists = logprobs_tensors.tolists()
@@ -2970,6 +2975,12 @@ class GPUModelRunner(
         for req_idx in range(num_sampled_tokens):
             if self.use_async_scheduling:
                 sampled_ids = [-1] if req_idx not in invalid_req_indices_set else None
+            elif sampled_token_ids_cpu is not None:
+                if req_idx in discard_req_indices_set:
+                    sampled_ids = []
+                else:
+                    sampled_ids = [int(sampled_token_ids_cpu[req_idx, 0])]
+                    valid_sampled_token_ids[req_idx] = sampled_ids
             else:
                 sampled_ids = valid_sampled_token_ids[req_idx]
 
@@ -3937,6 +3948,63 @@ class GPUModelRunner(
         sampled_count_event.synchronize()
         return counts_cpu[: prev_sampled_token_ids.shape[0]].tolist()
 
+    def get_ngram_proposal_inputs(
+        self,
+        sampled_token_ids: list[list[int]],
+        slot_mappings: dict[str, torch.Tensor]
+        | list[dict[str, torch.Tensor]]
+        | None,
+    ) -> "NgramProposalInputs":
+        """Prepare ngram proposer inputs.
+
+        Backends can override this hook to customize request filtering or token
+        history preparation while reusing the shared ngram proposal path in
+        ``propose_draft_token_ids``.
+        """
+        from vllm.v1.spec_decode.ngram_proposer import (NgramProposalInputs,
+                                                       NgramProposer)
+
+        assert isinstance(self.drafter, NgramProposer)
+
+        valid_ngram_requests = np.empty(len(sampled_token_ids), dtype=np.int32)
+        num_valid_requests = 0
+        for i, sampled_ids in enumerate(sampled_token_ids):
+            if self.drafter.should_propose_for_request(
+                i,
+                sampled_ids,
+                self.input_batch.num_tokens_no_spec[i],
+            ):
+                valid_ngram_requests[num_valid_requests] = i
+                num_valid_requests += 1
+
+        return NgramProposalInputs(
+            sampled_token_ids=sampled_token_ids,
+            num_tokens_no_spec=self.input_batch.num_tokens_no_spec,
+            token_ids_cpu=self.input_batch.token_ids_cpu,
+            valid_ngram_requests=valid_ngram_requests[:num_valid_requests],
+        )
+
+    def propose_ngram_draft_token_ids(
+        self,
+        sampled_token_ids: list[list[int]],
+        slot_mappings: dict[str, torch.Tensor]
+        | list[dict[str, torch.Tensor]]
+        | None,
+    ) -> list[list[int]]:
+        from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+
+        assert isinstance(self.drafter, NgramProposer)
+        ngram_inputs = self.get_ngram_proposal_inputs(
+            sampled_token_ids, slot_mappings
+        )
+        return self.drafter.propose(
+            ngram_inputs.sampled_token_ids,
+            ngram_inputs.num_tokens_no_spec,
+            ngram_inputs.token_ids_cpu,
+            slot_mappings=slot_mappings,
+            valid_ngram_requests=ngram_inputs.valid_ngram_requests,
+        )
+
     def propose_draft_token_ids(
         self,
         scheduler_output: "SchedulerOutput",
@@ -3953,15 +4021,10 @@ class GPUModelRunner(
         spec_config = self.speculative_config
         assert spec_config is not None
         if spec_config.method == "ngram":
-            from vllm.v1.spec_decode.ngram_proposer import NgramProposer
-
             assert isinstance(sampled_token_ids, list)
-            assert isinstance(self.drafter, NgramProposer)
-            draft_token_ids = self.drafter.propose(
+            draft_token_ids = self.propose_ngram_draft_token_ids(
                 sampled_token_ids,
-                self.input_batch.num_tokens_no_spec,
-                self.input_batch.token_ids_cpu,
-                slot_mappings=slot_mappings,
+                slot_mappings,
             )
         elif spec_config.method == "suffix":
             assert isinstance(sampled_token_ids, list)
@@ -6186,7 +6249,9 @@ class GPUModelRunner(
 
         return kv_cache_spec
 
-    def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
+    def _copy_sampled_token_ids_to_cpu_tensor(
+        self, sampled_token_ids: torch.Tensor
+    ) -> torch.Tensor:
         # This is a short term mitigation for issue mentioned in
         # https://github.com/vllm-project/vllm/issues/22754.
         # `tolist` would trigger a cuda wise stream sync, which
@@ -6199,6 +6264,10 @@ class GPUModelRunner(
         pinned.copy_(sampled_token_ids, non_blocking=True)
         self.transfer_event.record()
         self.transfer_event.synchronize()
+        return pinned
+
+    def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
+        pinned = self._copy_sampled_token_ids_to_cpu_tensor(sampled_token_ids)
         return pinned.tolist()
 
     def get_encoder_timing_stats(self) -> dict[str, dict[str, float | int]]:

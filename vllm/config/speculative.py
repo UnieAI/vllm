@@ -53,6 +53,7 @@ SpeculativeMethod = Literal[
     "suffix",
     EagleModelTypes,
 ]
+DSCAutoFallbackMode = Literal["disabled", "shadow", "enforce"]
 
 
 @config
@@ -109,6 +110,36 @@ class SpeculativeConfig:
     speculative input batches can contain sequences of different lengths,
     which may only be supported by certain attention backends. This currently
     only affects the EAGLE method of speculation."""
+    auto_fallback_enabled: bool = False
+    """Enable runtime auto-fallback that can disable speculative decoding
+    based on system signals (e.g., concurrency, acceptance)."""
+    auto_fallback_mode: DSCAutoFallbackMode | None = None
+    """Runtime controller mode. If unset, preserves the legacy
+    auto_fallback_enabled behavior: disabled when false, enforce when true."""
+    auto_fallback_max_concurrency: int | None = Field(default=None, ge=1)
+    """If set, disable speculative decoding when running+waiting requests
+    reach or exceed this threshold."""
+    auto_fallback_enable_load: int | None = Field(default=None, ge=1)
+    """If set, re-enable speculative decoding when estimated token load drops
+    below this threshold."""
+    auto_fallback_disable_load: int | None = Field(default=None, ge=1)
+    """If set, disable speculative decoding when estimated token load rises
+    above this threshold."""
+    auto_fallback_min_accept_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    """If set, disable speculative decoding when rolling acceptance rate is
+    below this threshold."""
+    auto_fallback_resume_accept_rate: float | None = Field(
+        default=None, ge=0.0, le=1.0
+    )
+    """If set, re-enable speculative decoding once the acceptance rate recovers
+    to this level."""
+    auto_fallback_cooldown_sec: float = Field(default=5.0, ge=0.0)
+    """Minimum time between auto-fallback toggles."""
+    auto_fallback_window: int = Field(default=20, ge=1)
+    """Number of recent acceptance samples to average for the controller."""
+    auto_fallback_min_speculative_tokens: int | None = Field(default=None, ge=1)
+    """Minimum speculative depth to retain when the controller adaptively
+    shrinks speculation."""
 
     # Ngram proposer configuration
     prompt_lookup_max: int | None = Field(default=None, ge=1)
@@ -117,6 +148,9 @@ class SpeculativeConfig:
     prompt_lookup_min: int | None = Field(default=None, ge=1)
     """Minimum size of ngram token window when using Ngram proposer, if
     provided. Defaults to 1."""
+    prompt_lookup_window: int | None = Field(default=None, ge=1)
+    """Optional maximum number of recent context tokens to search when using
+    the ngram proposer. If unset, search the full context."""
 
     # Alternative drafting strategies
     speculative_token_tree: str | None = None
@@ -453,7 +487,7 @@ class SpeculativeConfig:
 
                     if isinstance(
                         self.draft_model_config.hf_config,
-                        (EAGLEConfig, SpeculatorsConfig),
+                        EAGLEConfig | SpeculatorsConfig,
                     ):
                         pass
                     else:
@@ -708,6 +742,33 @@ class SpeculativeConfig:
                 "speculative decoding is > 1, but got "
                 f"{self.disable_by_batch_size=}"
             )
+        if (
+            self.auto_fallback_resume_accept_rate is not None
+            and self.auto_fallback_min_accept_rate is not None
+            and self.auto_fallback_resume_accept_rate
+            < self.auto_fallback_min_accept_rate
+        ):
+            raise ValueError(
+                "auto_fallback_resume_accept_rate must be >= "
+                "auto_fallback_min_accept_rate when both are set."
+            )
+        if (
+            self.auto_fallback_enable_load is not None
+            and self.auto_fallback_disable_load is not None
+            and self.auto_fallback_enable_load > self.auto_fallback_disable_load
+        ):
+            raise ValueError(
+                "auto_fallback_enable_load must be <= "
+                "auto_fallback_disable_load when both are set."
+            )
+        if (
+            self.auto_fallback_min_speculative_tokens is not None
+            and self.auto_fallback_min_speculative_tokens > self.num_speculative_tokens
+        ):
+            raise ValueError(
+                "auto_fallback_min_speculative_tokens must be <= "
+                "num_speculative_tokens."
+            )
 
         eagle3_target_supported = [
             "llama",
@@ -732,6 +793,17 @@ class SpeculativeConfig:
             )
         self.verify_equal_vocab_size_if_draft_model()
         return self
+
+    def resolved_auto_fallback_mode(self) -> DSCAutoFallbackMode:
+        if self.auto_fallback_mode is not None:
+            return self.auto_fallback_mode
+        return "enforce" if self.auto_fallback_enabled else "disabled"
+
+    def auto_fallback_runtime_enabled(self) -> bool:
+        return self.resolved_auto_fallback_mode() != "disabled"
+
+    def auto_fallback_is_shadow(self) -> bool:
+        return self.resolved_auto_fallback_mode() == "shadow"
 
     def verify_equal_vocab_size_if_draft_model(self):
         if (

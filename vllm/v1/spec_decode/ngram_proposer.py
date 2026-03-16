@@ -1,12 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
+from typing import NamedTuple
 
 import numpy as np
 import torch
 from numba import get_num_threads, jit, njit, prange, set_num_threads
 
 from vllm.config import VllmConfig
+
+
+class NgramProposalInputs(NamedTuple):
+    sampled_token_ids: list[list[int]]
+    num_tokens_no_spec: np.ndarray
+    token_ids_cpu: np.ndarray
+    valid_ngram_requests: np.ndarray | None = None
 
 
 class NgramProposer:
@@ -19,6 +27,8 @@ class NgramProposer:
         self.min_n = vllm_config.speculative_config.prompt_lookup_min
         # Maximum length of the n-gram to match.
         self.max_n = vllm_config.speculative_config.prompt_lookup_max
+        # Optional search window over recent context only.
+        self.search_window = vllm_config.speculative_config.prompt_lookup_window
         # Number of tokens follow the match. If there are less than k
         # tokens follow the match, we will return the maximum amount of
         # tokens until the end.
@@ -43,58 +53,77 @@ class NgramProposer:
             # Cap the number of threads to 8 to avoid using too many threads
             # since other components like frontend (incl tokenization)
             # and Structured Outputs also use multiple threads.
-            # TODO(ekagra-ranjan): bump up the cap from 1 to 8
-            # when TP parallelization for ngram is implemented.
-            self.num_numba_thread_available = min(1, (cpu_count // 2))
+            self.num_numba_thread_available = min(8, max(1, cpu_count // 2))
             # Divide by tp_size to ensure each tensor parallel rank
             # has some threads since all ranks will run this.
-            self.num_numba_thread_available //= tp_size
+            self.num_numba_thread_available = max(
+                1, self.num_numba_thread_available // max(1, tp_size)
+            )
         else:
             self.num_numba_thread_available = 1
 
-        # Trigger Numba JIT compilation for N-gram proposer.
-        # This usually takes less than 1 second.
+        # Trigger Numba JIT compilation without allocating a full
+        # max_model_len-sized warmup batch.
+        warmup_num_reqs = min(8, max_num_seqs)
+        warmup_model_len = min(
+            self.max_model_len,
+            max(64, self.max_n + self.k, self.min_n + self.k),
+        )
         self.propose(
-            [[]] * 1024,
-            np.zeros(1024, dtype=np.int32),
-            np.zeros((1024, self.max_model_len), dtype=np.int32),
+            [[0]] * warmup_num_reqs,
+            np.full(warmup_num_reqs, warmup_model_len, dtype=np.int32),
+            np.zeros((warmup_num_reqs, warmup_model_len), dtype=np.int32),
         )
 
-    def batch_propose(
+    def should_propose_for_request(
         self,
-        num_requests: int,
-        valid_ngram_requests: list,
+        request_index: int,
+        sampled_ids: list[int],
+        num_tokens: int,
+    ) -> bool:
+        """Hook for backend-specific request filtering.
+
+        Backends can override this to skip requests that should not participate
+        in ngram proposal while still reusing the shared CPU matcher path.
+        """
+        if not sampled_ids:
+            # Skip speculative decoding.
+            return False
+
+        if num_tokens >= self.max_model_len:
+            # Skip requests that have already reached the max model length.
+            return False
+
+        return True
+
+    def get_valid_ngram_requests(
+        self,
+        sampled_token_ids: list[list[int]],
+        num_tokens_no_spec: np.ndarray,
+    ) -> np.ndarray:
+        valid_ngram_requests = np.empty(len(sampled_token_ids), dtype=np.int32)
+        num_valid_requests = 0
+        for i, sampled_ids in enumerate(sampled_token_ids):
+            num_tokens = num_tokens_no_spec[i]
+            if self.should_propose_for_request(i, sampled_ids, num_tokens):
+                valid_ngram_requests[num_valid_requests] = i
+                num_valid_requests += 1
+        return valid_ngram_requests[:num_valid_requests]
+
+    def run_batch_match(
+        self,
+        valid_ngram_requests: np.ndarray,
         num_tokens_no_spec: np.ndarray,
         token_ids_cpu: np.ndarray,
-    ) -> list[list[int]]:
-        """Batch version of ngram proposer using numba for acceleration.
-
-        Args:
-            valid_ngram_requests:
-                Set of indices of requests that need ngram proposals.
-            num_tokens_no_spec:
-                Numpy array of shape (batch_size,) representing the number
-                of tokens without speculative tokens for each request.
-            token_ids_cpu:
-                Numpy array of shape (batch_size, max_model_len)
-                representing the token IDs for each request.
-
-        Returns:
-            list[list[int]]:
-                A list where each element is a list of proposed
-                token IDs for the corresponding request.
-        """
-        draft_token_ids: list[list[int]] = []
-
-        # Only run batch propose if there are requests needing ngram proposals.
-        # avoid calling numba function with empty list which causes error
-        # ValueError: cannot compute fingerprint of empty list
-        if num_ngram_requests := len(valid_ngram_requests):
+    ) -> None:
+        num_ngram_requests = len(valid_ngram_requests)
+        if num_ngram_requests:
             original_num_numba_threads = get_num_threads()
-            # Ensure we use at least one thread.
-            # If total tokens is small, using multiple threads
-            # may slow down due to overhead.
-            total_tokens = np.sum(num_tokens_no_spec)
+            # If the valid working set is small, thread coordination costs more
+            # than the matcher itself.
+            total_tokens = int(
+                num_tokens_no_spec[valid_ngram_requests].sum(dtype=np.int64)
+            )
             if total_tokens >= self.num_tokens_threshold:
                 final_num_threads = max(
                     1, min(self.num_numba_thread_available, num_ngram_requests)
@@ -109,24 +138,45 @@ class NgramProposer:
                 token_ids_cpu,
                 self.min_n,
                 self.max_n,
+                self.search_window if self.search_window is not None else 0,
                 self.max_model_len,
                 self.k,
                 self.valid_ngram_draft,
                 self.valid_ngram_num_drafts,
             )
 
-            # Restore original number of threads.
             set_num_threads(original_num_numba_threads)
 
-        for i in range(num_requests):
-            if i in valid_ngram_requests and self.valid_ngram_num_drafts[i] > 0:
-                draft_token_ids.append(
-                    self.valid_ngram_draft[i, : self.valid_ngram_num_drafts[i]].tolist()
-                )
-            else:
-                draft_token_ids.append([])
-
+    def materialize_draft_token_ids(
+        self,
+        num_requests: int,
+        valid_ngram_requests: np.ndarray,
+    ) -> list[list[int]]:
+        draft_token_ids: list[list[int]] = [[] for _ in range(num_requests)]
+        for i in valid_ngram_requests:
+            if self.valid_ngram_num_drafts[i] > 0:
+                draft_token_ids[i] = self.valid_ngram_draft[
+                    i, : self.valid_ngram_num_drafts[i]
+                ].tolist()
         return draft_token_ids
+
+    def batch_propose(
+        self,
+        num_requests: int,
+        valid_ngram_requests: np.ndarray,
+        num_tokens_no_spec: np.ndarray,
+        token_ids_cpu: np.ndarray,
+    ) -> list[list[int]]:
+        """Batch version of ngram proposer using numba for acceleration."""
+        self.run_batch_match(
+            valid_ngram_requests,
+            num_tokens_no_spec,
+            token_ids_cpu,
+        )
+        return self.materialize_draft_token_ids(
+            num_requests,
+            valid_ngram_requests,
+        )
 
     def propose(
         self,
@@ -136,21 +186,13 @@ class NgramProposer:
         slot_mappings: dict[str, torch.Tensor]
         | list[dict[str, torch.Tensor]]
         | None = None,  # unused
+        valid_ngram_requests: np.ndarray | None = None,
     ) -> list[list[int]]:
-        # find which requests need ngram proposals
-        valid_ngram_requests = []
-        for i, sampled_ids in enumerate(sampled_token_ids):
-            num_sampled_ids = len(sampled_ids)
-            if not num_sampled_ids:
-                # Skip speculative decoding.
-                continue
-
-            num_tokens = num_tokens_no_spec[i]
-            if num_tokens >= self.max_model_len:
-                # Skip requests that have already reached the max model length.
-                continue
-
-            valid_ngram_requests.append(i)
+        if valid_ngram_requests is None:
+            valid_ngram_requests = self.get_valid_ngram_requests(
+                sampled_token_ids,
+                num_tokens_no_spec,
+            )
 
         draft_token_ids = self.batch_propose(
             len(sampled_token_ids),
@@ -168,11 +210,12 @@ class NgramProposer:
 
 @njit(parallel=True)
 def batch_propose_numba(
-    valid_ngram_requests: list,
+    valid_ngram_requests: np.ndarray,
     num_tokens_no_spec: np.ndarray,
     token_ids_cpu: np.ndarray,
     min_n: int,
     max_n: int,
+    search_window: int,
     max_model_len: int,
     k: int,
     valid_ngram_draft: np.ndarray,
@@ -181,8 +224,11 @@ def batch_propose_numba(
     for i in prange(len(valid_ngram_requests)):
         idx = valid_ngram_requests[i]
         num_tokens = num_tokens_no_spec[idx]
-        context_token_ids = token_ids_cpu[idx, :num_tokens]
-        drafter_output = _find_longest_matched_ngram_and_propose_tokens(
+        search_start = 0
+        if search_window > 0 and num_tokens > search_window:
+            search_start = num_tokens - search_window
+        context_token_ids = token_ids_cpu[idx, search_start:num_tokens]
+        start_position, draft_len = _find_longest_matched_ngram_and_propose_tokens(
             origin_tokens=context_token_ids,
             min_ngram=min_n,
             max_ngram=max_n,
@@ -190,9 +236,11 @@ def batch_propose_numba(
             k=k,
         )
 
-        valid_ngram_num_drafts[idx] = drafter_output.shape[0]
-        if len(drafter_output):
-            valid_ngram_draft[idx, : drafter_output.shape[0]] = drafter_output
+        valid_ngram_num_drafts[idx] = draft_len
+        if draft_len > 0:
+            valid_ngram_draft[idx, :draft_len] = context_token_ids[
+                start_position : start_position + draft_len
+            ]
 
 
 @jit(nopython=True)
@@ -202,7 +250,7 @@ def _find_longest_matched_ngram_and_propose_tokens(
     max_ngram: int,
     max_model_len: int,
     k: int,
-) -> np.ndarray:
+) -> tuple[int, int]:
     """
     Find the longest n-gram which matches the suffix of the given tokens
     whose length is within [min_ngram, max_ngram] (inclusive).
@@ -212,12 +260,12 @@ def _find_longest_matched_ngram_and_propose_tokens(
     # Do not generate draft tokens is context is shorter than minimum n-gram
     total_token = origin_tokens.shape[0]
     if total_token < min_ngram:
-        return np.empty((0,), dtype=origin_tokens.dtype)
+        return 0, 0
 
     # Do not generate draft tokens beyond the max model length.
     k = min(k, max_model_len - total_token)
     if k <= 0:
-        return np.empty((0,), dtype=origin_tokens.dtype)
+        return 0, 0
 
     # Flip tokens, and the goal become to find longest ngram
     # on the rightmost position which matches the prefix with
@@ -274,12 +322,12 @@ def _find_longest_matched_ngram_and_propose_tokens(
 
     if longest_ngram < min_ngram:
         # No valid ngram is found
-        return np.empty((0,), dtype=origin_tokens.dtype)
+        return 0, 0
 
     # Flip the position back, so in origin_tokens,
     # origin_tokens[total_token-1-position:total_token-1-position+longest_ngram]
     # is the matched ngram, so we should start drafting tokens from
     # total_token-1-position+longest_ngram
     start_position = total_token - 1 - position + longest_ngram
-    k = min(k, total_token - start_position)
-    return origin_tokens[start_position : start_position + k]
+    draft_len = min(k, total_token - start_position)
+    return start_position, draft_len

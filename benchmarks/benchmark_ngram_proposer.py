@@ -1,68 +1,95 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
-import time
-from unittest import mock
+from types import SimpleNamespace
 
 import numpy as np
 from benchmark_utils import TimeCollector
 from tabulate import tabulate
 
-from vllm.config import (
-    CacheConfig,
-    DeviceConfig,
-    LoadConfig,
-    ModelConfig,
-    ParallelConfig,
-    SchedulerConfig,
-    SpeculativeConfig,
-    VllmConfig,
-)
-from vllm.platforms import current_platform
+from vllm.config import SpeculativeConfig
 from vllm.utils.argparse_utils import FlexibleArgumentParser
-from vllm.v1.spec_decode.ngram_proposer import NgramProposer
-from vllm.v1.worker.gpu_input_batch import InputBatch
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.spec_decode.ngram_proposer import NgramProposer, NgramProposalInputs
+
+
+def _build_proposer(
+    args,
+    *,
+    max_ngram: int,
+    max_model_len: int | None = None,
+) -> NgramProposer:
+    return NgramProposer(
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                max_model_len=max_model_len
+                or (args.num_token + args.num_spec_token),
+            ),
+            parallel_config=SimpleNamespace(tensor_parallel_size=1),
+            scheduler_config=SimpleNamespace(max_num_seqs=args.num_req),
+            speculative_config=SpeculativeConfig(
+                prompt_lookup_min=args.min_ngram,
+                prompt_lookup_max=max_ngram,
+                prompt_lookup_window=args.search_window,
+                num_speculative_tokens=args.num_spec_token,
+                method="ngram",
+            ),
+        )
+    )
 
 
 def benchmark_propose(args):
     rows = []
     for max_ngram in args.max_ngram:
-        collector = TimeCollector(TimeCollector.US)
-
-        model_config = ModelConfig(
-            model="facebook/opt-125m",
-            max_model_len=args.num_token + args.num_spec_token,
-            tokenizer="facebook/opt-125m",
-            tokenizer_mode="auto",
-            dtype="auto",
-            seed=0,
-            trust_remote_code=False,
-        )
-        proposer = NgramProposer(
-            vllm_config=VllmConfig(
-                model_config=model_config,
-                speculative_config=SpeculativeConfig(
-                    prompt_lookup_min=args.min_ngram,
-                    prompt_lookup_max=max_ngram,
-                    num_speculative_tokens=args.num_spec_token,
-                    method="ngram",
-                ),
-            )
-        )
-
-        # Warm up
-        proposer.propose(np.random.randint(0, 20, (args.num_token,)))
+        filter_collector = TimeCollector(TimeCollector.US)
+        match_collector = TimeCollector(TimeCollector.US)
+        materialize_collector = TimeCollector(TimeCollector.US)
+        propose_collector = TimeCollector(TimeCollector.US)
+        proposer = _build_proposer(args, max_ngram=max_ngram)
+        sampled_token_ids = [[0] for _ in range(args.num_req)]
+        num_tokens_no_spec = np.full(args.num_req, args.num_token, dtype=np.int32)
 
         gc.collect()
         for _ in range(args.num_iteration):
-            tokens = np.random.randint(0, 20, (args.num_req, args.num_token))
-            with collector:
-                for i in range(args.num_req):
-                    proposer.propose(tokens[i, :])
+            token_ids_cpu = np.random.randint(
+                0,
+                20,
+                (args.num_req, args.num_token),
+                dtype=np.int32,
+            )
+            with filter_collector:
+                valid_ngram_requests = proposer.get_valid_ngram_requests(
+                    sampled_token_ids,
+                    num_tokens_no_spec,
+                )
+            with match_collector:
+                proposer.run_batch_match(
+                    valid_ngram_requests,
+                    num_tokens_no_spec,
+                    token_ids_cpu,
+                )
+            with materialize_collector:
+                proposer.materialize_draft_token_ids(
+                    args.num_req,
+                    valid_ngram_requests,
+                )
+            with propose_collector:
+                proposer.propose(
+                    sampled_token_ids,
+                    num_tokens_no_spec,
+                    token_ids_cpu,
+                )
         rows.append(
-            [args.num_req, args.num_token, args.min_ngram, max_ngram]
-            + collector.dump_avg_max()
+            [
+                args.num_req,
+                args.num_token,
+                args.min_ngram,
+                max_ngram,
+                args.search_window or "full",
+                *filter_collector.dump_avg_max(),
+                *match_collector.dump_avg_max(),
+                *materialize_collector.dump_avg_max(),
+                *propose_collector.dump_avg_max(),
+            ]
         )
 
     print(
@@ -73,8 +100,15 @@ def benchmark_propose(args):
                 "# Token",
                 "Min Ngram",
                 "Max Ngram",
-                "Avg (us)",
-                "Max (us)",
+                "Search Window",
+                "Filter Avg (us)",
+                "Filter Max (us)",
+                "Match Avg (us)",
+                "Match Max (us)",
+                "Materialize Avg (us)",
+                "Materialize Max (us)",
+                "Propose Avg (us)",
+                "Propose Max (us)",
             ],
             tablefmt="grid",
             floatfmt=".3f",
@@ -83,78 +117,96 @@ def benchmark_propose(args):
 
 
 def benchmark_batched_propose(args):
-    NUM_SPECULATIVE_TOKENS_NGRAM = 10
-    PROMPT_LOOKUP_MIN = 5
-    PROMPT_LOOKUP_MAX = 15
-    MAX_MODEL_LEN = int(1e7)
-    DEVICE = current_platform.device_type
-
-    model_config = ModelConfig(model="facebook/opt-125m", runner="generate")
-
-    speculative_config = SpeculativeConfig(
-        target_model_config=model_config,
-        target_parallel_config=ParallelConfig(),
-        method="ngram",
-        num_speculative_tokens=NUM_SPECULATIVE_TOKENS_NGRAM,
-        prompt_lookup_max=PROMPT_LOOKUP_MAX,
-        prompt_lookup_min=PROMPT_LOOKUP_MIN,
-    )
-
-    vllm_config = VllmConfig(
-        model_config=model_config,
-        cache_config=CacheConfig(),
-        speculative_config=speculative_config,
-        device_config=DeviceConfig(device=current_platform.device_type),
-        parallel_config=ParallelConfig(),
-        load_config=LoadConfig(),
-        scheduler_config=SchedulerConfig(
-            max_model_len=model_config.max_model_len,
-            is_encoder_decoder=model_config.is_encoder_decoder,
-        ),
-    )
-
-    # monkey patch vllm.v1.worker.gpu_model_runner.get_pp_group
-    mock_pp_group = mock.MagicMock()
-    mock_pp_group.world_size = 1
-    with mock.patch(
-        "vllm.v1.worker.gpu_model_runner.get_pp_group", return_value=mock_pp_group
-    ):
-        runner = GPUModelRunner(vllm_config, DEVICE)
-
-        # hack max model len
-        runner.max_model_len = MAX_MODEL_LEN
-        runner.drafter.max_model_len = MAX_MODEL_LEN
-
-        dummy_input_batch = InputBatch(
-            max_num_reqs=args.num_req,
-            max_model_len=MAX_MODEL_LEN,
-            max_num_batched_tokens=args.num_req * args.num_token,
-            device=DEVICE,
-            pin_memory=False,
-            vocab_size=256000,
-            block_sizes=[16],
-        )
-        dummy_input_batch._req_ids = list(str(id) for id in range(args.num_req))
-        dummy_input_batch.num_tokens_no_spec = [args.num_token] * args.num_req
-        dummy_input_batch.token_ids_cpu = np.random.randint(
-            0, 20, (args.num_req, args.num_token)
-        )
-
-        runner.input_batch = dummy_input_batch
-
-        sampled_token_ids = [[0]] * args.num_req
-
-        print("Starting benchmark")
-        # first run is warmup so ignore it
-        for _ in range(args.num_iteration):
-            start = time.time()
-            runner.drafter.propose(
-                sampled_token_ids,
-                dummy_input_batch.num_tokens_no_spec,
-                dummy_input_batch.token_ids_cpu,
+    class FakeNgramRunner:
+        def __init__(self, proposer: NgramProposer, num_req: int, num_token: int):
+            self.drafter = proposer
+            self.max_model_len = proposer.max_model_len
+            self.input_batch = SimpleNamespace(
+                num_tokens_no_spec=np.full(num_req, num_token, dtype=np.int32),
+                token_ids_cpu=np.random.randint(
+                    0,
+                    20,
+                    (num_req, num_token),
+                    dtype=np.int32,
+                ),
             )
-            end = time.time()
-            print(f"Iteration time (s): {end - start}")
+
+        def get_ngram_proposal_inputs(
+            self,
+            sampled_token_ids: list[list[int]],
+        ) -> NgramProposalInputs:
+            valid_ngram_requests = np.empty(len(sampled_token_ids), dtype=np.int32)
+            num_valid_requests = 0
+            for i, sampled_ids in enumerate(sampled_token_ids):
+                if self.drafter.should_propose_for_request(
+                    i,
+                    sampled_ids,
+                    self.input_batch.num_tokens_no_spec[i],
+                ):
+                    valid_ngram_requests[num_valid_requests] = i
+                    num_valid_requests += 1
+
+            return NgramProposalInputs(
+                sampled_token_ids=sampled_token_ids,
+                num_tokens_no_spec=self.input_batch.num_tokens_no_spec,
+                token_ids_cpu=self.input_batch.token_ids_cpu,
+                valid_ngram_requests=valid_ngram_requests[:num_valid_requests],
+            )
+
+        def propose_ngram_draft_token_ids(
+            self,
+            sampled_token_ids: list[list[int]],
+        ) -> list[list[int]]:
+            ngram_inputs = self.get_ngram_proposal_inputs(sampled_token_ids)
+            return self.drafter.propose(
+                ngram_inputs.sampled_token_ids,
+                ngram_inputs.num_tokens_no_spec,
+                ngram_inputs.token_ids_cpu,
+                valid_ngram_requests=ngram_inputs.valid_ngram_requests,
+            )
+
+    proposer = _build_proposer(
+        args,
+        max_ngram=max(args.max_ngram),
+        max_model_len=args.num_token + args.num_spec_token,
+    )
+    runner = FakeNgramRunner(proposer, args.num_req, args.num_token)
+    sampled_token_ids = [[0]] * args.num_req
+    inputs_collector = TimeCollector(TimeCollector.US)
+    propose_collector = TimeCollector(TimeCollector.US)
+
+    print("Starting benchmark")
+    for _ in range(args.num_iteration):
+        with inputs_collector:
+            runner.get_ngram_proposal_inputs(sampled_token_ids)
+        with propose_collector:
+            runner.propose_ngram_draft_token_ids(sampled_token_ids)
+
+    rows = [[
+        args.num_req,
+        args.num_token,
+        args.search_window or "full",
+        inputs_collector.avg(),
+        inputs_collector.max(),
+        propose_collector.avg(),
+        propose_collector.max(),
+    ]]
+    print(
+        tabulate(
+            rows,
+            headers=[
+                "# Request",
+                "# Token",
+                "Search Window",
+                "Input Avg (us)",
+                "Input Max (us)",
+                "Runner Propose Avg (us)",
+                "Runner Propose Max (us)",
+            ],
+            tablefmt="grid",
+            floatfmt=".3f",
+        )
+    )
 
 
 def invoke_main() -> None:
@@ -188,6 +240,13 @@ def invoke_main() -> None:
         nargs="*",
         default=[5, 7, 10, 15, 20],
         help="Maximum n-gram to match",
+    )
+    parser.add_argument(
+        "--search-window",
+        type=int,
+        default=None,
+        help="Only search the most recent N context tokens. Unset means full "
+        "history.",
     )
     parser.add_argument(
         "--num-spec-token",

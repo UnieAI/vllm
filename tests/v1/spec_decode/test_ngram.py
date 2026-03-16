@@ -1,204 +1,290 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
+
 import numpy as np
 
-from vllm.config import (
-    ModelConfig,
-    SpeculativeConfig,
-    VllmConfig,
-)
+from vllm.config import SpeculativeConfig
 from vllm.v1.spec_decode.ngram_proposer import (
     NgramProposer,
     _find_longest_matched_ngram_and_propose_tokens,
 )
 
 
+def _make_ngram_proposer(
+    *,
+    min_n: int,
+    max_n: int,
+    k: int,
+    max_model_len: int = 1024,
+    max_num_seqs: int = 16,
+    search_window: int | None = None,
+) -> NgramProposer:
+    return NgramProposer(
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(max_model_len=max_model_len),
+            parallel_config=SimpleNamespace(tensor_parallel_size=1),
+            scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+            speculative_config=SpeculativeConfig(
+                prompt_lookup_min=min_n,
+                prompt_lookup_max=max_n,
+                prompt_lookup_window=search_window,
+                num_speculative_tokens=k,
+                method="ngram",
+            ),
+        )
+    )
+
+
+def _materialize_match(
+    tokens: np.ndarray,
+    *,
+    min_ngram: int,
+    max_ngram: int,
+    max_model_len: int,
+    k: int,
+) -> np.ndarray:
+    start_position, draft_len = _find_longest_matched_ngram_and_propose_tokens(
+        origin_tokens=tokens,
+        min_ngram=min_ngram,
+        max_ngram=max_ngram,
+        max_model_len=max_model_len,
+        k=k,
+    )
+    return tokens[start_position : start_position + draft_len]
+
+
 def test_find_longest_matched_ngram_and_propose_tokens():
-    tokens = np.array([1, 2, 3, 4, 1, 2, 3, 5, 6])
-    result = _find_longest_matched_ngram_and_propose_tokens(
-        origin_tokens=tokens, min_ngram=2, max_ngram=2, max_model_len=1024, k=2
-    )
-    assert len(result) == 0
-
-    tokens = np.array([1, 2, 3, 4, 1, 2, 3])
+    tokens = np.array([1, 2, 3, 4, 1, 2, 3, 5, 6], dtype=np.int32)
     np.testing.assert_array_equal(
-        _find_longest_matched_ngram_and_propose_tokens(
-            origin_tokens=tokens, min_ngram=2, max_ngram=2, max_model_len=1024, k=3
+        _materialize_match(
+            tokens,
+            min_ngram=2,
+            max_ngram=2,
+            max_model_len=1024,
+            k=2,
         ),
-        np.array([4, 1, 2]),
-    )
-    np.testing.assert_array_equal(
-        _find_longest_matched_ngram_and_propose_tokens(
-            origin_tokens=tokens, min_ngram=2, max_ngram=2, max_model_len=1024, k=2
-        ),
-        np.array([4, 1]),
-    )
-    np.testing.assert_array_equal(
-        _find_longest_matched_ngram_and_propose_tokens(
-            origin_tokens=tokens, min_ngram=1, max_ngram=1, max_model_len=1024, k=3
-        ),
-        np.array([4, 1, 2]),
-    )
-    np.testing.assert_array_equal(
-        _find_longest_matched_ngram_and_propose_tokens(
-            origin_tokens=tokens, min_ngram=1, max_ngram=1, max_model_len=1024, k=2
-        ),
-        np.array([4, 1]),
+        np.array([], dtype=np.int32),
     )
 
-    tokens = np.array([1, 3, 6, 2, 3, 4, 1, 2, 3])
+    tokens = np.array([1, 2, 3, 4, 1, 2, 3], dtype=np.int32)
     np.testing.assert_array_equal(
-        _find_longest_matched_ngram_and_propose_tokens(
-            origin_tokens=tokens, min_ngram=2, max_ngram=2, max_model_len=1024, k=3
+        _materialize_match(
+            tokens,
+            min_ngram=2,
+            max_ngram=2,
+            max_model_len=1024,
+            k=3,
         ),
-        np.array([4, 1, 2]),
+        np.array([4, 1, 2], dtype=np.int32),
     )
-    # Return on the first match
     np.testing.assert_array_equal(
-        _find_longest_matched_ngram_and_propose_tokens(
-            origin_tokens=tokens, min_ngram=1, max_ngram=1, max_model_len=1024, k=2
+        _materialize_match(
+            tokens,
+            min_ngram=2,
+            max_ngram=2,
+            max_model_len=1024,
+            k=2,
         ),
-        np.array([6, 2]),
+        np.array([4, 1], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        _materialize_match(
+            tokens,
+            min_ngram=1,
+            max_ngram=1,
+            max_model_len=1024,
+            k=3,
+        ),
+        np.array([4, 1, 2], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        _materialize_match(
+            tokens,
+            min_ngram=1,
+            max_ngram=1,
+            max_model_len=1024,
+            k=2,
+        ),
+        np.array([4, 1], dtype=np.int32),
+    )
+
+    tokens = np.array([1, 3, 6, 2, 3, 4, 1, 2, 3], dtype=np.int32)
+    np.testing.assert_array_equal(
+        _materialize_match(
+            tokens,
+            min_ngram=2,
+            max_ngram=2,
+            max_model_len=1024,
+            k=3,
+        ),
+        np.array([4, 1, 2], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        _materialize_match(
+            tokens,
+            min_ngram=1,
+            max_ngram=1,
+            max_model_len=1024,
+            k=2,
+        ),
+        np.array([6, 2], dtype=np.int32),
     )
 
 
 def test_ngram_proposer():
-    def get_ngram_proposer(min_n: int, max_n: int, k: int) -> NgramProposer:
-        # Dummy model config. Just to set max_model_len.
-        model_config = ModelConfig(model="facebook/opt-125m")
-        return NgramProposer(
-            vllm_config=VllmConfig(
-                model_config=model_config,
-                speculative_config=SpeculativeConfig(
-                    prompt_lookup_min=min_n,
-                    prompt_lookup_max=max_n,
-                    num_speculative_tokens=k,
-                    method="ngram",
-                ),
-            )
-        )
-
-    # No match.
-    token_ids_cpu = np.array([[1, 2, 3, 4, 5]])
-    result = get_ngram_proposer(min_n=2, max_n=2, k=2).propose(
+    token_ids_cpu = np.array([[1, 2, 3, 4, 5]], dtype=np.int32)
+    result = _make_ngram_proposer(min_n=2, max_n=2, k=2).propose(
         sampled_token_ids=[[0]],
-        num_tokens_no_spec=np.array([len(c) for c in token_ids_cpu]),
+        num_tokens_no_spec=np.array([len(c) for c in token_ids_cpu], dtype=np.int32),
         token_ids_cpu=token_ids_cpu,
     )
     assert len(result[0]) == 0
 
-    # No match for 4-gram.
-    token_ids_cpu = np.array([[1, 2, 3, 4, 1, 2, 3]])
-    result = get_ngram_proposer(min_n=4, max_n=4, k=2).propose(
+    token_ids_cpu = np.array([[1, 2, 3, 4, 1, 2, 3]], dtype=np.int32)
+    result = _make_ngram_proposer(min_n=4, max_n=4, k=2).propose(
         sampled_token_ids=[[0]],
-        num_tokens_no_spec=np.array([len(c) for c in token_ids_cpu]),
+        num_tokens_no_spec=np.array([len(c) for c in token_ids_cpu], dtype=np.int32),
         token_ids_cpu=token_ids_cpu,
     )
     assert len(result[0]) == 0
 
-    # No match for 4-gram but match for 3-gram.
-    token_ids_cpu = np.array([[1, 2, 3, 4, 1, 2, 3]])
-    result = get_ngram_proposer(min_n=3, max_n=4, k=2).propose(
+    result = _make_ngram_proposer(min_n=3, max_n=4, k=2).propose(
         sampled_token_ids=[[0]],
-        num_tokens_no_spec=np.array([len(c) for c in token_ids_cpu]),
+        num_tokens_no_spec=np.array([len(c) for c in token_ids_cpu], dtype=np.int32),
         token_ids_cpu=token_ids_cpu,
     )
-    assert np.array_equal(result, np.array([[4, 1]]))
+    assert result == [[4, 1]]
 
-    # Match for both 4-gram and 3-gram.
-    # In this case, the proposer should return the 4-gram match.
-    token_ids_cpu = np.array([[2, 3, 4, 5, 1, 2, 3, 4, 1, 2, 3, 4]])
-    result = get_ngram_proposer(min_n=3, max_n=4, k=2).propose(
+    token_ids_cpu = np.array([[2, 3, 4, 5, 1, 2, 3, 4, 1, 2, 3, 4]], dtype=np.int32)
+    result = _make_ngram_proposer(min_n=3, max_n=4, k=2).propose(
         sampled_token_ids=[[0]],
-        num_tokens_no_spec=np.array([len(c) for c in token_ids_cpu]),
+        num_tokens_no_spec=np.array([len(c) for c in token_ids_cpu], dtype=np.int32),
         token_ids_cpu=token_ids_cpu,
     )
-    assert np.array_equal(result, np.array([[1, 2]]))  # Not [5, 1]]
+    assert result == [[1, 2]]
 
-    # Match for 2-gram and 3-gram, but not 4-gram.
-    token_ids_cpu = np.array([[3, 4, 5, 2, 3, 4, 1, 2, 3, 4]])
-    result = get_ngram_proposer(min_n=2, max_n=4, k=2).propose(
+    token_ids_cpu = np.array([[3, 4, 5, 2, 3, 4, 1, 2, 3, 4]], dtype=np.int32)
+    result = _make_ngram_proposer(min_n=2, max_n=4, k=2).propose(
         sampled_token_ids=[[0]],
-        num_tokens_no_spec=np.array([len(c) for c in token_ids_cpu]),
+        num_tokens_no_spec=np.array([len(c) for c in token_ids_cpu], dtype=np.int32),
         token_ids_cpu=token_ids_cpu,
     )
-    assert np.array_equal(result, np.array([[1, 2]]))  # Not [5, 2]]
+    assert result == [[1, 2]]
 
-    # Multiple 3-gram matched, but always pick the first one.
-    token_ids_cpu = np.array([[1, 2, 3, 100, 1, 2, 3, 200, 1, 2, 3, 300, 1, 2, 3]])
-    result = get_ngram_proposer(min_n=3, max_n=3, k=2).propose(
+    token_ids_cpu = np.array(
+        [[1, 2, 3, 100, 1, 2, 3, 200, 1, 2, 3, 300, 1, 2, 3]],
+        dtype=np.int32,
+    )
+    result = _make_ngram_proposer(min_n=3, max_n=3, k=2).propose(
         sampled_token_ids=[[0]],
-        num_tokens_no_spec=np.array([len(c) for c in token_ids_cpu]),
+        num_tokens_no_spec=np.array([len(c) for c in token_ids_cpu], dtype=np.int32),
         token_ids_cpu=token_ids_cpu,
     )
-    assert np.array_equal(result, np.array([[100, 1]]))
+    assert result == [[100, 1]]
 
-    # check empty input
-    token_ids_cpu = np.array([[]])
-    result = get_ngram_proposer(min_n=2, max_n=2, k=2).propose(
+    token_ids_cpu = np.array([[]], dtype=np.int32)
+    result = _make_ngram_proposer(min_n=2, max_n=2, k=2).propose(
         sampled_token_ids=[[0]],
-        num_tokens_no_spec=np.array([len(c) for c in token_ids_cpu]),
+        num_tokens_no_spec=np.array([len(c) for c in token_ids_cpu], dtype=np.int32),
         token_ids_cpu=token_ids_cpu,
     )
     assert len(result[0]) == 0
 
-    # check multibatch input
-    # first request has 5 tokens and a match
-    # second request has 3 tokens and no match. Padded with -1 for max len 5
-    token_ids_cpu = np.array([[1, 2, 3, 1, 2], [4, 5, 6, -1, -1]])
-    result = get_ngram_proposer(min_n=2, max_n=2, k=2).propose(
+    token_ids_cpu = np.array([[1, 2, 3, 1, 2], [4, 5, 6, -1, -1]], dtype=np.int32)
+    result = _make_ngram_proposer(min_n=2, max_n=2, k=2, max_num_seqs=2).propose(
         sampled_token_ids=[[0], [1]],
-        num_tokens_no_spec=np.array([5, 3]),
+        num_tokens_no_spec=np.array([5, 3], dtype=np.int32),
         token_ids_cpu=token_ids_cpu,
     )
-    assert len(result[0]) == 2
-    assert np.array_equal(result[0], np.array([3, 1]))
-    assert np.array_equal(result[1], np.array([]))
+    assert result[0] == [3, 1]
+    assert result[1] == []
 
-    # Test non-contiguous indices: requests 0 and 2 need proposals,
-    # request 1 is in prefill
-    proposer = get_ngram_proposer(min_n=2, max_n=2, k=2)
-    max_model_len = 20
-    token_ids_cpu = np.zeros((3, max_model_len), dtype=np.int32)
+    proposer = _make_ngram_proposer(min_n=2, max_n=2, k=2, max_model_len=20)
+    token_ids_cpu = np.zeros((3, 20), dtype=np.int32)
     token_ids_cpu[0, :5] = [1, 2, 3, 1, 2]
     token_ids_cpu[1, :3] = [4, 5, 6]
     token_ids_cpu[2, :5] = [7, 8, 9, 7, 8]
-    num_tokens_no_spec = np.array([5, 3, 5], dtype=np.int32)
-    sampled_token_ids = [[2], [], [8]]  # Empty list for request 1 simulates prefill
     result = proposer.propose(
-        sampled_token_ids=sampled_token_ids,
-        num_tokens_no_spec=num_tokens_no_spec,
+        sampled_token_ids=[[2], [], [8]],
+        num_tokens_no_spec=np.array([5, 3, 5], dtype=np.int32),
         token_ids_cpu=token_ids_cpu,
     )
-    assert len(result) == 3
-    assert np.array_equal(result[0], [3, 1])
-    assert len(result[1]) == 0
-    assert np.array_equal(result[2], [9, 7])
-    # Verify internal arrays written to correct indices
+    assert result == [[3, 1], [], [9, 7]]
     assert proposer.valid_ngram_num_drafts[0] == 2
     assert proposer.valid_ngram_num_drafts[1] == 0
     assert proposer.valid_ngram_num_drafts[2] == 2
-    assert np.array_equal(proposer.valid_ngram_draft[0, :2], [3, 1])
-    assert np.array_equal(proposer.valid_ngram_draft[2, :2], [9, 7])
+    np.testing.assert_array_equal(proposer.valid_ngram_draft[0, :2], [3, 1])
+    np.testing.assert_array_equal(proposer.valid_ngram_draft[2, :2], [9, 7])
 
-    # test if 0 threads available: can happen if TP size > CPU count
-    ngram_proposer = get_ngram_proposer(min_n=2, max_n=2, k=2)
-    ngram_proposer.num_numba_thread_available = 0
-    # set max_model_len to 2 * threshold to ensure multithread is used
-    num_tokens_threshold = ngram_proposer.num_tokens_threshold
-    ngram_proposer.max_model_len = 2 * num_tokens_threshold
-    # using multibatch test
-    middle_integer = num_tokens_threshold // 2
-    input_1 = [_ for _ in range(num_tokens_threshold)]
-    input_1 += [middle_integer, middle_integer + 1]
-    input_2 = [-1] * len(input_1)
-    input_2[:3] = [4, 5, 6]
-    token_ids_cpu = np.array([input_1, input_2])
-    result = ngram_proposer.propose(
-        sampled_token_ids=[[0], [1]],
-        num_tokens_no_spec=np.array([len(input_1), 3]),
+
+def test_ngram_proposer_search_window():
+    token_ids_cpu = np.array([[1, 2, 3, 4, 1, 2, 3]], dtype=np.int32)
+
+    full_history_result = _make_ngram_proposer(
+        min_n=3,
+        max_n=3,
+        k=2,
+        search_window=None,
+    ).propose(
+        sampled_token_ids=[[0]],
+        num_tokens_no_spec=np.array([7], dtype=np.int32),
         token_ids_cpu=token_ids_cpu,
     )
-    assert len(result[0]) == 2
-    assert np.array_equal(result[0], np.array([middle_integer + 2, middle_integer + 3]))
-    assert np.array_equal(result[1], np.array([]))
+    assert full_history_result == [[4, 1]]
+
+    recent_window_result = _make_ngram_proposer(
+        min_n=3,
+        max_n=3,
+        k=2,
+        search_window=4,
+    ).propose(
+        sampled_token_ids=[[0]],
+        num_tokens_no_spec=np.array([7], dtype=np.int32),
+        token_ids_cpu=token_ids_cpu,
+    )
+    assert recent_window_result == [[]]
+
+
+def test_ngram_proposer_request_filter_hook():
+    class FilteredNgramProposer(NgramProposer):
+        def __init__(self, *args, skipped_requests: set[int], **kwargs):
+            self.skipped_requests = skipped_requests
+            super().__init__(*args, **kwargs)
+
+        def should_propose_for_request(
+            self,
+            request_index: int,
+            sampled_ids: list[int],
+            num_tokens: int,
+        ) -> bool:
+            return (
+                request_index not in self.skipped_requests
+                and super().should_propose_for_request(
+                    request_index, sampled_ids, num_tokens
+                )
+            )
+
+    proposer = FilteredNgramProposer(
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(max_model_len=1024),
+            parallel_config=SimpleNamespace(tensor_parallel_size=1),
+            scheduler_config=SimpleNamespace(max_num_seqs=2),
+            speculative_config=SpeculativeConfig(
+                prompt_lookup_min=2,
+                prompt_lookup_max=2,
+                num_speculative_tokens=2,
+                method="ngram",
+            ),
+        ),
+        skipped_requests={0},
+    )
+
+    token_ids_cpu = np.array([[1, 2, 3, 1, 2], [7, 8, 9, 7, 8]], dtype=np.int32)
+    result = proposer.propose(
+        sampled_token_ids=[[0], [1]],
+        num_tokens_no_spec=np.array([5, 5], dtype=np.int32),
+        token_ids_cpu=token_ids_cpu,
+    )
+    assert result[0] == []
+    assert result[1] == [9, 7]
