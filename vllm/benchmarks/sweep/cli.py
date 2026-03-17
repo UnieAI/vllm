@@ -8,6 +8,8 @@ from .plot import SweepPlotArgs
 from .plot import main as plot_main
 from .plot_pareto import SweepPlotParetoArgs
 from .plot_pareto import main as plot_pareto_main
+from .serve_optuna import SweepServeOptunaArgs
+from .serve_optuna import main as serve_optuna_main
 from .serve import SweepServeArgs
 from .serve import main as serve_main
 from .serve_sla import SweepServeSLAArgs
@@ -18,6 +20,7 @@ from .startup import main as startup_main
 SUBCOMMANDS = (
     (SweepServeArgs, serve_main),
     (SweepServeSLAArgs, serve_sla_main),
+    (SweepServeOptunaArgs, serve_optuna_main),
     (SweepStartupArgs, startup_main),
     (SweepPlotArgs, plot_main),
     (SweepPlotParetoArgs, plot_pareto_main),

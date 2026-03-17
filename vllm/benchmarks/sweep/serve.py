@@ -284,7 +284,11 @@ class SweepServeArgs:
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         serve_cmd = shlex.split(args.serve_cmd)
-        bench_cmd = shlex.split(args.bench_cmd)
+        bench_cmd = (
+            ["vllm", "bench", "serve"]
+            if args.bench_cmd is None
+            else shlex.split(args.bench_cmd)
+        )
         after_bench_cmd = (
             [] if args.after_bench_cmd is None else shlex.split(args.after_bench_cmd)
         )
@@ -331,8 +335,11 @@ class SweepServeArgs:
         parser.add_argument(
             "--bench-cmd",
             type=str,
-            required=True,
-            help="The command used to run the benchmark: `vllm bench serve ...`",
+            default=None,
+            help=(
+                "The command used to run the benchmark: `vllm bench serve ...`. "
+                "If omitted, defaults to `vllm bench serve`."
+            ),
         )
         parser.add_argument(
             "--after-bench-cmd",

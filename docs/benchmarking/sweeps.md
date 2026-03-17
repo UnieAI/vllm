@@ -139,6 +139,60 @@ The algorithm for adjusting the SLA variable is as follows:
 
     For a given combination of `--serve-params` and `--bench-params`, we share the benchmark results across `--sla-params` to avoid rerunning benchmarks with the same SLA variable value.
 
+### Optuna auto-tuner
+
+`vllm bench sweep serve_optuna` uses Optuna to tune serve arguments and scores each trial across multiple benchmark concurrencies.
+
+The score formula is:
+
+`sum(mean(score_metric) / concurrency)`
+
+where `mean(score_metric)` is computed across `--num-runs` for that concurrency.
+
+1. (Optional) Create a JSON search space file:
+
+```json
+{
+  "gpu_memory_utilization": { "type": "float", "low": 0.7, "high": 0.98, "step": 0.02 },
+  "max_num_batched_tokens": { "type": "categorical", "choices": [null, 512, 1024, 2048, 4096, 8192] },
+  "max_num_seqs": { "type": "categorical", "choices": [null, 8, 16, 32, 64, 128, 256] },
+  "enable_chunked_prefill": { "type": "bool" },
+  "enable_prefix_caching": { "type": "bool" }
+}
+```
+
+If `--search-space` is omitted, `serve_optuna` uses built-in defaults:
+- `gpu_memory_utilization` in `[0.7, 0.98]` (step `0.02`)
+- `max_num_batched_tokens` in `[null, 512, 1024, 2048, 4096, 8192]`
+- `max_num_seqs` in `[null, 8, 16, 32, 64, 128, 256]`
+- `enable_chunked_prefill` in `[true, false]`
+- `enable_prefix_caching` in `[true, false]`
+
+2. Run the optimizer:
+
+```bash
+vllm bench sweep serve_optuna \
+    --serve-cmd 'vllm serve meta-llama/Llama-2-7b-chat-hf' \
+    --search-space benchmarks/search_space.json \
+    --score-metric total_token_throughput \
+    --score-concurrencies 1,8,64,256 \
+    --n-trials 20 \
+    -o benchmarks/results
+```
+
+`--bench-cmd` is optional. When omitted, `serve_optuna` uses `vllm bench serve`
+and auto-fills model/base-url/tokenizer from `--serve-cmd`.
+
+By default, `serve_optuna` also launches the best server configuration at the end.
+Use `--no-start-best-server` to disable this behavior.
+
+3. Inspect outputs under the timestamped run directory:
+
+- `baseline.json`: baseline run score and full per-concurrency benchmark payload.
+- `trials.json`: all trial records (`complete`, `pruned`, baseline).
+- `best_params.json`: best Optuna parameters.
+- `best.json`: best trial score and benchmark payload.
+
 ### Startup
 
 `vllm bench sweep startup` runs `vllm bench startup` across parameter combinations to compare cold/warm startup time for different engine settings.

@@ -9,7 +9,7 @@ vllm --help
 Available Commands:
 
 ```bash
-vllm {chat,complete,serve,bench,collect-env,run-batch}
+vllm {chat,complete,serve,serve-optuna,bench,collect-env,run-batch}
 ```
 
 ## serve
@@ -146,6 +146,24 @@ vllm bench throughput \
 ```
 
 See [vllm bench throughput](./bench/throughput.md) for the full reference of all available arguments.
+
+## serve-optuna
+
+Tune `vllm serve` parameters with Optuna and benchmark scoring across multiple concurrencies.
+
+```bash
+vllm serve-optuna \
+    --serve-cmd 'vllm serve Qwen/Qwen3-0.6B' \
+    --score-concurrencies 1,8,64,256 \
+    --n-trials 20 \
+    -o benchmarks/results
+```
+
+`--search-space` is optional. If omitted, vLLM uses built-in default serve tuning ranges.
+`--bench-cmd` is optional. If omitted, vLLM auto-fills model/base-url/tokenizer from `--serve-cmd`.
+By default, the best server config is started after optimization. Use `--no-start-best-server` to skip.
+
+See [vllm bench sweep serve_optuna](./bench/sweep/serve_optuna.md) for the full reference of all available arguments.
 
 ## collect-env
 
