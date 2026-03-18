@@ -349,9 +349,31 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     "csrc/quantization/w8a8/fp8/per_token_group_quant.cu"
     "csrc/quantization/w8a8/int8/per_token_group_quant.cu")
 
+  # Workaround for CUDA 12.8 + sm_120 ptxas failures in activation_kernels.cu.
+  # Keep all other kernels (including vllm_flash_attn) at native arch.
+  set(VLLM_ACTIVATION_KERNEL_SRC "csrc/activation_kernels.cu")
+  set(VLLM_ACTIVATION_KERNEL_ARCHS "${CUDA_ARCHS}")
+  if(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
+     CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8 AND
+     CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0 AND
+     "12.0" IN_LIST CUDA_ARCHS)
+    # CUDA 12.8 ptxas fails on __CUDA_ARCH__ >= 1000 path in this file.
+    # Compile it with < 10.0 PTX so the fallback path is used.
+    set(VLLM_ACTIVATION_KERNEL_ARCHS "9.0+PTX")
+    message(WARNING
+      "Applying CUDA 12.8 sm_120 workaround: ${VLLM_ACTIVATION_KERNEL_SRC} "
+      "will be compiled for ${VLLM_ACTIVATION_KERNEL_ARCHS}.")
+  endif()
+
+  # Apply native arch flags to all CUDA sources except activation_kernels.cu.
+  list(REMOVE_ITEM VLLM_EXT_SRC "${VLLM_ACTIVATION_KERNEL_SRC}")
   set_gencode_flags_for_srcs(
     SRCS "${VLLM_EXT_SRC}"
     CUDA_ARCHS "${CUDA_ARCHS}")
+  set_gencode_flags_for_srcs(
+    SRCS "${VLLM_ACTIVATION_KERNEL_SRC}"
+    CUDA_ARCHS "${VLLM_ACTIVATION_KERNEL_ARCHS}")
+  list(APPEND VLLM_EXT_SRC "${VLLM_ACTIVATION_KERNEL_SRC}")
 
   # Only build Marlin kernels if we are building for at least some compatible archs.
   # Keep building Marlin for 9.0 as there are some group sizes and shapes that
