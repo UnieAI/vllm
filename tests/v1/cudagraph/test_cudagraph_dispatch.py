@@ -235,6 +235,40 @@ class TestCudagraphDispatcher:
 
         assert dispatcher.get_capture_descs() == []
 
+    def test_dispatcher_supports_multiple_uniform_decode_query_lens(self):
+        comp_config = CompilationConfig(
+            cudagraph_mode="FULL_DECODE_ONLY",
+            mode=CompilationMode.NONE,
+            cudagraph_capture_sizes=[1, 5, 8, 10],
+        )
+
+        config = _create_vllm_config(comp_config, max_num_seqs=10)
+        dispatcher = CudagraphDispatcher(config)
+        dispatcher.initialize_cudagraph_keys(
+            cudagraph_mode=comp_config.cudagraph_mode,
+            uniform_decode_query_len=[1, 5],
+        )
+
+        # qlen=1 pure decode
+        rt_mode, key = dispatcher.dispatch(
+            num_tokens=8,
+            uniform_decode=True,
+            has_lora=False,
+            uniform_decode_query_len=1,
+        )
+        assert rt_mode == CUDAGraphMode.FULL
+        assert key == BatchDescriptor(num_tokens=8, num_reqs=8, uniform=True)
+
+        # qlen=5 spec decode
+        rt_mode, key = dispatcher.dispatch(
+            num_tokens=10,
+            uniform_decode=True,
+            has_lora=False,
+            uniform_decode_query_len=5,
+        )
+        assert rt_mode == CUDAGraphMode.FULL
+        assert key == BatchDescriptor(num_tokens=10, num_reqs=2, uniform=True)
+
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
 class TestCUDAGraphWrapper:

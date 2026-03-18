@@ -217,6 +217,9 @@ SPEC_DECODE_DEBUG_MAX_REQS = max(1, _read_int_env("VLLM_SPEC_DECODE_DEBUG_MAX_RE
 SPEC_DECODE_DEBUG_MAX_TOKENS = max(
     1, _read_int_env("VLLM_SPEC_DECODE_DEBUG_MAX_TOKENS", 16)
 )
+NGRAM_FIRST_TOKEN_ONLY = _read_bool_env(
+    "VLLM_NGRAM_FIRST_TOKEN_ONLY", False
+)
 
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
@@ -672,6 +675,11 @@ class GPUModelRunner(
             )
 
         self.uniform_decode_query_len = 1 + self.num_spec_tokens
+        self.cudagraph_uniform_decode_query_lens = [1]
+        if self.uniform_decode_query_len > 1:
+            self.cudagraph_uniform_decode_query_lens.append(
+                self.uniform_decode_query_len
+            )
 
         # Cudagraph dispatcher for runtime cudagraph dispatching.
         self.cudagraph_dispatcher = CudagraphDispatcher(self.vllm_config)
@@ -3167,6 +3175,9 @@ class GPUModelRunner(
             else force_uniform_decode
         )
 
+    def _get_runtime_uniform_decode_query_len(self, use_spec_decode: bool) -> int:
+        return self.uniform_decode_query_len if use_spec_decode else 1
+
     def _determine_batch_execution_and_padding(
         self,
         num_tokens: int,
@@ -3174,6 +3185,7 @@ class GPUModelRunner(
         num_scheduled_tokens_np: np.ndarray,
         max_num_scheduled_tokens: int,
         use_cascade_attn: bool,
+        uniform_decode_query_len: int = 1,
         allow_microbatching: bool = True,
         force_eager: bool = False,
         # For cudagraph capture TODO(lucas): Refactor how we capture cudagraphs (will
@@ -3190,7 +3202,7 @@ class GPUModelRunner(
     ]:
         uniform_decode = self._is_uniform_decode(
             max_num_scheduled_tokens=max_num_scheduled_tokens,
-            uniform_decode_query_len=self.uniform_decode_query_len,
+            uniform_decode_query_len=uniform_decode_query_len,
             num_tokens=num_tokens,
             num_reqs=num_reqs,
             force_uniform_decode=force_uniform_decode,
@@ -3214,6 +3226,7 @@ class GPUModelRunner(
                 has_lora=has_lora,
                 uniform_decode=uniform_decode,
                 disable_full=disable_full,
+                uniform_decode_query_len=uniform_decode_query_len,
             )
             if not force_eager
             else (CUDAGraphMode.NONE, BatchDescriptor(num_tokens_padded))
@@ -3497,6 +3510,12 @@ class GPUModelRunner(
                 num_scheduled_tokens_np=num_scheduled_tokens_np,
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
+                uniform_decode_query_len=self._get_runtime_uniform_decode_query_len(
+                    use_spec_decode=len(
+                        scheduler_output.scheduled_spec_decode_tokens
+                    )
+                    > 0
+                ),
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
 
@@ -4072,6 +4091,23 @@ class GPUModelRunner(
 
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, NgramProposer)
+            if NGRAM_FIRST_TOKEN_ONLY:
+                new_req_ids = {
+                    req_data.req_id for req_data in scheduler_output.scheduled_new_reqs
+                }
+                sampled_token_ids = [
+                    token_ids
+                    if (
+                        req_id in new_req_ids
+                        or scheduler_output.scheduled_cached_reqs.is_context_phase(
+                            req_id
+                        )
+                    )
+                    else []
+                    for req_id, token_ids in zip(
+                        self.input_batch.req_ids, sampled_token_ids
+                    )
+                ]
             draft_token_ids = self.drafter.propose(
                 sampled_token_ids,
                 self.input_batch.num_tokens_no_spec,
@@ -4770,6 +4806,7 @@ class GPUModelRunner(
         cudagraph_runtime_mode: CUDAGraphMode | None = None,
         force_attention: bool = False,
         uniform_decode: bool = False,
+        uniform_decode_query_len: int | None = None,
         allow_microbatching: bool = True,
         skip_eplb: bool = False,
         is_profile: bool = False,
@@ -4825,7 +4862,14 @@ class GPUModelRunner(
         # When setting max_query_len = 1, we switch to and capture the optimized
         # routine of FA2 for pure decode, i.e., Flashdecode + an optimization
         # for GQA/MQA.
-        max_query_len = self.uniform_decode_query_len if uniform_decode else num_tokens
+        runtime_uniform_decode_query_len = (
+            self.uniform_decode_query_len
+            if uniform_decode_query_len is None
+            else uniform_decode_query_len
+        )
+        max_query_len = (
+            runtime_uniform_decode_query_len if uniform_decode else num_tokens
+        )
 
         # Set num_scheduled_tokens based on num_tokens and max_num_seqs
         # for dummy run with LoRA so that the num_reqs collectively
@@ -4870,6 +4914,7 @@ class GPUModelRunner(
                 num_scheduled_tokens_np=num_scheduled_tokens,
                 max_num_scheduled_tokens=max_query_len,
                 use_cascade_attn=False,
+                uniform_decode_query_len=runtime_uniform_decode_query_len,
                 allow_microbatching=allow_microbatching,
                 force_eager=is_profile
                 or (cudagraph_runtime_mode == CUDAGraphMode.NONE),
@@ -5429,6 +5474,11 @@ class GPUModelRunner(
         for batch_desc in batch_descriptors:
             num_tokens = batch_desc.num_tokens
             activate_lora = batch_desc.has_lora
+            runtime_uniform_decode_query_len = (
+                num_tokens // batch_desc.num_reqs
+                if uniform_decode and batch_desc.num_reqs
+                else 1
+            )
 
             # We currently only capture ubatched graphs when its a FULL
             # cudagraph, a uniform decode batch, and the number of tokens
@@ -5454,6 +5504,7 @@ class GPUModelRunner(
                 dummy_run(
                     num_tokens,
                     cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                    uniform_decode_query_len=runtime_uniform_decode_query_len,
                     allow_microbatching=allow_microbatching,
                     activate_lora=activate_lora,
                 )
@@ -5462,6 +5513,7 @@ class GPUModelRunner(
             dummy_run(
                 num_tokens,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
+                uniform_decode_query_len=runtime_uniform_decode_query_len,
                 allow_microbatching=allow_microbatching,
                 activate_lora=activate_lora,
                 is_graph_capturing=True,
@@ -5670,22 +5722,15 @@ class GPUModelRunner(
             and self.uniform_decode_query_len > 1
             and min_cg_support.value < AttentionCGSupport.UNIFORM_BATCH.value
         ):
-            msg = (
-                f"CUDAGraphMode.{cudagraph_mode.name} is not supported"
-                f" with spec-decode for attention backend "
-                f"{min_cg_backend_name} (support: {min_cg_support})"
+            logger.warning(
+                "CUDAGraphMode.%s does not support spec-decode full graphs for "
+                "attention backend %s (support: %s); keeping vanilla qlen=1 "
+                "decode graphs and falling back to non-full graphs for spec batches.",
+                cudagraph_mode.name,
+                min_cg_backend_name,
+                min_cg_support,
             )
-            if self.compilation_config.splitting_ops_contain_attention():
-                msg += "; setting cudagraph_mode=PIECEWISE"
-                cudagraph_mode = self.compilation_config.cudagraph_mode = (
-                    CUDAGraphMode.PIECEWISE
-                )
-            else:
-                msg += "; setting cudagraph_mode=NONE"
-                cudagraph_mode = self.compilation_config.cudagraph_mode = (
-                    CUDAGraphMode.NONE
-                )
-            logger.warning(msg)
+            self.cudagraph_uniform_decode_query_lens = [1]
 
         # double check that we can support full cudagraph if they are requested
         # even after automatic downgrades
@@ -5711,6 +5756,7 @@ class GPUModelRunner(
             cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
             and cudagraph_mode.separate_routine()
             and self.uniform_decode_query_len > 1
+            and self.uniform_decode_query_len in self.cudagraph_uniform_decode_query_lens
         ):
             self.compilation_config.adjust_cudagraph_sizes_for_spec_decode(
                 self.uniform_decode_query_len, self.parallel_config.tensor_parallel_size
@@ -5724,7 +5770,7 @@ class GPUModelRunner(
         # resolved cudagraph mode.
         self.compilation_config.cudagraph_mode = cudagraph_mode
         self.cudagraph_dispatcher.initialize_cudagraph_keys(
-            cudagraph_mode, self.uniform_decode_query_len
+            cudagraph_mode, self.cudagraph_uniform_decode_query_lens
         )
 
         # Initialize eagle's cudagraph dispatcher if using eagle spec decode.
