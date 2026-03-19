@@ -155,6 +155,17 @@ def test_ngram_proposer():
     assert np.array_equal(result[0], np.array([3, 1]))
     assert np.array_equal(result[1], np.array([]))
 
+    # Only apply ngram on first generated token.
+    token_ids_cpu = np.array([[1, 2, 3, 1, 2, -1], [1, 2, 3, 1, 2, 3]])
+    result = get_ngram_proposer(min_n=2, max_n=2, k=2).propose(
+        sampled_token_ids=[[0], [1]],
+        num_tokens_no_spec=np.array([5, 6]),
+        token_ids_cpu=token_ids_cpu,
+        num_prompt_tokens=np.array([5, 5]),
+    )
+    assert np.array_equal(result[0], np.array([3, 1]))
+    assert np.array_equal(result[1], np.array([]))
+
     # Test non-contiguous indices: requests 0 and 2 need proposals,
     # request 1 is in prefill
     proposer = get_ngram_proposer(min_n=2, max_n=2, k=2)

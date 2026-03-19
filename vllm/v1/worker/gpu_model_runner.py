@@ -4076,6 +4076,7 @@ class GPUModelRunner(
                 sampled_token_ids,
                 self.input_batch.num_tokens_no_spec,
                 self.input_batch.token_ids_cpu,
+                num_prompt_tokens=self.input_batch.num_prompt_tokens,
                 slot_mappings=slot_mappings,
             )
         elif spec_config.method == "suffix":

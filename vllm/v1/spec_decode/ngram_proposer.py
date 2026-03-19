@@ -133,6 +133,7 @@ class NgramProposer:
         sampled_token_ids: list[list[int]],
         num_tokens_no_spec: np.ndarray,
         token_ids_cpu: np.ndarray,
+        num_prompt_tokens: np.ndarray | None = None,
         slot_mappings: dict[str, torch.Tensor]
         | list[dict[str, torch.Tensor]]
         | None = None,  # unused
@@ -148,6 +149,10 @@ class NgramProposer:
             num_tokens = num_tokens_no_spec[i]
             if num_tokens >= self.max_model_len:
                 # Skip requests that have already reached the max model length.
+                continue
+
+            if num_prompt_tokens is not None and num_tokens != num_prompt_tokens[i]:
+                # Only use ngram on the first generated token.
                 continue
 
             valid_ngram_requests.append(i)

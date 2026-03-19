@@ -1086,6 +1086,20 @@ class Scheduler(SchedulerInterface):
             self.kv_cache_manager.set_use_eagle(False)
             return False
 
+        if speculative_config is not None and speculative_config.method == "ngram":
+            # Disable load-based on/off switching for ngram.
+            # Keep speculative decoding enabled unless blocked by safeguards above.
+            if not self.spec_decode_enabled:
+                self.spec_decode_enabled = True
+                self.spec_last_switch_time = now
+                logger.info(
+                    "enable speculative decoding: ngram load switching disabled"
+                )
+            self.kv_cache_manager.set_use_eagle(
+                self.use_eagle and self.spec_decode_enabled
+            )
+            return self.spec_decode_enabled
+
         if self.spec_hold_disabled_until_idle:
             # Lift the hold only when there is no in-flight request.
             if self.running or self.waiting:

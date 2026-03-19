@@ -507,8 +507,6 @@ class EngineArgs:
     logits_processor_pattern: str | None = ModelConfig.logits_processor_pattern
 
     speculative_config: dict[str, Any] | None = None
-    speculative_enable_load: int = 60
-    speculative_disable_load: int = 80
     speculative_cooldown_sec: int = 30
 
     show_hidden_metrics_for_version: str | None = (
@@ -1166,25 +1164,6 @@ class EngineArgs:
             "--speculative-config", **vllm_kwargs["speculative_config"]
         )
         vllm_group.add_argument(
-            "--speculative-enable-load",
-            type=int,
-            default=EngineArgs.speculative_enable_load,
-            help=(
-                "Enable speculative decoding when estimated token load drops "
-                "below this threshold. Only active when --speculative-config "
-                "is set."
-            ),
-        )
-        vllm_group.add_argument(
-            "--speculative-disable-load",
-            type=int,
-            default=EngineArgs.speculative_disable_load,
-            help=(
-                "Disable speculative decoding when estimated token load exceeds "
-                "this threshold. Only active when --speculative-config is set."
-            ),
-        )
-        vllm_group.add_argument(
             "--speculative-cooldown-sec",
             type=int,
             default=EngineArgs.speculative_cooldown_sec,
@@ -1359,14 +1338,9 @@ class EngineArgs:
         dictionary from the engine.
         """
         if self.speculative_config is None:
-            if (
-                self.speculative_enable_load != 120000
-                or self.speculative_disable_load != 180000
-                or self.speculative_cooldown_sec != 30
-            ):
+            if self.speculative_cooldown_sec != 30:
                 logger.warning(
-                    "--speculative-enable-load/--speculative-disable-load/"
-                    "--speculative-cooldown-sec are ignored because "
+                    "--speculative-cooldown-sec is ignored because "
                     "--speculative-config is not set."
                 )
             return None
@@ -1378,8 +1352,6 @@ class EngineArgs:
             {
                 "target_model_config": target_model_config,
                 "target_parallel_config": target_parallel_config,
-                "enable_load": self.speculative_enable_load,
-                "disable_load": self.speculative_disable_load,
                 "cooldown_sec": self.speculative_cooldown_sec,
             }
         )

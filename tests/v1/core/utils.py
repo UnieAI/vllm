@@ -52,8 +52,6 @@ def create_scheduler(
     block_size: int = 16,
     max_model_len: int | None = None,
     num_speculative_tokens: int | None = None,
-    speculative_enable_load: int = 120000,
-    speculative_disable_load: int = 180000,
     speculative_cooldown_sec: int = 30,
     skip_tokenizer_init: bool = False,
     async_scheduling: bool = False,
@@ -123,8 +121,6 @@ def create_scheduler(
         speculative_config = SpeculativeConfig(
             model="ngram",
             num_speculative_tokens=num_speculative_tokens,
-            enable_load=speculative_enable_load,
-            disable_load=speculative_disable_load,
             cooldown_sec=speculative_cooldown_sec,
         )
 
