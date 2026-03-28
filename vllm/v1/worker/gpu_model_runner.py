@@ -4187,7 +4187,7 @@ class GPUModelRunner(
 
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
-        if spec_config is not None:
+        if spec_config is not None and scheduler_output.enable_spec_decode:
             input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
                 spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
                 <= self.effective_drafter_max_model_len
@@ -4255,6 +4255,44 @@ class GPUModelRunner(
                     self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
             else:
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
+        elif spec_config is not None and self.num_spec_tokens > 0:
+            # Spec decode is disabled by scheduler policy (e.g., ngram_dsc),
+            # but some downstream paths still expect draft token payload shape.
+            # In async ngram_gpu mode, if this step is still verifying draft
+            # tokens generated in the prior step, keep valid token counts
+            # updated so optimistic async corrections remain accurate.
+            if (
+                self.use_async_spec_decode
+                and spec_config.use_ngram_gpu()
+                and scheduler_output.scheduled_spec_decode_tokens
+                and self.valid_sampled_token_count_event is not None
+            ):
+                assert isinstance(self.drafter, NgramProposerGPU)
+                sampled_token_ids = sampler_output.sampled_token_ids
+                try:
+                    next_token_ids, valid_sampled_tokens_count, _ = (
+                        self.drafter.update_token_ids_ngram(
+                            sampled_token_ids,
+                            self.input_batch,
+                            self.token_ids_gpu_tensor,
+                            self.num_tokens_no_spec_gpu,
+                            self.discard_request_mask.gpu,
+                        )
+                    )
+                    self._copy_valid_sampled_token_count(
+                        next_token_ids, valid_sampled_tokens_count
+                    )
+                except Exception:
+                    logger.exception(
+                        "NGRAM_DSC: failed to update async sampled token counts "
+                        "while spec decode disabled; continuing with zero drafts."
+                    )
+            self._draft_token_ids = torch.zeros(
+                (len(self.input_batch.req_ids), self.num_spec_tokens),
+                device=self.device,
+                dtype=torch.int32,
+            )
+            self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (

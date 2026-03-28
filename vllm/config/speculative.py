@@ -51,6 +51,7 @@ EagleModelTypes = Literal["eagle", "eagle3", "extract_hidden_states", MTPModelTy
 NgramGPUTypes = Literal["ngram_gpu"]
 SpeculativeMethod = Literal[
     "ngram",
+    "ngram_dsc",
     "medusa",
     "mlp_speculator",
     "draft_model",
@@ -130,6 +131,21 @@ class SpeculativeConfig:
     prompt_lookup_min: int | None = Field(default=None, ge=1)
     """Minimum size of ngram token window when using Ngram proposer, if
     provided. Defaults to 1."""
+    ngram_dsc: bool = False
+    """Enable dynamic switching control (DSC) for ngram speculation. When
+    enabled, the scheduler disables ngram speculative tokens under heavy decode
+    load and re-enables them after load drops and cooldown elapses."""
+    ngram_dsc_disable_decode_tokens: int | None = Field(default=None, ge=1)
+    """Disable ngram speculation when the current number of running decode
+    tokens reaches this threshold. If None, the scheduler picks an automatic
+    threshold based on runtime capacity."""
+    ngram_dsc_enable_decode_tokens: int | None = Field(default=None, ge=1)
+    """Re-enable ngram speculation when running decode tokens fall to this
+    threshold or below. If None, the scheduler derives it from the disable
+    threshold to provide hysteresis."""
+    ngram_dsc_switch_cooldown_sec: float = Field(default=30.0, ge=0.0)
+    """Minimum time in seconds between DSC mode switches, used to avoid
+    oscillation under fluctuating load."""
 
     # Alternative drafting strategies
     speculative_token_tree: str | None = None
@@ -352,7 +368,9 @@ class SpeculativeConfig:
 
         # infer method from user args
         if self.method is None:
-            if self.model in ("ngram", "[ngram]"):
+            if self.model in ("ngram", "[ngram]", "ngram_dsc"):
+                if self.model == "ngram_dsc":
+                    self.ngram_dsc = True
                 self.method = "ngram"
             else:
                 self.method = "draft_model"
@@ -377,7 +395,9 @@ class SpeculativeConfig:
                 # --quantization fp8 with a bf16 checkpoint.
                 if not self.quantization:
                     self.quantization = self.target_model_config.quantization
-            elif self.method in ("ngram", "[ngram]"):
+            elif self.method in ("ngram", "[ngram]", "ngram_dsc"):
+                if self.method == "ngram_dsc":
+                    self.ngram_dsc = True
                 self.model = "ngram"
             elif self.method == "ngram_gpu":
                 self.model = "ngram_gpu"
@@ -390,7 +410,9 @@ class SpeculativeConfig:
                     "num_speculative_tokens was provided but without speculative model."
                 )
 
-        if self.method in ("ngram", "[ngram]"):
+        if self.method in ("ngram", "[ngram]", "ngram_dsc"):
+            if self.method == "ngram_dsc":
+                self.ngram_dsc = True
             self.method = "ngram"
 
         if self.method in ("ngram", "ngram_gpu"):
@@ -778,6 +800,17 @@ class SpeculativeConfig:
             raise ValueError(
                 "Expected num_speculative_tokens to be greater "
                 f"than zero ({self.num_speculative_tokens})."
+            )
+
+        if (
+            self.ngram_dsc_enable_decode_tokens is not None
+            and self.ngram_dsc_disable_decode_tokens is not None
+            and self.ngram_dsc_enable_decode_tokens
+            > self.ngram_dsc_disable_decode_tokens
+        ):
+            raise ValueError(
+                "ngram_dsc_enable_decode_tokens must be <= "
+                "ngram_dsc_disable_decode_tokens."
             )
 
         if self.draft_model_config:

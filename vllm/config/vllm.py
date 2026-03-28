@@ -707,6 +707,22 @@ class VllmConfig:
         executor_class = Executor.get_class(self)
         executor_supports_async_sched = executor_class.supports_async_scheduling()
 
+        # ngram_dsc uses ngram by default, but async scheduling requires
+        # ngram_gpu among ngram variants. Auto-promote here when async is
+        # requested (or auto mode) so startup does not fail.
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.ngram_dsc
+            and self.speculative_config.method == "ngram"
+            and self.scheduler_config.async_scheduling is not False
+        ):
+            self.speculative_config.method = "ngram_gpu"
+            self.speculative_config.model = "ngram_gpu"
+            logger.info_once(
+                "Using ngram_gpu for ngram_dsc with async scheduling.",
+                scope="local",
+            )
+
         if self.scheduler_config.async_scheduling:
             # Async scheduling explicitly enabled, hard fail any incompatibilities.
             # Currently, async scheduling only support eagle speculative

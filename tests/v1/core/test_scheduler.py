@@ -1038,6 +1038,200 @@ def test_no_spec_tokens_scheduled_for_prefill_chunks():
     assert len(output.scheduled_spec_decode_tokens[req.request_id]) == num_spec_tokens
 
 
+def test_ngram_dsc_disables_speculation_under_high_decode_load():
+    scheduler = create_scheduler(
+        num_speculative_tokens=3,
+        speculative_config_kwargs={
+            "ngram_dsc": True,
+            "ngram_dsc_disable_decode_tokens": 2,
+            "ngram_dsc_enable_decode_tokens": 1,
+            "ngram_dsc_switch_cooldown_sec": 30.0,
+        },
+    )
+    requests = create_requests(num_requests=3, num_tokens=1)
+    for request in requests:
+        scheduler.add_request(request)
+
+    # Prefill.
+    output = scheduler.schedule()
+    req_ids = [req.request_id for req in requests]
+    req_id_to_index = {req_id: idx for idx, req_id in enumerate(req_ids)}
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+            sampled_token_ids=[[0], [0], [0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    # High decode load should force normal decoding (drop spec tokens).
+    scheduler.update_draft_token_ids(
+        DraftTokenIds(req_ids, [[1, 2, 3], [4, 5, 6], [7, 8, 9]])
+    )
+    for request in requests:
+        assert request.spec_token_ids == []
+
+    output = scheduler.schedule()
+    assert output.enable_spec_decode is False
+    assert output.scheduled_spec_decode_tokens == {}
+    for req_id in req_ids:
+        assert output.num_scheduled_tokens[req_id] == 1
+
+
+def test_ngram_dsc_switch_back_respects_cooldown(monkeypatch: pytest.MonkeyPatch):
+    now_s = {"value": 1000.0}
+    monkeypatch.setattr(
+        "vllm.v1.core.sched.scheduler.time.monotonic", lambda: now_s["value"]
+    )
+
+    scheduler = create_scheduler(
+        num_speculative_tokens=3,
+        speculative_config_kwargs={
+            "ngram_dsc": True,
+            "ngram_dsc_disable_decode_tokens": 2,
+            "ngram_dsc_enable_decode_tokens": 1,
+            "ngram_dsc_switch_cooldown_sec": 30.0,
+        },
+    )
+    requests = create_requests(num_requests=2, num_tokens=1)
+    for request in requests:
+        scheduler.add_request(request)
+
+    # Prefill.
+    output = scheduler.schedule()
+    req_ids = [req.request_id for req in requests]
+    req_id_to_index = {req_id: idx for idx, req_id in enumerate(req_ids)}
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+            sampled_token_ids=[[0], [0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    # At load=2, switch to normal decoding.
+    scheduler.update_draft_token_ids(
+        DraftTokenIds(req_ids, [[1, 2, 3], [4, 5, 6]])
+    )
+    assert scheduler._ngram_dsc_spec_enabled is False
+
+    # Drop load to 1 decode request, but keep time within cooldown.
+    scheduler.finish_requests(requests[1].request_id, RequestStatus.FINISHED_ABORTED)
+    now_s["value"] = 1010.0
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([requests[0].request_id], [[7, 8]])
+    )
+    assert requests[0].spec_token_ids == []
+    assert scheduler._ngram_dsc_spec_enabled is False
+
+    # After cooldown, switch back to ngram speculation.
+    now_s["value"] = 1031.0
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([requests[0].request_id], [[11, 12, 13]])
+    )
+    assert requests[0].spec_token_ids == [11, 12, 13]
+    assert scheduler._ngram_dsc_spec_enabled is True
+
+
+def test_ngram_gpu_dsc_disables_speculation_under_high_decode_load():
+    scheduler = create_scheduler(
+        num_speculative_tokens=3,
+        speculative_config_kwargs={
+            "method": "ngram_gpu",
+            "ngram_dsc": True,
+            "ngram_dsc_disable_decode_tokens": 2,
+            "ngram_dsc_enable_decode_tokens": 1,
+            "ngram_dsc_switch_cooldown_sec": 30.0,
+        },
+    )
+    requests = create_requests(num_requests=3, num_tokens=1)
+    for request in requests:
+        scheduler.add_request(request)
+
+    # Prefill to move requests into decode phase.
+    output = scheduler.schedule()
+    req_ids = [req.request_id for req in requests]
+    req_id_to_index = {req_id: idx for idx, req_id in enumerate(req_ids)}
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+            sampled_token_ids=[[0], [0], [0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    scheduler.update_draft_token_ids(
+        DraftTokenIds(req_ids, [[1, 2, 3], [4, 5, 6], [7, 8, 9]])
+    )
+    for request in requests:
+        assert request.spec_token_ids == []
+
+
+def test_ngram_gpu_dsc_disables_speculation_in_async_scheduler():
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        num_speculative_tokens=3,
+        speculative_config_kwargs={
+            "method": "ngram_gpu",
+            "ngram_dsc": True,
+            "ngram_dsc_disable_decode_tokens": 1,
+            "ngram_dsc_enable_decode_tokens": 1,
+            "ngram_dsc_switch_cooldown_sec": 30.0,
+        },
+    )
+    requests = create_requests(num_requests=2, num_tokens=1)
+    for request in requests:
+        scheduler.add_request(request)
+
+    # First step: prefill
+    output = scheduler.schedule()
+    req_ids = [req.request_id for req in requests]
+    req_id_to_index = {req_id: idx for idx, req_id in enumerate(req_ids)}
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+            sampled_token_ids=[[0], [0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    # Second step: decode phase should force normal decoding (no spec tokens).
+    output = scheduler.schedule()
+    assert output.enable_spec_decode is False
+    assert output.scheduled_spec_decode_tokens == {}
+    for req_id in req_ids:
+        assert output.num_scheduled_tokens[req_id] == 1
+
+
+def test_ngram_dsc_auto_disable_threshold_is_capped():
+    scheduler = create_scheduler(
+        max_num_seqs=1024,
+        num_speculative_tokens=3,
+        speculative_config_kwargs={
+            "ngram_dsc": True,
+        },
+    )
+    assert scheduler._ngram_dsc_enabled is True
+    # decode_capacity = min(max_num_seqs=1024, max_num_scheduled_tokens=8192)
+    # raw half would be 512, but auto threshold is capped at 128.
+    assert scheduler._ngram_dsc_disable_decode_tokens == 128
+
 def _assert_right_scheduler_output(
     output: SchedulerOutput,
     num_requests: int,

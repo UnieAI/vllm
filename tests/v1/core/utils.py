@@ -52,6 +52,7 @@ def create_scheduler(
     block_size: int = 16,
     max_model_len: int | None = None,
     num_speculative_tokens: int | None = None,
+    speculative_config_kwargs: dict[str, object] | None = None,
     skip_tokenizer_init: bool = False,
     async_scheduling: bool = False,
     pipeline_parallel_size: int = 1,
@@ -120,10 +121,12 @@ def create_scheduler(
         )
 
     speculative_config: SpeculativeConfig | None = None
-    if num_speculative_tokens is not None:
-        speculative_config = SpeculativeConfig(
-            model="ngram", num_speculative_tokens=num_speculative_tokens
-        )
+    if num_speculative_tokens is not None or speculative_config_kwargs is not None:
+        spec_kwargs = dict(speculative_config_kwargs or {})
+        spec_kwargs.setdefault("model", "ngram")
+        if num_speculative_tokens is not None:
+            spec_kwargs.setdefault("num_speculative_tokens", num_speculative_tokens)
+        speculative_config = SpeculativeConfig(**spec_kwargs)
 
     ec_transfer_config = (
         ECTransferConfig(
