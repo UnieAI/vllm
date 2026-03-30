@@ -224,6 +224,9 @@ class SchedulerOutput:
     # need to perform grammar bitmask computation.
     pending_structured_output_tokens: bool = False
 
+    # Whether speculative drafting should run in the worker for this step.
+    enable_spec_decode: bool = True
+
     # Used for adjusting acceptance rate calculation.
     num_invalid_spec_tokens: dict[str, int] | None = None
 

@@ -58,6 +58,29 @@ def test_async_scheduling_with_pipeline_parallelism_is_allowed():
     assert cfg.scheduler_config.async_scheduling is True
 
 
+def test_async_scheduling_with_ngram_dsc_promotes_to_ngram_gpu():
+    cfg = VllmConfig(
+        scheduler_config=SchedulerConfig(
+            max_model_len=8192,
+            is_encoder_decoder=False,
+            async_scheduling=True,
+        ),
+        parallel_config=ParallelConfig(
+            distributed_executor_backend="mp",
+        ),
+        speculative_config=SpeculativeConfig(
+            method="ngram_dsc",
+            num_speculative_tokens=4,
+            prompt_lookup_min=3,
+            prompt_lookup_max=8,
+        ),
+    )
+    assert cfg.scheduler_config.async_scheduling is True
+    assert cfg.speculative_config is not None
+    assert cfg.speculative_config.method == "ngram_gpu"
+    assert cfg.speculative_config.ngram_dsc is True
+
+
 @dataclass
 class _TestConfigFields:
     a: int

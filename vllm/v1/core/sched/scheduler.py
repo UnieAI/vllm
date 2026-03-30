@@ -213,6 +213,14 @@ class Scheduler(SchedulerInterface):
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
         self.num_spec_tokens = self.num_lookahead_tokens = 0
+        self._ngram_dsc_enabled = False
+        self._ngram_dsc_spec_enabled = True
+        self._ngram_dsc_disable_decode_tokens = 0
+        self._ngram_dsc_enable_decode_tokens = 0
+        self._ngram_dsc_switch_cooldown_sec = 0.0
+        self._ngram_dsc_last_switch_time = 0.0
+        self._ngram_dsc_last_status_log_time = 0.0
+        self._ngram_dsc_status_log_interval_sec = 5.0
         if speculative_config:
             self.num_spec_tokens = speculative_config.num_speculative_tokens
             if speculative_config.use_eagle():
@@ -220,6 +228,44 @@ class Scheduler(SchedulerInterface):
                 self.num_lookahead_tokens = self.num_spec_tokens
             if speculative_config.uses_draft_model():
                 self.num_lookahead_tokens = self.num_spec_tokens
+            if (
+                speculative_config.method in ("ngram", "ngram_gpu")
+                and speculative_config.ngram_dsc
+            ):
+                self._ngram_dsc_enabled = True
+                decode_capacity = max(
+                    1, min(self.max_num_running_reqs, self.max_num_scheduled_tokens)
+                )
+                # Auto threshold should not scale unbounded with max_num_seqs;
+                # a cap keeps switching responsive on large-capacity servers.
+                auto_disable = max(1, min(128, decode_capacity // 2))
+                disable_decode_tokens = (
+                    speculative_config.ngram_dsc_disable_decode_tokens
+                    or auto_disable
+                )
+                enable_decode_tokens = (
+                    speculative_config.ngram_dsc_enable_decode_tokens
+                )
+                if enable_decode_tokens is None:
+                    enable_decode_tokens = max(1, int(disable_decode_tokens * 0.8))
+                self._ngram_dsc_disable_decode_tokens = disable_decode_tokens
+                self._ngram_dsc_enable_decode_tokens = min(
+                    enable_decode_tokens, disable_decode_tokens
+                )
+                self._ngram_dsc_switch_cooldown_sec = (
+                    speculative_config.ngram_dsc_switch_cooldown_sec
+                )
+                logger.info(
+                    "NGRAM_DSC_INIT disable_decode_tokens=%d "
+                    "enable_decode_tokens=%d switch_cooldown_sec=%.2f "
+                    "method=%s max_num_seqs=%d max_num_scheduled_tokens=%d",
+                    self._ngram_dsc_disable_decode_tokens,
+                    self._ngram_dsc_enable_decode_tokens,
+                    self._ngram_dsc_switch_cooldown_sec,
+                    speculative_config.method,
+                    self.max_num_running_reqs,
+                    self.max_num_scheduled_tokens,
+                )
 
         # Create the KV cache manager.
         self.kv_cache_manager = KVCacheManager(
@@ -920,6 +966,7 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            enable_spec_decode=self._should_use_ngram_spec(),
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1660,6 +1707,7 @@ class Scheduler(SchedulerInterface):
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
 
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
+        use_ngram_spec = self._should_use_ngram_spec()
         for req_id, spec_token_ids in zip(
             draft_token_ids.req_ids,
             draft_token_ids.draft_token_ids,
@@ -1675,11 +1723,96 @@ class Scheduler(SchedulerInterface):
                     request.spec_token_ids = []
                 continue
 
+            if not use_ngram_spec:
+                if request.spec_token_ids:
+                    request.spec_token_ids = []
+                continue
+
             # Add newly generated spec token ids to the request.
             if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request
                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
             request.spec_token_ids = spec_token_ids
+
+    def _get_running_decode_token_load(self) -> int:
+        return sum(
+            1
+            for request in self.running
+            if request.num_computed_tokens >= request.num_prompt_tokens
+        )
+
+    def _should_use_ngram_spec(self) -> bool:
+        if not self._ngram_dsc_enabled:
+            return True
+
+        decode_token_load = self._get_running_decode_token_load()
+        now = time.monotonic()
+
+        if self._ngram_dsc_spec_enabled:
+            if decode_token_load >= self._ngram_dsc_disable_decode_tokens:
+                self._ngram_dsc_spec_enabled = False
+                self._ngram_dsc_last_switch_time = now
+                logger.info(
+                    "NGRAM_DSC_SWITCH to=normal_decode "
+                    "decode_token_load=%d disable_threshold=%d "
+                    "enable_threshold=%d cooldown_sec=%.2f",
+                    decode_token_load,
+                    self._ngram_dsc_disable_decode_tokens,
+                    self._ngram_dsc_enable_decode_tokens,
+                    self._ngram_dsc_switch_cooldown_sec,
+                )
+            decision = self._ngram_dsc_spec_enabled
+            self._log_ngram_dsc_state(now, decode_token_load, decision)
+            return decision
+
+        if (
+            now - self._ngram_dsc_last_switch_time
+            < self._ngram_dsc_switch_cooldown_sec
+        ):
+            decision = False
+            self._log_ngram_dsc_state(now, decode_token_load, decision)
+            return decision
+
+        if decode_token_load <= self._ngram_dsc_enable_decode_tokens:
+            self._ngram_dsc_spec_enabled = True
+            self._ngram_dsc_last_switch_time = now
+            logger.info(
+                "NGRAM_DSC_SWITCH to=ngram_spec "
+                "decode_token_load=%d disable_threshold=%d "
+                "enable_threshold=%d cooldown_sec=%.2f",
+                decode_token_load,
+                self._ngram_dsc_disable_decode_tokens,
+                self._ngram_dsc_enable_decode_tokens,
+                self._ngram_dsc_switch_cooldown_sec,
+            )
+        decision = self._ngram_dsc_spec_enabled
+        self._log_ngram_dsc_state(now, decode_token_load, decision)
+        return decision
+
+    def _log_ngram_dsc_state(
+        self, now: float, decode_token_load: int, decision_use_ngram_spec: bool
+    ) -> None:
+        if (
+            now - self._ngram_dsc_last_status_log_time
+            < self._ngram_dsc_status_log_interval_sec
+        ):
+            return
+        cooldown_remaining_sec = max(
+            0.0,
+            self._ngram_dsc_switch_cooldown_sec
+            - (now - self._ngram_dsc_last_switch_time),
+        )
+        logger.info(
+            "NGRAM_DSC_STATE use_ngram_spec=%s decode_token_load=%d "
+            "disable_threshold=%d enable_threshold=%d "
+            "cooldown_remaining_sec=%.2f",
+            decision_use_ngram_spec,
+            decode_token_load,
+            self._ngram_dsc_disable_decode_tokens,
+            self._ngram_dsc_enable_decode_tokens,
+            cooldown_remaining_sec,
+        )
+        self._ngram_dsc_last_status_log_time = now
 
     def update_draft_token_ids_in_output(
         self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput

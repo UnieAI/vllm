@@ -18,6 +18,7 @@ class AsyncScheduler(Scheduler):
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         super()._update_after_schedule(scheduler_output)
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
+        use_ngram_spec = scheduler_output.enable_spec_decode
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests[req_id]
             if request.is_prefill_chunk:
@@ -26,13 +27,17 @@ class AsyncScheduler(Scheduler):
             scheduler_output.pending_structured_output_tokens |= (
                 request.use_structured_output and request.num_output_placeholders > 0
             )
-            # The request will generate a new token plus num_spec_tokens
-            # in this scheduling step.
+            # The request will generate a new token plus currently scheduled
+            # draft tokens in this step. For ngram_dsc switching, keep current
+            # step draft verification intact and only disable drafting for the
+            # next step via request.spec_token_ids below.
             cur_num_spec_tokens = len(spec_decode_tokens.get(req_id, ()))
             request.num_output_placeholders += 1 + cur_num_spec_tokens
             # Add placeholders for the new draft/spec tokens.
             # We will update the actual spec token ids in the worker process.
-            request.spec_token_ids = self._spec_token_placeholders
+            request.spec_token_ids = (
+                self._spec_token_placeholders if use_ngram_spec else []
+            )
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int]

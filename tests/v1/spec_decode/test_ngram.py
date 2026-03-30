@@ -202,3 +202,12 @@ def test_ngram_proposer():
     assert len(result[0]) == 2
     assert np.array_equal(result[0], np.array([middle_integer + 2, middle_integer + 3]))
     assert np.array_equal(result[1], np.array([]))
+
+
+def test_ngram_dsc_method_alias():
+    speculative_config = SpeculativeConfig(
+        method="ngram_dsc",
+        num_speculative_tokens=2,
+    )
+    assert speculative_config.method == "ngram"
+    assert speculative_config.ngram_dsc is True
