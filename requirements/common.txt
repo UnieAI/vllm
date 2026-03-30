@@ -55,3 +55,5 @@ opentelemetry-sdk >= 1.27.0
 opentelemetry-api >= 1.27.0
 opentelemetry-exporter-otlp >= 1.27.0
 opentelemetry-semantic-conventions-ai >= 0.4.1
+cryptography  # Required for UnieAI license verification in unieai.py
+uvloop  # Optional event loop for performance in unieai.py and other entrypoints
