@@ -7,6 +7,15 @@ import torch
 from numba import get_num_threads, jit, njit, prange, set_num_threads
 
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+try:
+    from vllm_rs import batch_ngram_propose as _rs_batch_ngram_propose
+    _HAS_RUST_NGRAM = True
+except ImportError:
+    _HAS_RUST_NGRAM = False
 
 
 class NgramProposer:
@@ -43,9 +52,7 @@ class NgramProposer:
             # Cap the number of threads to 8 to avoid using too many threads
             # since other components like frontend (incl tokenization)
             # and Structured Outputs also use multiple threads.
-            # TODO(ekagra-ranjan): bump up the cap from 1 to 8
-            # when TP parallelization for ngram is implemented.
-            self.num_numba_thread_available = min(1, (cpu_count // 2))
+            self.num_numba_thread_available = min(8, max(1, cpu_count // 2))
             # Divide by tp_size to ensure each tensor parallel rank
             # has some threads since all ranks will run this.
             self.num_numba_thread_available //= tp_size
@@ -90,36 +97,52 @@ class NgramProposer:
         # avoid calling numba function with empty list which causes error
         # ValueError: cannot compute fingerprint of empty list
         if num_ngram_requests := len(valid_ngram_requests):
-            original_num_numba_threads = get_num_threads()
-            # Ensure we use at least one thread.
-            # If total tokens is small, using multiple threads
-            # may slow down due to overhead.
-            total_tokens = np.sum(num_tokens_no_spec)
-            if total_tokens >= self.num_tokens_threshold:
-                final_num_threads = max(
-                    1, min(self.num_numba_thread_available, num_ngram_requests)
+            if _HAS_RUST_NGRAM:
+                # Rust path: faster KMP with native parallelism.
+                draft_arr, ndrafts_arr = _rs_batch_ngram_propose(
+                    token_ids_cpu,
+                    num_tokens_no_spec,
+                    valid_ngram_requests,
+                    self.min_n,
+                    self.max_n,
+                    self.max_model_len,
+                    self.k,
                 )
-                set_num_threads(final_num_threads)
+                self.valid_ngram_draft[:num_requests, :] = (
+                    draft_arr[:num_requests, :]
+                )
+                self.valid_ngram_num_drafts[:num_requests] = (
+                    ndrafts_arr[:num_requests]
+                )
             else:
-                set_num_threads(1)
+                # Numba fallback.
+                original_num_numba_threads = get_num_threads()
+                total_tokens = np.sum(num_tokens_no_spec)
+                if total_tokens >= self.num_tokens_threshold:
+                    final_num_threads = max(
+                        1, min(self.num_numba_thread_available,
+                               num_ngram_requests)
+                    )
+                    set_num_threads(final_num_threads)
+                else:
+                    set_num_threads(1)
 
-            batch_propose_numba(
-                valid_ngram_requests,
-                num_tokens_no_spec,
-                token_ids_cpu,
-                self.min_n,
-                self.max_n,
-                self.max_model_len,
-                self.k,
-                self.valid_ngram_draft,
-                self.valid_ngram_num_drafts,
-            )
+                batch_propose_numba(
+                    valid_ngram_requests,
+                    num_tokens_no_spec,
+                    token_ids_cpu,
+                    self.min_n,
+                    self.max_n,
+                    self.max_model_len,
+                    self.k,
+                    self.valid_ngram_draft,
+                    self.valid_ngram_num_drafts,
+                )
+                set_num_threads(original_num_numba_threads)
 
-            # Restore original number of threads.
-            set_num_threads(original_num_numba_threads)
-
+        valid_set = set(valid_ngram_requests)
         for i in range(num_requests):
-            if i in valid_ngram_requests and self.valid_ngram_num_drafts[i] > 0:
+            if i in valid_set and self.valid_ngram_num_drafts[i] > 0:
                 draft_token_ids.append(
                     self.valid_ngram_draft[i, : self.valid_ngram_num_drafts[i]].tolist()
                 )
