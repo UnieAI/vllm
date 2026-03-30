@@ -50,7 +50,15 @@ from vllm.v1.core.sched.request_queue import (
     SchedulingPolicy,
     create_request_queue,
 )
-from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.core.sched.rust_accelerated import (
+    STOP_EOS,
+    STOP_LENGTH,
+    STOP_NONE,
+    STOP_TOKEN,
+    _HAS_RUST,
+    batch_precompute_stop_reasons,
+)
+from vllm.v1.core.sched.utils import check_stop, check_sequence_repetition, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
@@ -173,6 +181,10 @@ class Scheduler(SchedulerInterface):
         # requests so that they can free the cached states for those requests.
         # This is flushed at the end of each scheduling step.
         self.finished_req_ids: set[str] = set()
+
+        # Batch stop-check pre-computation (populated before the
+        # update_from_output loop, consumed inside _update_request_with_output).
+        self._precomputed_stops: dict[str, int] = {}
 
         # Counter for requests waiting for streaming input. Used to calculate
         # number of unfinished requests
@@ -1380,6 +1392,16 @@ class Scheduler(SchedulerInterface):
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
         # to avoid expensive operations inside the loop.
+
+        # Batch pre-compute stop conditions for single-token generation
+        # requests.  This avoids per-request Python attribute lookups and
+        # comparison overhead inside the hot loop below.
+        self._precomputed_stops.clear()
+        if _HAS_RUST and sampled_token_ids is not None:
+            self._batch_precompute_stops(
+                scheduler_output, model_runner_output, failed_kv_load_req_ids,
+            )
+
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
@@ -1664,6 +1686,98 @@ class Scheduler(SchedulerInterface):
 
         return self.routed_experts_reader.get_routed_experts(indices=slot_mapping)
 
+    def _batch_precompute_stops(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_runner_output: ModelRunnerOutput,
+        failed_kv_load_req_ids: set[str] | None,
+    ) -> None:
+        """Pre-compute stop conditions for single-token generation requests.
+
+        Populates ``self._precomputed_stops`` with ``{req_id: stop_code}``
+        for every request that will generate exactly one token and does not
+        use speculative decoding.  The results are consumed by
+        ``_update_request_with_output`` in the hot loop.
+        """
+        sampled = model_runner_output.sampled_token_ids
+        if not sampled:
+            return
+
+        num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+
+        candidates: list[tuple[str, Request]] = []
+        new_tokens: list[int] = []
+
+        for req_id in num_scheduled_tokens:
+            if spec_tokens and req_id in spec_tokens:
+                continue
+            if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
+                continue
+            request = self.requests.get(req_id)
+            if request is None or request.is_finished():
+                continue
+            if request.pooling_params:
+                continue
+            req_index = model_runner_output.req_id_to_index.get(req_id)
+            if req_index is None:
+                continue
+            generated = sampled[req_index]
+            if len(generated) != 1:
+                continue
+            candidates.append((req_id, request))
+            new_tokens.append(generated[0])
+
+        if len(candidates) < 2:
+            # Not worth the overhead for a single request.
+            return
+
+        token_arr = np.array(new_tokens, dtype=np.int64)
+        reqs = [req for _, req in candidates]
+        stop_results = batch_precompute_stop_reasons(
+            reqs, token_arr, self.max_model_len,
+        )
+
+        for i, (req_id, _) in enumerate(candidates):
+            self._precomputed_stops[req_id] = int(stop_results[i])
+
+    def _apply_batch_stop(
+        self, request: Request, stop_code: int, last_token_id: int,
+    ) -> bool:
+        """Apply a pre-computed batch stop result to a request.
+
+        Sets ``request.status`` and ``request.stop_reason`` as
+        ``check_stop`` would, then falls back to Python for
+        repetition detection (not handled by the Rust batch check).
+        """
+        if stop_code == STOP_NONE:
+            # Rust says "not stopped" — still need to check repetition
+            # detection which is not handled in the batch path.
+            sp = request.sampling_params
+            if (
+                sp is not None
+                and sp.repetition_detection is not None
+                and request.num_output_tokens >= sp.min_tokens
+                and check_sequence_repetition(
+                    request.output_token_ids, sp.repetition_detection,
+                )
+            ):
+                request.status = RequestStatus.FINISHED_REPETITION
+                request.stop_reason = "repetition_detected"
+                return True
+            return False
+        elif stop_code == STOP_EOS:
+            request.status = RequestStatus.FINISHED_STOPPED
+            return True
+        elif stop_code == STOP_TOKEN:
+            request.status = RequestStatus.FINISHED_STOPPED
+            request.stop_reason = last_token_id
+            return True
+        elif stop_code == STOP_LENGTH:
+            request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+            return True
+        return False
+
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int]
     ) -> tuple[list[int], bool]:
@@ -1671,6 +1785,19 @@ class Scheduler(SchedulerInterface):
         # a request is still being prefilled, we expect the model runner
         # to return empty token ids for the request.
         stopped = False
+
+        # Fast path: single token with a pre-computed batch stop result.
+        precomputed = self._precomputed_stops.pop(
+            request.request_id, None,
+        )
+        if precomputed is not None and len(new_token_ids) == 1:
+            request.append_output_token_ids(new_token_ids[0])
+            stopped = self._apply_batch_stop(
+                request, precomputed, new_token_ids[0],
+            )
+            return new_token_ids, stopped
+
+        # Regular path: per-token stop checking.
         for num_new, output_token_id in enumerate(new_token_ids, 1):
             request.append_output_token_ids(output_token_id)
 
