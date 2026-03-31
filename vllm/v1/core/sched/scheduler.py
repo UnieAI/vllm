@@ -56,7 +56,9 @@ from vllm.v1.core.sched.rust_accelerated import (
     STOP_NONE,
     STOP_TOKEN,
     _HAS_RUST,
+    batch_apply_spec_decode,
     batch_precompute_stop_reasons,
+    compute_running_tokens_batch,
 )
 from vllm.v1.core.sched.utils import check_stop, check_sequence_repetition, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
@@ -185,6 +187,9 @@ class Scheduler(SchedulerInterface):
         # Batch stop-check pre-computation (populated before the
         # update_from_output loop, consumed inside _update_request_with_output).
         self._precomputed_stops: dict[str, int] = {}
+        # Batch spec-decode pre-computation (populated before the loop,
+        # consumed inside the loop for each spec-decode request).
+        self._precomputed_spec: dict[str, tuple[int, int]] = {}
 
         # Counter for requests waiting for streaming input. Used to calculate
         # number of unfinished requests
@@ -431,41 +436,64 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
+        # Pre-compute token counts for all running requests in one
+        # vectorised Rust call.  The result accounts for async-scheduling
+        # skips, long-prefill threshold, budget, and max-model-len, but
+        # NOT encoder scheduling or mamba alignment (handled below).
+        _precomputed_running_tokens: np.ndarray | None = None
+        if _HAS_RUST and self.running and token_budget > 0:
+            _precomputed_running_tokens = compute_running_tokens_batch(
+                self.running,
+                token_budget,
+                self.scheduler_config.long_prefill_token_threshold,
+                self.max_model_len,
+            )
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 
-            if (
-                request.num_output_placeholders > 0
-                # This is (num_computed_tokens + 1) - (num_output_placeholders - 1).
-                # Since output placeholders are also included in the computed tokens
-                # count, we subtract (num_output_placeholders - 1) to remove any draft
-                # tokens, so that we can be sure no further steps are needed even if
-                # they are all rejected.
-                and request.num_computed_tokens + 2 - request.num_output_placeholders
-                >= request.num_prompt_tokens + request.max_tokens
-            ):
-                # Async scheduling: Avoid scheduling an extra step when we are sure that
-                # the previous step has reached request.max_tokens. We don't schedule
-                # partial draft tokens since this prevents uniform decode optimizations.
-                req_index += 1
-                continue
+            # ── Token count: use Rust pre-computed value or Python fallback ──
+            if _precomputed_running_tokens is not None:
+                num_new_tokens = int(_precomputed_running_tokens[req_index])
+                if num_new_tokens == 0:
+                    # Rust determined this request should be skipped
+                    # (async-scheduling early exit or zero budget).
+                    req_index += 1
+                    continue
+                # Rust used the *original* budget, but we may have consumed
+                # more due to encoder/mamba adjustments in prior iterations.
+                # Re-clamp against the *current* remaining budget.
+                num_new_tokens = min(num_new_tokens, token_budget)
+            else:
+                if (
+                    request.num_output_placeholders > 0
+                    and request.num_computed_tokens + 2
+                    - request.num_output_placeholders
+                    >= request.num_prompt_tokens + request.max_tokens
+                ):
+                    req_index += 1
+                    continue
 
-            num_new_tokens = (
-                request.num_tokens_with_spec
-                + request.num_output_placeholders
-                - request.num_computed_tokens
-            )
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens = min(num_new_tokens, token_budget)
-
-            # Make sure the input position does not exceed the max model len.
-            # This is necessary when using spec decoding.
-            num_new_tokens = min(
-                num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
-            )
+                num_new_tokens = (
+                    request.num_tokens_with_spec
+                    + request.num_output_placeholders
+                    - request.num_computed_tokens
+                )
+                if (
+                    0
+                    < self.scheduler_config.long_prefill_token_threshold
+                    < num_new_tokens
+                ):
+                    num_new_tokens = (
+                        self.scheduler_config.long_prefill_token_threshold
+                    )
+                num_new_tokens = min(num_new_tokens, token_budget)
+                num_new_tokens = min(
+                    num_new_tokens,
+                    self.max_model_len - 1 - request.num_computed_tokens,
+                )
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -1397,8 +1425,12 @@ class Scheduler(SchedulerInterface):
         # requests.  This avoids per-request Python attribute lookups and
         # comparison overhead inside the hot loop below.
         self._precomputed_stops.clear()
+        self._precomputed_spec.clear()
         if _HAS_RUST and sampled_token_ids is not None:
             self._batch_precompute_stops(
+                scheduler_output, model_runner_output, failed_kv_load_req_ids,
+            )
+            self._batch_precompute_spec_decode(
                 scheduler_output, model_runner_output, failed_kv_load_req_ids,
             )
 
@@ -1429,9 +1461,14 @@ class Scheduler(SchedulerInterface):
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
             if scheduled_spec_token_ids and generated_token_ids:
-                num_draft_tokens = len(scheduled_spec_token_ids)
-                num_accepted = len(generated_token_ids) - 1
-                num_rejected = num_draft_tokens - num_accepted
+                # Use batch-precomputed spec decode results when available.
+                precomp = self._precomputed_spec.pop(req_id, None)
+                if precomp is not None:
+                    num_accepted, num_rejected = precomp
+                else:
+                    num_draft_tokens = len(scheduled_spec_token_ids)
+                    num_accepted = len(generated_token_ids) - 1
+                    num_rejected = num_draft_tokens - num_accepted
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
                 # tokens and rejections. If some tokens are rejected,
@@ -1445,7 +1482,7 @@ class Scheduler(SchedulerInterface):
                     request.num_output_placeholders -= num_rejected
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
-                    num_draft_tokens=num_draft_tokens,
+                    num_draft_tokens=len(scheduled_spec_token_ids),
                     num_accepted_tokens=num_accepted,
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
@@ -1740,6 +1777,59 @@ class Scheduler(SchedulerInterface):
 
         for i, (req_id, _) in enumerate(candidates):
             self._precomputed_stops[req_id] = int(stop_results[i])
+
+    def _batch_precompute_spec_decode(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_runner_output: ModelRunnerOutput,
+        failed_kv_load_req_ids: set[str] | None,
+    ) -> None:
+        """Batch pre-compute spec decode accepted/rejected counts.
+
+        Populates ``self._precomputed_spec`` with
+        ``{req_id: (num_accepted, num_rejected)}`` for every request that
+        used speculative decoding in this step.
+        """
+        sampled = model_runner_output.sampled_token_ids
+        if not sampled:
+            return
+        spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        if not spec_tokens:
+            return
+
+        candidates: list[tuple[str, Request]] = []
+        num_generated_list: list[int] = []
+        num_draft_list: list[int] = []
+
+        for req_id, spec_tok_ids in spec_tokens.items():
+            if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
+                continue
+            request = self.requests.get(req_id)
+            if request is None or request.is_finished():
+                continue
+            req_index = model_runner_output.req_id_to_index.get(req_id)
+            if req_index is None:
+                continue
+            generated = sampled[req_index]
+            if not generated:
+                continue
+            candidates.append((req_id, request))
+            num_generated_list.append(len(generated))
+            num_draft_list.append(len(spec_tok_ids))
+
+        if len(candidates) < 2:
+            return
+
+        _, _, accepted, rejected = batch_apply_spec_decode(
+            [req for _, req in candidates],
+            num_generated_list,
+            num_draft_list,
+        )
+
+        for i, (req_id, _) in enumerate(candidates):
+            self._precomputed_spec[req_id] = (
+                int(accepted[i]), int(rejected[i]),
+            )
 
     def _apply_batch_stop(
         self, request: Request, stop_code: int, last_token_id: int,
