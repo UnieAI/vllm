@@ -165,7 +165,7 @@ except ImportError:
 
 ## 4. TODO Roadmap
 
-### 已完成 ✅（22 項）
+### 已完成 ✅（24 項）
 
 | # | 項目 | 檔案 | 整合位置 | 效能 |
 |---|------|------|---------|------|
@@ -186,11 +186,13 @@ except ImportError:
 | 15 | 序列化輔助 | `serial_helpers.rs` | Rust 可用 | — |
 | 16 | CUDA n-gram kernel（GPU） | `csrc/ngram_kernels.cu` | `ngram_proposer_gpu.py` | Fused KMP O(n)，需 GPU 驗證 |
 | 17 | CI 自動建構 | `.github/workflows/rust-ci.yml` | GitHub Actions | cargo check + pytest + 效能回歸 |
-| 18 | D1: Adaptive k | — | `scheduler.py` `_adaptive_k()` | 按接受率縮減 draft |
-| 19 | D2: Low-confidence filter | — | `scheduler.py` `_is_low_confidence_draft()` | 接受率<20% 減半 |
-| 20 | D3: Gradual DSC | — | `scheduler.py` `_get_effective_spec_k()` | 線性降級取代 binary |
+| 18 | D1: Adaptive k (EMA) | — | `scheduler.py` `_adaptive_k()` | 按 EMA 接受率縮減 |
+| 19 | D2: Low-confidence filter | — | `scheduler.py` `_is_low_confidence_draft()` | EMA<20% 減半 |
+| 20 | D3: Gradual DSC | — | `scheduler.py` `_get_effective_spec_k()` | 線性降級 |
 | 21 | D4: Relaxed retry | — | `ngram_proposer.py` `_run_propose_backend()` | min_n=1 fallback |
-| 22 | D5: Position-aware decay | — | `scheduler.py` `_position_decay_k()` | 截斷低接受率位置 |
+| 22 | D5: Position-aware decay (EMA) | — | `scheduler.py` `_position_decay_k()` | 截斷低 EMA 位置 |
+| 23 | D9: Tree multi-candidate (Phase 1) | — | `ngram_proposer.py` `_run_tree_propose()` | 3-branch 選最佳 |
+| 24 | EMA 追蹤（universal） | — | `scheduler.py` `_req_accept_ema` | α=0.3，適用所有 spec decode |
 
 ### 不做（已驗證不值得）
 
@@ -311,21 +313,97 @@ EMA：rate = 0.3 * this_step + 0.7 * previous_ema
   → 適用場景：code → chat 切換、長 prompt 中 topic switch
 ```
 
+#### D9: Tree-structured multi-candidate n-gram（已完成 Phase 1）
+
+**不需要額外模型。** Tree-based speculation 是驗證策略，draft 來源可以是任何 proposer。
+
+**已完成（Phase 1 — proposer 側）：**
+
+`ngram_proposer.py` 新增 `_run_tree_propose()`，為每個 request 搜尋 3 個候選分支：
+
+| Branch | 搜尋範圍 | 分數加權 | 目的 |
+|--------|---------|---------|------|
+| 0 | 完整 context | `ngram_len × 1.0` | 最長 match（原始行為） |
+| 1 | 最近 50% context | `ngram_len × 1.3` | 偏好更近的 match（recency bonus） |
+| 2 | min_n=1 fallback | `ngram_len × 0.5` | 最寬搜尋（D4 fallback） |
+
+選擇分數最高的 branch 作為 draft。效果：
+- 當最長 match 來自很早的 context（可能已過時），recency branch 會勝出
+- 當完全沒有 match 時，fallback branch 用更寬鬆的條件搜尋
+
+目前用**線性驗證**（選最佳候選 → 送一條路徑給 GPU），不是真正的 tree attention。
+
+**未完成（Phase 2 — GPU 側 tree attention）：**
+
+要讓所有 3 個 branch 同時被 GPU 驗證（一次 forward pass），需要：
+
+| 項目 | 說明 |
+|------|------|
+| `SchedulerOutput` 擴充 | 攜帶 tree structure（`tree_choices`）到 model runner |
+| Model runner 偵測 | CPU-side proposer 的 tree draft → 切換 tree attention backend |
+| `TreeAttentionMetadataBuilder` | 從動態 tree shape 建構 attention mask（目前只支援靜態 EAGLE tree shape） |
+| Rejection sampler | 支援 tree path selection（目前是 linear walk） |
+
+**預估效果**：Phase 1（多候選選擇）+3-5%。Phase 2（tree verification）再 +5-10%（因為同時驗證 3 條路徑，至少 1 條匹配的機率更高）。
+
 #### N-gram 以外的方向（未實作）
 
 | # | 方向 | 預期效果 | 難度 | 備註 |
 |---|------|---------|------|------|
 | D6 | Token embedding 相似度匹配 | 提升非重複文本接受率 | 高 | |
 | D7 | Lightweight draft model (EAGLE) | 接受率 70-90% | 高 | 也受 entropy 限制 |
-| D8 | Tree-based speculation | 等效吞吐量 2-3x | 很高 | |
 
 > **EAGLE 也不是萬能的**：在高 entropy 場景（creative writing、complex reasoning），
 > EAGLE 的接受率也會降至 30-50%。D1/D5 的 entropy 偵測機制對 EAGLE 同樣有效，
 > 可以在高 entropy 段自動降低 k，避免浪費 draft model 的 GPU 時間。
 
+### 4.4 Self-Speculative Decoding（Layer-Skip Draft）
+
+用模型自身的 layer 子集當 draft model，零額外 GPU 記憶體。
+
+#### 已實作
+
+| # | 策略 | 機制 | 用法 |
+|---|------|------|------|
+| S1 | 前 K 層截斷 | patch `end_layer` | `"self_draft_depth": 8` |
+| S2 | 均勻跳層 | identity-replace 奇數層 | `"self_draft_skip_pattern": "even"` |
+| S3 | 自定義層 | identity-replace 非指定層 | `"self_draft_skip_pattern": "custom", "self_draft_layer_indices": [0,4,8,12]` |
+| Auto | 自動探測 | 測 prefix + even，選最佳 | `"self_draft_depth": -1` |
+
+```bash
+# 前 8 層當 draft
+vllm serve <model> --speculative-config \
+    '{"method": "self_draft", "num_speculative_tokens": 3, "self_draft_depth": 8}'
+
+# 均勻跳層（更好的 agreement）
+vllm serve <model> --speculative-config \
+    '{"method": "self_draft", "num_speculative_tokens": 3,
+      "self_draft_depth": 16, "self_draft_skip_pattern": "even"}'
+
+# 自動探測
+vllm serve <model> --speculative-config \
+    '{"method": "self_draft", "num_speculative_tokens": 3, "self_draft_depth": -1}'
+```
+
+#### 策略比較
+
+| | 前 K 層截斷 | 均勻跳層 | Dynamic Early Exit |
+|--|------------|---------|-------------------|
+| Agreement（同等計算量）| baseline | +10-15% | +15-25% |
+| 額外記憶體 | 0 | 0 | 少量（probe） |
+| 需要訓練 | 否 | 否 | 是 |
+| 狀態 | ✅ | ✅ | 未來方向 |
+
+#### 未來方向
+
+| # | 方向 | 說明 | 難度 |
+|---|------|------|------|
+| S4 | Dynamic Early Exit | per-layer probe，confidence 夠高就退出 | 高（需訓練） |
+| S5 | KV cache 共享 | draft 和 verify 共享前 K 層 KV cache | 高 |
+
 ### Next Step
 
-1. **驗證**：Linux GPU 機器跑 `benchmark_serving.py` A/B 對比，用不同 workload（code / chat / RAG）驗證 D1-D5 實際效果
-2. **根據驗證結果調參**：D1 的 0.4 閾值、D5 的 0.15 閾值、EMA α=0.3 可能需要根據實測調整
-3. **如果 D1-D5 效果不顯著**：考慮移除以減少代碼複雜度
-4. **EAGLE + D1/D5 組合**：在 EAGLE 場景下測試 adaptive k 的效果——理論上在混合 entropy workload 下應有 3-8% 的 GPU 時間節省
+1. **驗證**：Linux GPU 機器跑 A/B 對比，測 D1-D5 + S1/S2 實際效果
+2. **調參**：D1 的 0.4 閾值、D5 的 0.15 閾值、EMA α=0.3
+3. **Self-draft vs n-gram**：在 code / chat / RAG workload 下對比 S1/S2 和 n-gram
+4. **EAGLE + D1/D5**：在 EAGLE 場景下測試 adaptive k

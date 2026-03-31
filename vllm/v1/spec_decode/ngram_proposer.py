@@ -22,6 +22,10 @@ except ImportError:
         _HAS_RUST_NGRAM = False
 
 
+# Maximum number of tree branches (candidates) per position.
+_MAX_TREE_BRANCHES = 3
+
+
 class NgramProposer:
     def __init__(self, vllm_config: VllmConfig):
         assert vllm_config.speculative_config is not None
@@ -39,10 +43,29 @@ class NgramProposer:
         # Maximum length of the model.
         self.max_model_len = vllm_config.model_config.max_model_len
 
+        # Enable tree-structured multi-candidate proposing.
+        # When True, the proposer finds multiple n-gram matches and
+        # selects the best one using a recency-weighted scoring function.
+        # This prepares data for future tree attention verification.
+        self.enable_tree = True
+
         # Pre-allocate buffers for numba batch propose.
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         self.valid_ngram_draft = np.zeros((max_num_seqs, self.k), dtype=np.int32)
         self.valid_ngram_num_drafts = np.zeros((max_num_seqs), dtype=np.int32)
+
+        # Tree candidate buffers: (max_seqs, max_branches, k).
+        # Branch 0 = primary (longest), branch 1 = recency-biased,
+        # branch 2 = min_n=1 fallback.
+        self.tree_drafts = np.zeros(
+            (max_num_seqs, _MAX_TREE_BRANCHES, self.k), dtype=np.int32,
+        )
+        self.tree_num_drafts = np.zeros(
+            (max_num_seqs, _MAX_TREE_BRANCHES), dtype=np.int32,
+        )
+        self.tree_scores = np.zeros(
+            (max_num_seqs, _MAX_TREE_BRANCHES), dtype=np.float64,
+        )
 
         # Threshold of total number of tokens in the batch to enable
         # multi-threading in numba batch propose.
@@ -101,23 +124,27 @@ class NgramProposer:
         # avoid calling numba function with empty list which causes error
         # ValueError: cannot compute fingerprint of empty list
         if num_ngram_requests := len(valid_ngram_requests):
-            self._run_propose_backend(
-                valid_ngram_requests, num_tokens_no_spec,
-                token_ids_cpu, num_requests, self.min_n, self.max_n,
-            )
-
-            # D4: Relaxed retry — for requests that got 0 drafts with
-            # min_n > 1, retry with min_n=1 to find shorter matches.
-            if self.min_n > 1:
-                retry_indices = [
-                    idx for idx in valid_ngram_requests
-                    if self.valid_ngram_num_drafts[idx] == 0
-                ]
-                if retry_indices:
-                    self._run_propose_backend(
-                        retry_indices, num_tokens_no_spec,
-                        token_ids_cpu, num_requests, 1, self.max_n,
-                    )
+            if self.enable_tree:
+                self._run_tree_propose(
+                    valid_ngram_requests, num_tokens_no_spec,
+                    token_ids_cpu, num_requests,
+                )
+            else:
+                self._run_propose_backend(
+                    valid_ngram_requests, num_tokens_no_spec,
+                    token_ids_cpu, num_requests, self.min_n, self.max_n,
+                )
+                # D4: Relaxed retry.
+                if self.min_n > 1:
+                    retry_indices = [
+                        idx for idx in valid_ngram_requests
+                        if self.valid_ngram_num_drafts[idx] == 0
+                    ]
+                    if retry_indices:
+                        self._run_propose_backend(
+                            retry_indices, num_tokens_no_spec,
+                            token_ids_cpu, num_requests, 1, self.max_n,
+                        )
 
         valid_set = set(valid_ngram_requests)
         for i in range(num_requests):
@@ -129,6 +156,114 @@ class NgramProposer:
                 draft_token_ids.append([])
 
         return draft_token_ids
+
+    def _run_tree_propose(
+        self,
+        valid_requests: list,
+        num_tokens_no_spec: np.ndarray,
+        token_ids_cpu: np.ndarray,
+        num_requests: int,
+    ) -> None:
+        """Find multiple n-gram candidates and select the best one.
+
+        Tree-structured multi-candidate proposing:
+        1. Branch 0: longest match in full context (primary)
+        2. Branch 1: longest match in recent 50% of context (recency-biased)
+        3. Branch 2: min_n=1 fallback (widest net)
+
+        Candidates are scored by: ngram_length * recency_weight.
+        The highest-scoring candidate is placed into valid_ngram_draft.
+
+        NOTE: Currently selects the single best candidate (linear
+        verification). When tree attention is supported for CPU-side
+        proposers, all branches can be verified in one GPU forward pass.
+        """
+        # Branch 0: full context, original min_n/max_n.
+        self._run_propose_backend(
+            valid_requests, num_tokens_no_spec,
+            token_ids_cpu, num_requests, self.min_n, self.max_n,
+        )
+        for idx in valid_requests:
+            nd = self.valid_ngram_num_drafts[idx]
+            self.tree_drafts[idx, 0, :nd] = self.valid_ngram_draft[idx, :nd]
+            self.tree_num_drafts[idx, 0] = nd
+            # Score: ngram_length (num drafts as proxy).
+            self.tree_scores[idx, 0] = float(nd)
+
+        # Branch 1: recency-biased — search only last 50% of context.
+        recency_requests = [
+            idx for idx in valid_requests
+            if num_tokens_no_spec[idx] > 100  # Need enough context.
+        ]
+        if recency_requests:
+            # Create a view with only the recent half of tokens.
+            recency_token_ids = np.copy(token_ids_cpu)
+            recency_num_tokens = np.copy(num_tokens_no_spec)
+            for idx in recency_requests:
+                nt = num_tokens_no_spec[idx]
+                half = nt // 2
+                # Shift recent tokens to the beginning of the row, keeping
+                # the last `half` tokens plus the suffix the KMP needs.
+                # Actually, we just set num_tokens to start from halfway.
+                # KMP matches suffix of the token sequence, so we limit the
+                # search window by reducing the token count passed in.
+                # But we need the suffix (last tokens) intact, so instead
+                # we zero out the first half to prevent early matches.
+                recency_token_ids[idx, :half] = -1  # Poison early tokens.
+            self._run_propose_backend(
+                recency_requests, recency_num_tokens,
+                recency_token_ids, num_requests, self.min_n, self.max_n,
+            )
+            for idx in recency_requests:
+                nd = self.valid_ngram_num_drafts[idx]
+                self.tree_drafts[idx, 1, :nd] = (
+                    self.valid_ngram_draft[idx, :nd]
+                )
+                self.tree_num_drafts[idx, 1] = nd
+                # Score: ngram_length * 1.3 (recency bonus).
+                self.tree_scores[idx, 1] = float(nd) * 1.3
+
+        # Branch 2: min_n=1 fallback (D4).
+        if self.min_n > 1:
+            fallback_requests = [
+                idx for idx in valid_requests
+                if self.tree_num_drafts[idx, 0] == 0
+                and self.tree_num_drafts[idx, 1] == 0
+            ]
+            if fallback_requests:
+                self._run_propose_backend(
+                    fallback_requests, num_tokens_no_spec,
+                    token_ids_cpu, num_requests, 1, self.max_n,
+                )
+                for idx in fallback_requests:
+                    nd = self.valid_ngram_num_drafts[idx]
+                    self.tree_drafts[idx, 2, :nd] = (
+                        self.valid_ngram_draft[idx, :nd]
+                    )
+                    self.tree_num_drafts[idx, 2] = nd
+                    self.tree_scores[idx, 2] = float(nd) * 0.5
+
+        # Select best candidate per request.
+        for idx in valid_requests:
+            best_branch = -1
+            best_score = 0.0
+            for b in range(_MAX_TREE_BRANCHES):
+                if (self.tree_num_drafts[idx, b] > 0
+                        and self.tree_scores[idx, b] > best_score):
+                    best_score = self.tree_scores[idx, b]
+                    best_branch = b
+            if best_branch >= 0:
+                nd = self.tree_num_drafts[idx, best_branch]
+                self.valid_ngram_draft[idx, :nd] = (
+                    self.tree_drafts[idx, best_branch, :nd]
+                )
+                self.valid_ngram_num_drafts[idx] = nd
+            else:
+                self.valid_ngram_num_drafts[idx] = 0
+
+            # Reset tree buffers for next step.
+            self.tree_num_drafts[idx, :] = 0
+            self.tree_scores[idx, :] = 0.0
 
     def _run_propose_backend(
         self,
