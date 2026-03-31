@@ -5,13 +5,17 @@ import numpy as np
 import pytest
 
 try:
-    from vllm_rs import batch_ngram_propose
+    from vllm._rs import batch_ngram_propose
     HAS_RUST = True
 except ImportError:
-    HAS_RUST = False
+    try:
+        from _rs import batch_ngram_propose
+        HAS_RUST = True
+    except ImportError:
+        HAS_RUST = False
 
 
-@pytest.mark.skipif(not HAS_RUST, reason="vllm_rs not installed")
+@pytest.mark.skipif(not HAS_RUST, reason="vllm._rs not installed")
 class TestRustNgramProposer:
     def test_basic_match(self):
         token_ids = np.zeros((1, 100), dtype=np.int32)

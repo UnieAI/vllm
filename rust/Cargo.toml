@@ -12,3 +12,5 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { version = "0.23", features = ["extension-module"] }
 numpy = "0.23"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+aho-corasick = "1"

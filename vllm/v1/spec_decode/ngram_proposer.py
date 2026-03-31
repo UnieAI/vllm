@@ -12,10 +12,14 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 try:
-    from vllm_rs import batch_ngram_propose as _rs_batch_ngram_propose
+    from vllm._rs import batch_ngram_propose as _rs_batch_ngram_propose
     _HAS_RUST_NGRAM = True
 except ImportError:
-    _HAS_RUST_NGRAM = False
+    try:
+        from _rs import batch_ngram_propose as _rs_batch_ngram_propose
+        _HAS_RUST_NGRAM = True
+    except ImportError:
+        _HAS_RUST_NGRAM = False
 
 
 class NgramProposer:

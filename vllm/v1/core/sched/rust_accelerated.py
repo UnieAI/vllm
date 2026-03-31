@@ -27,18 +27,30 @@ from vllm.v1.request import Request
 logger = init_logger(__name__)
 
 try:
-    from vllm_rs import (  # type: ignore[import-untyped]
+    from vllm._rs import (  # type: ignore[import-untyped]
         batch_apply_generated_tokens as _rs_batch_apply,
         batch_check_stop as _rs_batch_check_stop,
         compute_running_tokens as _rs_compute_running,
     )
 
     _HAS_RUST = True
-    logger.info("Rust scheduler acceleration enabled (vllm_rs)")
 except ImportError:
-    _HAS_RUST = False
+    try:
+        from _rs import (  # type: ignore[import-untyped]
+            batch_apply_generated_tokens as _rs_batch_apply,
+            batch_check_stop as _rs_batch_check_stop,
+            compute_running_tokens as _rs_compute_running,
+        )
+
+        _HAS_RUST = True
+    except ImportError:
+        _HAS_RUST = False
+
+if _HAS_RUST:
+    logger.info("Rust scheduler acceleration enabled")
+else:
     logger.info(
-        "vllm_rs not available, using pure-Python scheduler (install "
+        "vllm._rs not available, using pure-Python scheduler (install "
         "vllm-scheduler-rs for ~100x faster scheduling loops)"
     )
 

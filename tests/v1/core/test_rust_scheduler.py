@@ -11,7 +11,7 @@ import pytest
 
 # Test the low-level Rust functions directly if available.
 try:
-    from vllm_rs import (
+    from vllm._rs import (
         batch_apply_generated_tokens,
         batch_check_stop,
         compute_running_tokens,
@@ -20,7 +20,17 @@ try:
 
     HAS_RUST = True
 except ImportError:
-    HAS_RUST = False
+    try:
+        from _rs import (
+            batch_apply_generated_tokens,
+            batch_check_stop,
+            compute_running_tokens,
+            compute_waiting_tokens,
+        )
+
+        HAS_RUST = True
+    except ImportError:
+        HAS_RUST = False
 
 
 @pytest.mark.skipif(not HAS_RUST, reason="vllm._rs not installed")
