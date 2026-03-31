@@ -15,6 +15,7 @@
 6. [效能基準測試](#6-效能基準測試)
 7. [開發流程](#7-開發流程)
 8. [常見問題](#8-常見問題)
+9. [TODO — 已完成與未完成項目](#9-todo--已完成與未完成項目)
 
 ---
 
@@ -766,3 +767,36 @@ maturin build --release --interpreter python3.10 python3.11 python3.12
 
 不需要。`.cargo/config.toml` 中的 macOS linker flag 在 Linux 上自動忽略。
 直接 `maturin develop --release` 即可。
+
+---
+
+## 9. TODO — 已完成與未完成項目
+
+### 已完成 ✅
+
+| 項目 | Rust 檔案 | Python 整合位置 | 效能 |
+|------|----------|----------------|------|
+| Token 預算計算 | `schedule.rs` | `rust_accelerated.py` | 194x vs Python |
+| 批次 stop 檢查 | `stop_check.rs` | `scheduler.py` `update_from_output()` | 301x vs Python |
+| Spec decode 接受/拒絕 | `update_output.rs` | `rust_accelerated.py` | 192x vs Python |
+| N-gram KMP 並行 | `ngram.rs` | `ngram_proposer.py` | 2.1x vs Numba-1T |
+| N-gram Numba 多線程解鎖 | — | `ngram_proposer.py` | 1.8x（P0 改 1 行）|
+| N-gram set 查找 | — | `ngram_proposer.py` | O(n)→O(1)（P0 改 1 行）|
+| Block hash 加速 | `block_hash.rs` | `kv_cache_utils.py`, `utils/hashing.py` | xxHash + batch |
+| Free block queue | `block_pool.rs` | `kv_cache_utils.py` | Arena O(1) 雙向鏈結串列 |
+| Stop string 匹配 | `stop_strings.rs` | `detokenizer.py` | Aho-Corasick 多模式匹配 |
+| 序列化輔助 | `serial_helpers.rs` | （Rust 已實作） | int32 array 編碼 |
+| 模組名遷移 | `lib.rs` + `pyproject.toml` | 全部 import | `vllm._rs` + `_rs` fallback |
+
+### 未完成
+
+| 優先級 | 項目 | 說明 | 難度 |
+|--------|------|------|------|
+| **P1** | `schedule()` running 迴圈完整接入 | `compute_running_tokens` 已可用，但排程迴圈中穿插了 KV cache allocation、encoder scheduling、preemption，需拆解 budget 回收邏輯後才能用 Rust 結果驅動迴圈 | 中 |
+| **P1** | vllm build system 整合 | 將 `maturin build` 嵌入 vllm 的 `pyproject.toml`，讓 `pip install vllm` 自動編譯 Rust 模組（或作為 optional dependency） | 中 |
+| **P1** | `serial_helpers.rs` Python 端接入 | Rust 函數已寫好，尚未接入 `serial_utils.py` 的 `MsgpackEncoder.enc_hook()` tensor 編碼路徑 | 低 |
+| **P2** | CUDA n-gram kernel | GPU 版 n-gram 用 PyTorch `unfold` 做 O(n×m) 暴力匹配 + Python `for` 遍歷 ngram 長度；寫 fused CUDA kernel 做 O(n) KMP 可快 2-5x | 高 |
+| **P2** | Rust SoA request metadata 鏡像 | 在 Rust 側維護 running requests 的 struct-of-arrays 鏡像（num_computed_tokens 等），避免每步從 Python 物件收集到 numpy 的開銷 | 高 |
+| **P3** | Lock-free IPC queue | 替換 EngineCore 的 `queue.Queue`（每次 put/get 需 GIL + mutex 雙重鎖）為 Rust SPSC ring buffer，透過 PyO3 暴露 | 高 |
+| **P3** | Shared memory IPC | 用 Rust 管理的 memory-mapped ring buffer 替換 ZMQ（同機器內），消除 socket + kernel copy 開銷 | 高 |
+| **P3** | CI 自動建構 | GitHub Actions：PR 中自動 `maturin build` + `pytest` Rust 測試 + 效能回歸檢查 | 低 |
