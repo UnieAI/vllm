@@ -165,7 +165,7 @@ except ImportError:
 
 ## 4. TODO Roadmap
 
-### 已完成 ✅（17 項）
+### 已完成 ✅（22 項）
 
 | # | 項目 | 檔案 | 整合位置 | 效能 |
 |---|------|------|---------|------|
@@ -186,6 +186,11 @@ except ImportError:
 | 15 | 序列化輔助 | `serial_helpers.rs` | Rust 可用 | — |
 | 16 | CUDA n-gram kernel（GPU） | `csrc/ngram_kernels.cu` | `ngram_proposer_gpu.py` | Fused KMP O(n)，需 GPU 驗證 |
 | 17 | CI 自動建構 | `.github/workflows/rust-ci.yml` | GitHub Actions | cargo check + pytest + 效能回歸 |
+| 18 | D1: Adaptive k | — | `scheduler.py` `_adaptive_k()` | 按接受率縮減 draft |
+| 19 | D2: Low-confidence filter | — | `scheduler.py` `_is_low_confidence_draft()` | 接受率<20% 減半 |
+| 20 | D3: Gradual DSC | — | `scheduler.py` `_get_effective_spec_k()` | 線性降級取代 binary |
+| 21 | D4: Relaxed retry | — | `ngram_proposer.py` `_run_propose_backend()` | min_n=1 fallback |
+| 22 | D5: Position-aware decay | — | `scheduler.py` `_position_decay_k()` | 截斷低接受率位置 |
 
 ### 不做（已驗證不值得）
 
