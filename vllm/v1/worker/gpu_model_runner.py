@@ -4813,6 +4813,8 @@ class GPUModelRunner(
                         draft_depth=self.speculative_config.self_draft_depth,
                         k=self.speculative_config.num_speculative_tokens,
                         device=self.device,
+                        skip_pattern=self.speculative_config.self_draft_skip_pattern,
+                        layer_indices=self.speculative_config.self_draft_layer_indices,
                         vllm_config=self.vllm_config,
                     )
                     self._self_draft_pending = False

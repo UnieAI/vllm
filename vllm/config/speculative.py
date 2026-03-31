@@ -153,11 +153,22 @@ class SpeculativeConfig:
     """Specifies the tree structure for speculative token generation.
     """
     # Self-speculative decoding (layer-skip draft)
-    self_draft_depth: int | None = Field(default=None, ge=1)
+    self_draft_depth: int | None = None
     """Number of transformer layers to use as draft model in self-speculative
     decoding.  For example, self_draft_depth=8 on a 32-layer model uses the
-    first 8 layers + LM head for drafting.  Requires method='self_draft'.
+    first 8 layers + LM head for drafting.  Set to -1 for auto-probe.
+    Requires method='self_draft'.
     Use tools/probe_draft_layers.py to find the optimal depth."""
+    self_draft_skip_pattern: str = "prefix"
+    """Layer skip pattern for self-speculative decoding:
+    - 'prefix': use the first K layers only (default)
+    - 'even': skip every other layer (keeps 0,2,4,...) — better agreement
+      at the same compute budget as prefix
+    - 'custom': specify exact layer indices via self_draft_layer_indices"""
+    self_draft_layer_indices: list[int] | None = None
+    """Explicit list of layer indices to keep when skip_pattern='custom'.
+    Example: [0, 4, 8, 12, 16, 20, 24, 28] for every-4th-layer on a
+    32-layer model."""
 
     parallel_drafting: bool = False
     """Enable parallel drafting, where all speculative tokens are generated
