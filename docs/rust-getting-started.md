@@ -270,16 +270,62 @@ D1-D5 **不提升接受率本身**，而是**減少無效 GPU 驗證時間**：
 > **最誠實的結論**：在 chat workload + 大模型場景下，D1-D5 可能只帶來 **0-5%** 的吞吐量改善。
 > 真正要大幅提升大模型吞吐量，需要 **EAGLE/Medusa 等 learned draft model**（接受率 70-90%）。
 
+#### 為什麼 D1/D2/D5 適用於所有 spec decode 方法（包括 EAGLE）
+
+所有 speculative decoding 的效果都取決於**輸出分佈的可預測性（entropy）**，不只是 n-gram：
+
+```
+接受率 ≈ f(輸出 entropy)
+
+低 entropy（確定性高）→ 只有 1-2 個合理 next token → 任何方法都能猜中
+高 entropy（模型不確定）→ 多個合理 next token → EAGLE 也猜不中
+```
+
+| 分佈特性 | 可預測性 | 影響 |
+|---------|---------|------|
+| 低 entropy token（函數名、常見語法） | 高 | 所有方法接受率高 |
+| 高 entropy token（創意內容、推理轉折） | 低 | 所有方法接受率低，包括 EAGLE |
+| 分佈穩定（持續同類型內容） | 高 | 歷史接受率是好的預測指標 |
+| 分佈突變（code → chat、topic switch） | 低 | 需要快速偵測並調整 |
+
+**D1/D2/D5 的核心策略不是「讓 draft 更好」，而是「偵測什麼時候不值得 draft」**。
+這個策略對所有 spec decode 方法都成立：
+
+- EAGLE 接受率 70-90%？→ D1 不觸發，全力 draft（正確）
+- EAGLE 在高 entropy 段接受率降至 20%？→ D1 自動減少 k（正確）
+- 位置 4+ 的接受率持續 < 15%？→ D5 截斷（對 EAGLE 也正確）
+
+**實作上 D1/D2/D5 已經適用所有方法**——它們位於 `update_draft_token_ids()`，
+在 proposer 回傳 draft 後、送入 scheduler 前統一處理，不區分 draft 來源。
+
+#### EMA 追蹤（快速適應分佈變化）
+
+使用 EMA（指數移動平均，α=0.3）取代累計平均，讓系統在分佈變化時快速反應：
+
+```
+累計平均：rate = total_accepted / total_drafted
+  → 1000 步歷史中突然分佈改變 → 需要 ~100 步才能反映
+
+EMA：rate = 0.3 * this_step + 0.7 * previous_ema
+  → 分佈改變 → ~5 步內即反映
+  → 適用場景：code → chat 切換、長 prompt 中 topic switch
+```
+
 #### N-gram 以外的方向（未實作）
 
-| # | 方向 | 預期效果 | 難度 |
-|---|------|---------|------|
-| D6 | Token embedding 相似度匹配 | 提升非重複文本接受率 | 高 |
-| D7 | Lightweight draft model (EAGLE) | 接受率 70-90% | 高 |
-| D8 | Tree-based speculation | 等效吞吐量 2-3x | 很高 |
+| # | 方向 | 預期效果 | 難度 | 備註 |
+|---|------|---------|------|------|
+| D6 | Token embedding 相似度匹配 | 提升非重複文本接受率 | 高 | |
+| D7 | Lightweight draft model (EAGLE) | 接受率 70-90% | 高 | 也受 entropy 限制 |
+| D8 | Tree-based speculation | 等效吞吐量 2-3x | 很高 | |
+
+> **EAGLE 也不是萬能的**：在高 entropy 場景（creative writing、complex reasoning），
+> EAGLE 的接受率也會降至 30-50%。D1/D5 的 entropy 偵測機制對 EAGLE 同樣有效，
+> 可以在高 entropy 段自動降低 k，避免浪費 draft model 的 GPU 時間。
 
 ### Next Step
 
 1. **驗證**：Linux GPU 機器跑 `benchmark_serving.py` A/B 對比，用不同 workload（code / chat / RAG）驗證 D1-D5 實際效果
-2. **根據驗證結果調參**：D1 的 0.4 閾值、D5 的 0.15 閾值可能需要根據實測調整
-3. **如果 D1-D5 效果不顯著**：考慮移除以減少代碼複雜度，專注 EAGLE 整合
+2. **根據驗證結果調參**：D1 的 0.4 閾值、D5 的 0.15 閾值、EMA α=0.3 可能需要根據實測調整
+3. **如果 D1-D5 效果不顯著**：考慮移除以減少代碼複雜度
+4. **EAGLE + D1/D5 組合**：在 EAGLE 場景下測試 adaptive k 的效果——理論上在混合 entropy workload 下應有 3-8% 的 GPU 時間節省

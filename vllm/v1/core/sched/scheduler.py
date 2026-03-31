@@ -285,16 +285,27 @@ class Scheduler(SchedulerInterface):
                 )
 
         # ── Draft quality optimization (D1/D3/D5) ──
-        # D1: Per-request acceptance rate tracking.
-        # {req_id: (num_accepted, num_drafted)} — cleared on request finish.
-        self._req_acceptance: dict[str, tuple[int, int]] = {}
-        # D5: Global per-position acceptance tracking.
+        # Applies to ALL spec decode methods (n-gram, EAGLE, draft model).
+        # Core insight: acceptance rate is a proxy for output entropy.
+        #   Low entropy (predictable) → high acceptance → worth drafting.
+        #   High entropy (uncertain)  → low acceptance  → reduce/skip draft.
+        # Uses EMA (exponential moving average) for fast adaptation to
+        # distribution changes (e.g., code → chat mid-conversation).
+        _EMA_ALPHA = 0.3  # Weight for most recent observation.
+        self._ema_alpha = _EMA_ALPHA
+        # D1: Per-request acceptance EMA.  {req_id: ema_rate}
+        self._req_accept_ema: dict[str, float] = {}
+        # D5: Global per-position acceptance EMA.
         if self.num_spec_tokens > 0:
-            self._pos_accepted = np.zeros(self.num_spec_tokens, dtype=np.int64)
-            self._pos_total = np.zeros(self.num_spec_tokens, dtype=np.int64)
+            self._pos_accept_ema = np.full(
+                self.num_spec_tokens, 0.5, dtype=np.float64,
+            )
+            self._pos_obs_count = np.zeros(
+                self.num_spec_tokens, dtype=np.int64,
+            )
         else:
-            self._pos_accepted = np.empty(0, dtype=np.int64)
-            self._pos_total = np.empty(0, dtype=np.int64)
+            self._pos_accept_ema = np.empty(0, dtype=np.float64)
+            self._pos_obs_count = np.empty(0, dtype=np.int64)
 
         # Create the KV cache manager.
         self.kv_cache_manager = KVCacheManager(
@@ -1501,16 +1512,26 @@ class Scheduler(SchedulerInterface):
                     request_id=req_id,
                 )
 
-                # D1: Update per-request acceptance tracking.
-                prev = self._req_acceptance.get(req_id, (0, 0))
-                self._req_acceptance[req_id] = (
-                    prev[0] + num_accepted, prev[1] + num_draft_tokens,
+                # D1: Update per-request acceptance EMA.
+                step_rate = (
+                    num_accepted / num_draft_tokens
+                    if num_draft_tokens > 0 else 0.0
                 )
-                # D5: Update global per-position acceptance tracking.
-                for pos in range(min(num_accepted, len(self._pos_accepted))):
-                    self._pos_accepted[pos] += 1
-                for pos in range(min(num_draft_tokens, len(self._pos_total))):
-                    self._pos_total[pos] += 1
+                prev_ema = self._req_accept_ema.get(req_id, 0.5)
+                self._req_accept_ema[req_id] = (
+                    self._ema_alpha * step_rate
+                    + (1.0 - self._ema_alpha) * prev_ema
+                )
+                # D5: Update global per-position acceptance EMA.
+                alpha = self._ema_alpha
+                for pos in range(min(num_draft_tokens,
+                                     len(self._pos_accept_ema))):
+                    hit = 1.0 if pos < num_accepted else 0.0
+                    self._pos_accept_ema[pos] = (
+                        alpha * hit
+                        + (1.0 - alpha) * self._pos_accept_ema[pos]
+                    )
+                    self._pos_obs_count[pos] += 1
 
             stopped = False
             new_logprobs = None
@@ -1958,7 +1979,7 @@ class Scheduler(SchedulerInterface):
             request = self.requests.get(req_id)
             if request is None or request.is_finished():
                 # Clean up acceptance tracking for finished requests.
-                self._req_acceptance.pop(req_id, None)
+                self._req_accept_ema.pop(req_id, None)
                 continue
 
             if request.is_prefill_chunk:
@@ -1997,40 +2018,43 @@ class Scheduler(SchedulerInterface):
             request.spec_token_ids = spec_token_ids
 
     def _adaptive_k(self, req_id: str, base_k: int) -> int:
-        """D1: Reduce k for requests with historically low acceptance rate."""
-        history = self._req_acceptance.get(req_id)
-        if history is None:
+        """D1: Reduce k for requests with low acceptance EMA.
+
+        Works for all spec decode methods (n-gram, EAGLE, draft model).
+        EMA reacts quickly to distribution changes.
+        """
+        ema = self._req_accept_ema.get(req_id)
+        if ema is None:
             return base_k  # No history yet — use full k.
-        accepted, drafted = history
-        if drafted < 10:
-            return base_k  # Not enough data.
-        rate = accepted / drafted
-        if rate >= 0.4:
+        if ema >= 0.4:
             return base_k  # Good acceptance — keep full k.
-        # Scale k proportionally: rate=0.4 → full k, rate=0 → 1.
-        return max(1, int(base_k * rate / 0.4))
+        # Scale k proportionally: ema=0.4 → full k, ema=0 → 1.
+        return max(1, int(base_k * ema / 0.4))
 
     def _position_decay_k(self, base_k: int) -> int:
-        """D5: Trim k to the last position with decent acceptance rate."""
-        if len(self._pos_total) == 0 or self._pos_total[0] < 50:
+        """D5: Trim k to the last position with decent acceptance EMA.
+
+        Works for all spec decode methods.
+        """
+        if (len(self._pos_obs_count) == 0
+                or self._pos_obs_count[0] < 30):
             return base_k  # Not enough data.
-        for pos in range(min(base_k, len(self._pos_total))):
-            if self._pos_total[pos] == 0:
-                return max(1, pos)
-            rate = self._pos_accepted[pos] / self._pos_total[pos]
-            if rate < 0.15:
+        for pos in range(min(base_k, len(self._pos_accept_ema))):
+            if self._pos_obs_count[pos] < 10:
+                return max(1, pos) if pos > 0 else base_k
+            if self._pos_accept_ema[pos] < 0.15:
                 return max(1, pos)
         return base_k
 
     def _is_low_confidence_draft(self, req_id: str) -> bool:
-        """D2: Check if recent drafts have been consistently rejected."""
-        history = self._req_acceptance.get(req_id)
-        if history is None:
+        """D2: Check if recent drafts have been consistently rejected.
+
+        Works for all spec decode methods.
+        """
+        ema = self._req_accept_ema.get(req_id)
+        if ema is None:
             return False
-        accepted, drafted = history
-        if drafted < 20:
-            return False
-        return (accepted / drafted) < 0.2
+        return ema < 0.2
 
     def _get_effective_spec_k(self) -> int:
         """D3: Gradual DSC — return proportional k instead of binary.
