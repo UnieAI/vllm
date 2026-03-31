@@ -148,11 +148,16 @@ except ImportError:
 | 14 | vllm build system 整合 | — | `setup.py` | best-effort auto |
 | 15 | 序列化輔助 | `serial_helpers.rs` | Rust 可用 | — |
 
-### 未完成（6 項）
+### 不做（已驗證不值得）
+
+| 項目 | 原因 |
+|------|------|
+| `serial_helpers.rs` Python 端接入 | Profile 結果：numpy `tobytes()` 比 Rust 快 3x（numpy 直接回傳 buffer pointer，零拷貝；Rust 需逐元素 `to_le_bytes` + 分配 PyBytes）。Rust 函數保留在 crate 中但不接入 Python。 |
+
+### 未完成（5 項）
 
 | 優先級 | 項目 | 說明 | 難度 |
 |--------|------|------|------|
-| **P1** | `serial_helpers.rs` Python 端接入 | Rust 已寫好 `batch_encode_int32_arrays`，尚未接入 `serial_utils.py`。numpy `tobytes()` 已是 C 最佳化，需 profile 確認瓶頸 | 低 |
 | **P2** | CUDA n-gram kernel | GPU 版用 `unfold` O(n×m)；fused CUDA KMP 可快 2-5x | 高 |
 | **P2** | Rust SoA request metadata 鏡像 | Rust 側維護 running requests SoA，避免每步 Python→numpy 收集開銷 | 高 |
 | **P3** | Lock-free IPC queue | Rust SPSC ring buffer 替換 `queue.Queue` | 高 |
@@ -169,6 +174,5 @@ except ImportError:
 ### Next Step
 
 1. **驗證優先**：Linux GPU 機器跑端到端 benchmark，取得實際吞吐量數據
-2. **P1**：profile `serial_utils.py` 確認 `serial_helpers` 是否值得接入
-3. **P2**：CUDA n-gram kernel（如果 GPU 版 n-gram 使用率高）
-4. **P3**：Lock-free IPC（架構性改動，投入大回報大）
+2. **P2**：CUDA n-gram kernel（如果 GPU 版 n-gram 使用率高）
+3. **P3**：Lock-free IPC（架構性改動，投入大回報大）
