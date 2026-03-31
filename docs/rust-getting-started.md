@@ -2,6 +2,43 @@
 
 ---
 
+## Overview
+
+### 問題
+
+vLLM V1 的 EngineCore 在每步推論中執行 `schedule() → execute_model() → update_from_output()`。GPU 計算佔延遲的 90%+，但在高併發（1000+ 同時請求）時，CPU 端的 Python 排程迴圈累積 ~2-5ms 開銷，在小模型場景（GPU forward ~2-5ms）下佔 step 時間的 **50%+**。
+
+### 解決方案
+
+透過 Rust + PyO3 加速 CPU 熱點路徑，將排程開銷從 ~2ms 降至 ~18μs（**118x**）。模組名稱 `vllm._rs`，安裝後**自動啟用**，未安裝時自動 fallback 到純 Python。
+
+### 效果（mock data 實測）
+
+| 場景 | GPU forward | Step (Python) | Step (Rust) | 加速 |
+|------|-------------|---------------|-------------|------|
+| 小模型 1-3B × 1000 req | 2 ms | 4.1 ms | 2.0 ms | **2.04x** |
+| 7-8B × 1000 req | 5 ms | 7.1 ms | 5.0 ms | **1.42x** |
+| 70B × 1000 req | 25 ms | 27.1 ms | 25.0 ms | 1.08x |
+
+> 大模型（70B+）的瓶頸在 GPU forward，CPU 加速效果有限。
+> 大模型的進一步優化需要從 **speculative decoding draft 品質** 和 **GPU kernel** 層面著手，見 [Roadmap §4.3](#43-draft-品質優化大模型吞吐量的關鍵)。
+
+### 模組清單
+
+```
+rust/src/
+├── schedule.rs        Token 預算計算        194x
+├── stop_check.rs      批次 stop 檢查        301x
+├── update_output.rs   Spec decode 接受/拒絕  192x
+├── ngram.rs           N-gram KMP 並行       2.1x
+├── block_hash.rs      Prefix cache hash     13.7x
+├── block_pool.rs      Free block queue      6.0x
+├── stop_strings.rs    Aho-Corasick 匹配     7.3x
+└── serial_helpers.rs  序列化輔助            (保留)
+```
+
+---
+
 ## 目錄
 
 1. [快速啟動](#1-快速啟動)
@@ -171,8 +208,52 @@ except ImportError:
 - [ ] `py-spy` profile 確認 CPU 熱點轉移
 - [ ] `block_hash` / `RustFreeBlockQueue` / `StopStringMatcher` 整合測試
 
+### 4.3 Draft 品質優化（大模型吞吐量的關鍵）
+
+大模型（70B+）的 GPU forward 佔 25-50ms，CPU 加速只省 ~8%。真正提升大模型吞吐量的方向是 **speculative decoding 的 draft 品質**——每步 GPU forward 時間固定，但如果 draft 接受率從 60% → 80%，等效吞吐量提升 ~33%。
+
+#### 現有 N-gram 演算法的限制
+
+| 限制 | 說明 | 影響 |
+|------|------|------|
+| **純語法匹配** | KMP 只匹配 token 序列，不理解語義 | "The dog ran" vs "A canine sprinted" → 無法匹配 |
+| **單一匹配** | 只回傳最長 match（一條路徑） | 無法生成多樣化 draft candidates |
+| **末尾匹配** | 只搜尋序列末尾的 n-gram | 錯過前面出現過的重複模式 |
+| **固定 n-gram 範圍** | `[min_n, max_n]` 靜態配置 | 重複性文本（code）適合大 n，多樣文本適合小 n |
+| **無回饋機制** | Draft 品質沒有回饋給 proposer | 持續提出低品質 draft，浪費 GPU 驗證時間 |
+| **二元 DSC 開關** | 高負載時完全關閉 n-gram speculation | 應該漸進降級（減少 k）而非全關 |
+
+#### 優化方向（按可行性排序）
+
+**可在目前架構內做的（不改模型）：**
+
+| # | 方向 | 做法 | 預期效果 | 難度 |
+|---|------|------|---------|------|
+| D1 | **Adaptive k** | 根據每個 request 的歷史接受率動態調整 k。高接受率 → 增加 k，低接受率 → 減少 k 或跳過 | 減少無效 GPU 驗證，提升吞吐量 5-15% | 低 |
+| D2 | **Frequency-weighted match** | 對多個 n-gram match 候選，選最高頻出現的而非最長的。高頻模式更可能被接受 | 提升接受率 5-10% | 低 |
+| D3 | **Gradual DSC** | 將 DSC 從 binary（全開/全關）改為 `k = max(1, base_k * (1 - load_ratio))`，高負載時減少 draft 數量但不完全關閉 | 高負載下仍保留部分 spec decode 收益 | 低 |
+| D4 | **Multi-match candidates** | 回傳 top-N 個 n-gram match（而非只回傳最長），用簡單啟發式選分數最高的 | 增加匹配多樣性，提升接受率 | 中 |
+| D5 | **Position-aware draft decay** | 位置越後的 draft token 越不可能被接受。根據歷史 per-position 接受率，動態決定每個位置是否值得 draft | 減少尾部無效 draft，節省 GPU 驗證時間 | 中 |
+
+**需要額外模型/資源的（長期方向）：**
+
+| # | 方向 | 做法 | 預期效果 | 難度 |
+|---|------|------|---------|------|
+| D6 | **Token embedding 相似度匹配** | 用 embedding cosine similarity 擴展 n-gram 搜尋範圍，匹配語義近似的 token 序列 | 大幅提升非重複性文本的接受率 | 高 |
+| D7 | **Lightweight draft model** | 用小模型（如 EAGLE head）生成 draft token，而非純 n-gram 匹配 | 接受率 70-90%（vs n-gram 40-60%） | 高 |
+| D8 | **Tree-based speculation** | 同時 draft 多條分支（樹狀），一次 GPU forward 驗證多條路徑 | 等效吞吐量 2-3x | 很高 |
+
+#### 建議路線
+
+```
+D1 (adaptive k) → D3 (gradual DSC) → D5 (position decay) → D2 (freq match)
+       低難度              低難度             中難度              低難度
+```
+
+D1-D3 可以在 1-2 週內完成，且完全不改動 Rust 或 CUDA code，只修改 Python 端的 `ngram_proposer.py` 和 `scheduler.py`。
+
 ### Next Step
 
-1. **驗證優先**：Linux GPU 機器跑端到端 benchmark，取得實際吞吐量數據
-2. **P2**：CUDA n-gram kernel（如果 GPU 版 n-gram 使用率高）
-3. **P3**：Lock-free IPC（架構性改動，投入大回報大）
+1. **D1 Adaptive k**：在 `ngram_proposer.py` 加入 per-request 接受率追蹤，動態調整 draft 數量
+2. **驗證**：Linux GPU 機器跑 `benchmark_serving.py` A/B 對比
+3. **D3 Gradual DSC**：將 binary DSC 開關改為漸進式降級
