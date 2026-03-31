@@ -79,6 +79,33 @@ def xxhash_cbor(input: Any) -> bytes:
     return _xxhash_digest(input_bytes)
 
 
+try:
+    from vllm._rs import hash_block_tokens_rust as _rs_hash  # type: ignore[import-untyped]
+    _HAS_RUST_HASH = True
+except ImportError:
+    _HAS_RUST_HASH = False
+
+
+def builtin_hash(input: Any) -> bytes:
+    """Fast hash using Rust xxh3_128, bypassing serialization.
+
+    Only works with raw bytes input.  For arbitrary Python objects,
+    falls back to xxhash_cbor.
+
+    Args:
+        input: bytes or a picklable Python object.
+
+    Returns:
+        16-byte xxh3_128 digest.
+    """
+    if _HAS_RUST_HASH and isinstance(input, (bytes, memoryview)):
+        return _rs_hash(b"", input)
+    # Fallback: serialize + xxhash for arbitrary objects.
+    if _xxhash is not None:
+        return xxhash_cbor(input)
+    return sha256_cbor(input)
+
+
 def get_hash_fn_by_name(hash_fn_name: str) -> Callable[[Any], bytes]:
     """Get a hash function by name, or raise an error if the function is not found.
 
@@ -96,6 +123,8 @@ def get_hash_fn_by_name(hash_fn_name: str) -> Callable[[Any], bytes]:
         return xxhash
     if hash_fn_name == "xxhash_cbor":
         return xxhash_cbor
+    if hash_fn_name == "builtin":
+        return builtin_hash
 
     raise ValueError(f"Unsupported hash function: {hash_fn_name}")
 

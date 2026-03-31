@@ -10,6 +10,12 @@ from transformers import PreTrainedTokenizerFast
 
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
+
+try:
+    from vllm._rs import StopStringMatcher as _RustStopMatcher  # type: ignore[import-untyped]
+    _HAS_RUST_STOP = True
+except ImportError:
+    _HAS_RUST_STOP = False
 from vllm.tokenizers.detokenizer_utils import (
     convert_prompt_ids_to_tokens,
     detokenize_incrementally,
@@ -89,6 +95,13 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
             self.stop_buffer_length = 0
         self._last_output_text_offset: int = 0
 
+        # Rust Aho-Corasick stop string matcher (optional acceleration).
+        self._rust_stop_matcher = (
+            _RustStopMatcher(self.stop)
+            if _HAS_RUST_STOP and self.stop
+            else None
+        )
+
         # Generation data
         self.output_text = ""
 
@@ -128,12 +141,20 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
         # 2) Evaluate stop strings.
         stop_string = None
         if self.stop and self.num_output_tokens() > self.min_tokens:
-            stop = check_stop_strings(
-                output_text=self.output_text,
-                new_char_count=len(self.output_text) - stop_check_offset,
-                stop=self.stop,
-                include_in_output=self.include_stop_str_in_output,
-            )
+            new_char_count = len(self.output_text) - stop_check_offset
+            if self._rust_stop_matcher is not None:
+                stop = self._rust_stop_matcher.check(
+                    self.output_text,
+                    new_char_count,
+                    self.include_stop_str_in_output,
+                )
+            else:
+                stop = check_stop_strings(
+                    output_text=self.output_text,
+                    new_char_count=new_char_count,
+                    stop=self.stop,
+                    include_in_output=self.include_stop_str_in_output,
+                )
             if stop is not None:
                 stop_string, truncate_to = stop
                 if truncate_to != -1:

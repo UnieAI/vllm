@@ -14,7 +14,19 @@ from typing import Any, NewType, TypeAlias, overload
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.utils.hashing import sha256_cbor, xxhash_cbor
+from vllm.utils.hashing import builtin_hash, sha256_cbor, xxhash_cbor
+
+try:
+    from vllm._rs import batch_hash_blocks as _rs_batch_hash  # type: ignore[import-untyped]
+    _HAS_RUST_HASH = True
+except ImportError:
+    _HAS_RUST_HASH = False
+
+try:
+    from vllm._rs import RustFreeBlockQueue as _RustQueue  # type: ignore[import-untyped]
+    _HAS_RUST_QUEUE = True
+except ImportError:
+    _HAS_RUST_QUEUE = False
 from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import format_gib
 from vllm.v1.kv_cache_interface import (
@@ -159,10 +171,12 @@ class FreeKVCacheBlockQueue:
     """This class organizes a list of KVCacheBlock objects to a doubly linked
     list of free blocks. We implement this class instead of using Python
     builtin deque to support removing a block in the middle of the queue
-    in O(1) time. To close the performance gap to the builtin deque which is
-    implemented in C++, this class does not allocate any Python objects when
-    manipulating the linked list. Instead, this class manipulates the
-    prev_free_block and next_free_block attributes of the given blocks.
+    in O(1) time.
+
+    When ``vllm._rs`` is available the linked-list ordering is delegated to
+    a Rust index-based implementation (``RustFreeBlockQueue``) which
+    eliminates Python attribute-access and reference-counting overhead.
+    Otherwise, the original Python linked-list implementation is used.
 
     The queue is ordered by block ID in the beginning. When a block is allocated
     and then freed, it will be appended back with the eviction order:
@@ -180,186 +194,155 @@ class FreeKVCacheBlockQueue:
     def __init__(self, blocks: list[KVCacheBlock]) -> None:
         self.num_free_blocks = len(blocks)
 
-        # Initialize doubly links of consecutive blocks
+        # Block ID → KVCacheBlock lookup (used by both backends).
+        self._blocks_by_id: dict[int, KVCacheBlock] = {
+            b.block_id: b for b in blocks
+        }
+
+        # Try Rust backend.
+        if _HAS_RUST_QUEUE:
+            max_id = max((b.block_id for b in blocks), default=0) + 1
+            self._rust_q: _RustQueue | None = _RustQueue(
+                [b.block_id for b in blocks], max_id,
+            )
+        else:
+            self._rust_q = None
+
+        if self._rust_q is not None:
+            # Rust backend: no need for Python linked list.
+            return
+
+        # Python backend: initialize doubly-linked list.
         for i in range(self.num_free_blocks):
             if i > 0:
                 blocks[i].prev_free_block = blocks[i - 1]
             if i < self.num_free_blocks - 1:
                 blocks[i].next_free_block = blocks[i + 1]
 
-        # Create a fake head and a tail block for the doubly linked list to
-        # reduce branching in the code
-        #
-        # The implementation guaranteed that the fake head and tail
-        # are NEVER got popped, so we could safely assume each real blocks
-        # in the queue has prev and next blocks.
         self.fake_free_list_head = KVCacheBlock(block_id=-1)
         self.fake_free_list_tail = KVCacheBlock(block_id=-1)
         if self.num_free_blocks > 0:
-            # Connect fake_head and fake_tail to the first and last block
-            # respectively.
             self.fake_free_list_head.next_free_block = blocks[0]
             blocks[0].prev_free_block = self.fake_free_list_head
             self.fake_free_list_tail.prev_free_block = blocks[-1]
             blocks[-1].next_free_block = self.fake_free_list_tail
         else:
-            # For empty list, simply connect the fake head and tail.
             self.fake_free_list_head.next_free_block = self.fake_free_list_tail
             self.fake_free_list_tail.prev_free_block = self.fake_free_list_head
 
     def popleft(self) -> KVCacheBlock:
-        """Pop the first free block and reduce num_free_blocks by 1.
+        """Pop the first free block and reduce num_free_blocks by 1."""
+        if self._rust_q is not None:
+            bid = self._rust_q.popleft()
+            self.num_free_blocks -= 1
+            return self._blocks_by_id[bid]
 
-        Returns:
-            The first free block.
-        """
         if (
             self.fake_free_list_head.next_free_block is self.fake_free_list_tail
             or self.fake_free_list_head.next_free_block is None
         ):
-            assert self.num_free_blocks == 0, (
-                f"num_free_blocks ({self.num_free_blocks}) is out of sync "
-                "with the free list."
-            )
+            assert self.num_free_blocks == 0
             raise ValueError("No free blocks available")
 
         first_block: KVCacheBlock = self.fake_free_list_head.next_free_block
-
         if first_block.next_free_block is None:
-            # This should not happen if the block is from the free list.
-            # It indicates a bug in the caller's logic.
-            raise RuntimeError(
-                "Invalid block found in popleft() "
-                "which doesn't have a valid next_free_block"
-            )
+            raise RuntimeError("Invalid block in popleft()")
 
-        # Connect fake_head and the next block of first_block (i.e. second block
-        # or fake tail).
         self.fake_free_list_head.next_free_block = first_block.next_free_block
         first_block.next_free_block.prev_free_block = self.fake_free_list_head
-
-        # Remove the block from the linked list.
         first_block.prev_free_block = first_block.next_free_block = None
-
         self.num_free_blocks -= 1
         return first_block
 
     def popleft_n(self, n: int) -> list[KVCacheBlock]:
-        """Pop the first n free blocks and reduce num_free_blocks by n.
-
-        Args:
-            n: The number of blocks to pop.
-
-        Returns:
-            A list of n free blocks.
-        """
+        """Pop the first n free blocks."""
         if n == 0:
             return []
+
+        if self._rust_q is not None:
+            ids = self._rust_q.popleft_n(n)
+            self.num_free_blocks -= n
+            return [self._blocks_by_id[bid] for bid in ids]
+
         assert self.num_free_blocks >= n
         self.num_free_blocks -= n
-
         curr_block = self.fake_free_list_head.next_free_block
-        # Pop n blocks from the head of the list
         ret = []
         for _ in range(n):
             assert curr_block is not None
             ret.append(curr_block)
             last_block = curr_block
             curr_block = curr_block.next_free_block
-            # Reset prev_free_block and next_free_block of all popped blocks
             last_block.prev_free_block = None
             last_block.next_free_block = None
-
         if curr_block is not None:
-            # The queue is not empty, connect the fake head to
-            # the new first block.
             self.fake_free_list_head.next_free_block = curr_block
             curr_block.prev_free_block = self.fake_free_list_head
         return ret
 
     def remove(self, block: KVCacheBlock) -> None:
-        """Remove a block in the free list and reduce num_free_blocks by 1.
+        """Remove a block in the free list."""
+        if self._rust_q is not None:
+            self._rust_q.remove(block.block_id)
+            self.num_free_blocks -= 1
+            return
 
-        Args:
-            block: The block to remove.
-        """
         if block.prev_free_block is None or block.next_free_block is None:
-            # This should not happen if the block is from the free list.
-            # It indicates a bug in the caller's logic.
             raise RuntimeError(f"remove() called on an invalid block: {block}")
-
-        # Link the previous block to the next block.
         block.prev_free_block.next_free_block = block.next_free_block
-        # Link the next block to the previous block.
         block.next_free_block.prev_free_block = block.prev_free_block
-
-        # Remove the block from the linked list.
         block.prev_free_block = block.next_free_block = None
         self.num_free_blocks -= 1
 
     def append(self, block: KVCacheBlock) -> None:
-        """Put a block back into the free list and increase
-        num_free_blocks by 1.
+        """Put a block back into the free list."""
+        if self._rust_q is not None:
+            self._rust_q.append(block.block_id)
+            self.num_free_blocks += 1
+            return
 
-        Args:
-            block: The block to append.
-        """
         if self.fake_free_list_tail.prev_free_block is None:
             raise RuntimeError(
                 "prev_free_block of fake_free_list_tail should always exist"
             )
         last_block: KVCacheBlock = self.fake_free_list_tail.prev_free_block
-
-        # Connect the new block after the last block.
         last_block.next_free_block = block
         block.prev_free_block = last_block
-
-        # Connect the fake tail after the new block.
         block.next_free_block = self.fake_free_list_tail
         self.fake_free_list_tail.prev_free_block = block
-
         self.num_free_blocks += 1
 
     def append_n(self, blocks: list[KVCacheBlock]) -> None:
-        """Put a list of blocks back into the free list
-
-        Args:
-            blocks: The blocks to append.
-        """
+        """Put a list of blocks back into the free list."""
         if len(blocks) == 0:
             return
 
+        if self._rust_q is not None:
+            self._rust_q.append_n([b.block_id for b in blocks])
+            self.num_free_blocks += len(blocks)
+            return
+
         last_block = self.fake_free_list_tail.prev_free_block
-        assert last_block is not None, (
-            "prev_free_block of fake_free_list_tail should always exist"
-        )
-        # Add inter-connections between consecutive blocks
+        assert last_block is not None
         for block in blocks:
             block.prev_free_block = last_block
             last_block.next_free_block = block
             last_block = block
-
-        # Connect the last block of <blocks> to the fake tail
         last_block.next_free_block = self.fake_free_list_tail
         self.fake_free_list_tail.prev_free_block = last_block
-
         self.num_free_blocks += len(blocks)
 
     def get_all_free_blocks(self) -> list[KVCacheBlock]:
-        """Get all free blocks in the free list. Mainly used for testing.
+        """Get all free blocks in the free list."""
+        if self._rust_q is not None:
+            return [self._blocks_by_id[bid] for bid in self._rust_q.get_all()]
 
-        Returns:
-            A list of free blocks.
-        """
         ret = []
         if self.fake_free_list_head.next_free_block is None:
             raise RuntimeError(
                 "next_free_block of fake_free_list_head should always exist"
             )
-        # Start from the first block
         curr_block: KVCacheBlock = self.fake_free_list_head.next_free_block
-        # As long as next_free_block is available, we haven't reached to
-        # the fake tail yet.
         while curr_block.next_free_block is not None:
             ret.append(curr_block)
             curr_block = curr_block.next_free_block
@@ -570,6 +553,11 @@ def get_request_block_hasher(
     Returns a function which computes the list of un-computed block hashes
     of a request."""
 
+    # Check if we can use the Rust fast path.  This requires:
+    # 1. vllm._rs is available
+    # 2. The hash function is "builtin" (Rust xxh3_128)
+    use_rust = _HAS_RUST_HASH and caching_hash_fn is builtin_hash
+
     def request_block_hasher(request: Request) -> list[BlockHash]:
         start_token_idx = len(request.block_hashes) * block_size
         num_tokens = request.num_tokens
@@ -578,6 +566,18 @@ def get_request_block_hasher(
             # Early stop when there no new full blocks created.
             return []
 
+        # Rust fast path: batch-hash all new full blocks in one call
+        # when the request has no extra keys (no MM, LoRA, cache_salt).
+        if use_rust and not need_extra_keys(request):
+            end_token_idx = (num_tokens // block_size) * block_size
+            token_ids = request.all_token_ids[start_token_idx:end_token_idx]
+            parent = (
+                request.block_hashes[-1] if request.block_hashes else NONE_HASH
+            )
+            hashes = _rs_batch_hash(parent, list(token_ids), block_size)
+            return [BlockHash(h) for h in hashes]
+
+        # Python path: per-block hashing with extra key support.
         curr_mm_idx = 0
         if start_token_idx > 0:
             # Set curr_mm_idx = -1 to indicate the last mm input.
