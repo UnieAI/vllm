@@ -197,14 +197,9 @@ except ImportError:
 | 項目 | 原因 |
 |------|------|
 | `serial_helpers.rs` Python 端接入 | numpy `tobytes()` 比 Rust 快 3x（零拷貝 vs 逐元素複製）。Rust 函數保留但不接入。 |
-
-### 未完成（3 項）
-
-| 優先級 | 項目 | 說明 | 難度 |
-|--------|------|------|------|
-| **P2** | Rust SoA request metadata 鏡像 | Rust 側維護 running requests SoA，避免每步 Python→numpy 收集開銷 | 高 |
-| **P3** | Lock-free IPC queue | Rust SPSC ring buffer 替換 `queue.Queue` | 高 |
-| **P3** | Shared memory IPC | mmap ring buffer 替換 ZMQ | 高 |
+| Rust SoA request metadata 鏡像 | CPU 排程已從 ~5ms→0.27ms（95% 減少），Python 屬性收集僅佔 ~50-100μs，再省不顯著。維護 Rust↔Python 雙向同步的成本遠高於收益。 |
+| Lock-free IPC queue | `queue.Queue` 每步只呼叫 1-2 次，瓶頸在序列化（msgspec）而非 queue 機制。改 EngineCore 進程架構風險高、收益低。 |
+| Shared memory IPC | 大 tensor 已走 OOB shared memory（`TensorIpcSender`），只有小 metadata 走 ZMQ，overhead 可忽略。|
 
 ### 驗證待辦
 
