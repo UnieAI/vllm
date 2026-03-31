@@ -770,46 +770,49 @@ maturin build --release --interpreter python3.10 python3.11 python3.12
 
 ---
 
-## 9. TODO — 已完成與未完成項目
+## 9. TODO — 專案狀態
 
-### 已完成 ✅
+### 已完成 ✅（13 項）
 
-| 項目 | Rust 檔案 | Python 整合位置 | 效能 |
-|------|----------|----------------|------|
-| Token 預算計算 | `schedule.rs` | `rust_accelerated.py` | 194x vs Python |
-| 批次 stop 檢查 | `stop_check.rs` | `scheduler.py` `update_from_output()` | 301x vs Python |
-| Spec decode 接受/拒絕 | `update_output.rs` | `rust_accelerated.py` | 192x vs Python |
-| N-gram KMP 並行 | `ngram.rs` | `ngram_proposer.py` | 2.1x vs Numba-1T |
-| N-gram Numba 多線程解鎖 | — | `ngram_proposer.py` | 1.8x（P0 改 1 行）|
-| N-gram set 查找 | — | `ngram_proposer.py` | O(n)→O(1)（P0 改 1 行）|
-| Block hash 加速 | `block_hash.rs` | `kv_cache_utils.py`, `utils/hashing.py` | xxHash + batch |
-| Free block queue | `block_pool.rs` | `kv_cache_utils.py` | Arena O(1) 雙向鏈結串列 |
-| Stop string 匹配 | `stop_strings.rs` | `detokenizer.py` | Aho-Corasick 多模式匹配 |
-| 序列化輔助 | `serial_helpers.rs` | （Rust 已實作） | int32 array 編碼 |
-| 模組名遷移 | `lib.rs` + `pyproject.toml` | 全部 import | `vllm._rs` + `_rs` fallback |
-| `schedule()` running 迴圈接入 | `schedule.rs` | `scheduler.py` `schedule()` | Rust 預算 + Python 調整 |
-| vllm build system 整合 | — | `setup.py` | best-effort auto-build |
+| # | 項目 | Rust 檔案 | Python 整合 | 效能 |
+|---|------|----------|-------------|------|
+| 1 | Token 預算計算 | `schedule.rs` | `rust_accelerated.py` | 194x |
+| 2 | 批次 stop 檢查（2D numpy） | `stop_check.rs` | `scheduler.py` | 301x |
+| 3 | Spec decode 接受/拒絕 | `update_output.rs` | `scheduler.py` | 192x |
+| 4 | `schedule()` running 迴圈接入 | `schedule.rs` | `scheduler.py` | Rust 預算 + Python 調整 |
+| 5 | `update_from_output()` batch stop 預計算 | `stop_check.rs` | `scheduler.py` | batch 快速路徑 |
+| 6 | N-gram KMP 並行 | `ngram.rs` | `ngram_proposer.py` | 2.1x vs Numba |
+| 7 | N-gram Numba 多線程解鎖 | — | `ngram_proposer.py` | 1.8x（改 1 行）|
+| 8 | N-gram set 查找 | — | `ngram_proposer.py` | O(n)→O(1) |
+| 9 | Block hash（xxHash） | `block_hash.rs` | `kv_cache_utils.py` | batch hash |
+| 10 | Free block queue | `block_pool.rs` | `kv_cache_utils.py` | Arena O(1) |
+| 11 | Stop string（Aho-Corasick） | `stop_strings.rs` | `detokenizer.py` | 多模式匹配 |
+| 12 | 模組名 `vllm._rs` | `lib.rs` | 全部 import | fallback chain |
+| 13 | vllm build system 整合 | — | `setup.py` | best-effort auto |
 
-### 未完成
+### 未完成（6 項）
 
 | 優先級 | 項目 | 說明 | 難度 |
 |--------|------|------|------|
-| ~~P0~~ | ~~`"builtin"` 加入 `PrefixCachingHashAlgo`~~ | ✅ 已加入 `config/cache.py` Literal type + docstring | — |
-| ~~P1~~ | ~~`schedule()` running 迴圈完整接入~~ | ✅ Rust 預計算結果作為初始值，encoder/mamba/preemption 仍在 Python 調整，re-clamp budget | — |
-| ~~P1~~ | ~~`batch_apply_spec_decode` 接入 `update_from_output()`~~ | ✅ 已整合 `_batch_precompute_spec_decode()` + 迴圈內 `_precomputed_spec` 快速路徑 | — |
-| ~~P1~~ | ~~vllm build system 整合~~ | ✅ `setup.py` `_build_rust_extension()` — best-effort：有 cargo 就編，沒有就跳過，`VLLM_SKIP_RUST=1` 可強制跳過 | — |
-| **P1** | `serial_helpers.rs` Python 端接入 | Rust 函數已寫好，尚未接入 `serial_utils.py` 的 `MsgpackEncoder.enc_hook()` tensor 編碼路徑。注意：numpy `tobytes()` 已是 C 最佳化，Rust 可能無額外收益，需先 profile 確認瓶頸 | 低 |
-| **P2** | CUDA n-gram kernel | GPU 版 n-gram 用 PyTorch `unfold` 做 O(n×m) 暴力匹配 + Python `for` 遍歷 ngram 長度；寫 fused CUDA kernel 做 O(n) KMP 可快 2-5x | 高 |
-| **P2** | Rust SoA request metadata 鏡像 | 在 Rust 側維護 running requests 的 struct-of-arrays 鏡像（num_computed_tokens 等），避免每步從 Python 物件收集到 numpy 的開銷 | 高 |
-| **P3** | Lock-free IPC queue | 替換 EngineCore 的 `queue.Queue`（每次 put/get 需 GIL + mutex 雙重鎖）為 Rust SPSC ring buffer，透過 PyO3 暴露 | 高 |
-| **P3** | Shared memory IPC | 用 Rust 管理的 memory-mapped ring buffer 替換 ZMQ（同機器內），消除 socket + kernel copy 開銷 | 高 |
-| **P3** | CI 自動建構 | GitHub Actions：PR 中自動 `maturin build` + `pytest` Rust 測試 + 效能回歸檢查 | 低 |
+| **P1** | `serial_helpers.rs` Python 端接入 | Rust 函數已寫好（`batch_encode_int32_arrays`），尚未接入 `serial_utils.py`。numpy `tobytes()` 已是 C 最佳化，需先 profile 確認是否為瓶頸 | 低 |
+| **P2** | CUDA n-gram kernel | GPU 版用 `unfold` O(n×m) 暴力匹配；寫 fused CUDA kernel 做 O(n) KMP 可快 2-5x | 高 |
+| **P2** | Rust SoA request metadata 鏡像 | 在 Rust 側維護 running requests 的 SoA，避免每步 Python→numpy 收集開銷 | 高 |
+| **P3** | Lock-free IPC queue | Rust SPSC ring buffer 替換 `queue.Queue`（GIL + mutex 雙重鎖） | 高 |
+| **P3** | Shared memory IPC | mmap ring buffer 替換 ZMQ，消除 socket + kernel copy | 高 |
+| **P3** | CI 自動建構 | GitHub Actions：`maturin build` + `pytest` + 效能回歸 | 低 |
 
 ### 驗證待辦
 
 - [ ] Linux x86_64 + NVIDIA GPU 環境下建構並驗證所有 Rust 模組
-- [ ] `benchmark_serving.py` 做有/無 Rust 的 A/B 對比（不同併發數 1/10/100/500/1000）
-- [ ] `py-spy` 或 `scalene` profile 確認 CPU 熱點是否已從 scheduler 迴圈轉移
-- [ ] 新增 `block_hash` Python 整合測試（`"builtin"` + chain hashing 正確性）
-- [ ] 新增 `RustFreeBlockQueue` 與原 Python 版本的行為交叉驗證測試
-- [ ] 新增 `StopStringMatcher` 邊界測試（Unicode、空 stop list、跨 token boundary）
+- [ ] `benchmark_serving.py` 做有/無 Rust 的 A/B 對比（併發數 1/10/100/500/1000）
+- [ ] `py-spy` 或 `scalene` profile 確認 CPU 熱點已從 scheduler 迴圈轉移
+- [ ] `block_hash` 整合測試（`"builtin"` + chain hashing 正確性）
+- [ ] `RustFreeBlockQueue` 與 Python 版本的行為交叉驗證
+- [ ] `StopStringMatcher` 邊界測試（Unicode、空 stop list、跨 token boundary）
+
+### 建議 Next Step
+
+1. **驗證優先**：在 Linux GPU 機器上跑完整 benchmark（有/無 Rust 的 A/B 對比），取得端到端吞吐量數據
+2. **P1**：profile `serial_utils.py` 確認是否值得接入 `serial_helpers.rs`
+3. **P2**：CUDA n-gram kernel（如果 GPU 版 n-gram 使用率高的話）
+4. **P3**：Lock-free IPC（需要架構性改動，投入大但回報也大）
