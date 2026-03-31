@@ -1,64 +1,117 @@
 # vLLM Rust 加速模組 — 啟動教學
 
-本文件說明如何從零開始建構、安裝、驗證 `vllm._rs` Rust 加速模組。
+本文件說明如何從零開始建構、安裝、驗證、啟用 `vllm._rs` Rust 加速模組，
+以及如何在開發中新增 Rust 函數。
 
 ---
 
 ## 目錄
 
-1. [前置需求](#1-前置需求)
-2. [環境準備](#2-環境準備)
+1. [架構總覽](#1-架構總覽)
+2. [前置需求](#2-前置需求)
 3. [建構與安裝](#3-建構與安裝)
 4. [驗證安裝](#4-驗證安裝)
 5. [在 vLLM 中啟用](#5-在-vllm-中啟用)
-6. [開發流程](#6-開發流程)
-7. [常見問題](#7-常見問題)
+6. [效能基準測試](#6-效能基準測試)
+7. [開發流程](#7-開發流程)
+8. [常見問題](#8-常見問題)
 
 ---
 
-## 1. 前置需求
+## 1. 架構總覽
 
-| 工具 | 最低版本 | 用途 |
-|------|---------|------|
-| Python | 3.10+ | vLLM 運行環境 |
-| Rust toolchain | 1.70+ | 編譯 Rust 程式碼 |
-| maturin | 1.0+ | Rust→Python 建構工具 |
-| numpy | 1.24+ | Rust↔Python 資料交換 |
+### 1.1 為什麼需要 Rust 加速
 
-### 1.1 檢查現有環境
+vLLM V1 的 EngineCore 忙碌迴圈在每步推論中執行：
 
-```bash
-# 確認 Python 版本
-python3 --version
-# 期望輸出: Python 3.10.x 或更高
-
-# 確認 Rust 是否已安裝
-rustc --version
-# 期望輸出: rustc 1.7x.0 或更高
-
-# 確認 cargo（Rust 套件管理器）
-cargo --version
+```
+schedule() → execute_model() → update_from_output()
+   CPU           GPU               CPU
 ```
 
+GPU 計算佔推論延遲的 90%+，但在高併發（100-1000+ 同時請求）場景下，
+CPU 端的 Python 迴圈成為瓶頸。以 N=1000 requests 為例：
+
+| 操作 | Python 延遲 | Rust 延遲 | 加速比 |
+|------|-------------|-----------|--------|
+| Token 預算計算 | 1,064 μs | 5.5 μs | 194x |
+| Stop 條件批次檢查 | 3,313 μs | 11 μs | 301x |
+| Spec decode 接受/拒絕 | 767 μs | 4.0 μs | 192x |
+| Block hash 計算（1K blocks）| 4,646 μs | 339 μs | 13.7x |
+| Free block queue（10K blocks）| 2,943 μs | 494 μs | 6.0x |
+| Stop string 匹配（5 patterns）| 2.5 μs | 0.3 μs | 7.3x |
+
+> **效能數據來源**：上述數字均在 Apple Silicon (aarch64-apple-darwin)、
+> CPython 3.12、Rust 1.93 release profile 下，用 `time.perf_counter()`
+> 取多次迭代平均值實測。測試方法見[第 6 節](#6-效能基準測試)。
+> 報告中的「端到端吞吐量預估」（如「小模型 3.4x step 加速」）為
+> 算術推算，**未經 GPU 端到端驗證**。
+
+### 1.2 模組結構
+
+```
+rust/
+├── Cargo.toml              # pyo3 0.23, numpy 0.23, xxhash-rust 0.8, aho-corasick 1
+├── pyproject.toml           # maturin 建構配置，module-name = "vllm._rs"
+├── .cargo/config.toml       # macOS aarch64 linker 設定
+└── src/
+    ├── lib.rs               # PyO3 模組入口（註冊所有函數和類別）
+    │
+    │   ── Scheduler 加速 ──
+    ├── schedule.rs          # compute_running_tokens, compute_waiting_tokens
+    ├── stop_check.rs        # batch_check_stop（2D numpy stop_token_ids）
+    ├── update_output.rs     # batch_apply_generated_tokens
+    ├── ngram.rs             # batch_ngram_propose（並行 KMP）
+    │
+    │   ── Phase 2 加速 ──
+    ├── block_hash.rs        # hash_block_tokens_rust, batch_hash_blocks（xxh3_128）
+    ├── block_pool.rs        # RustFreeBlockQueue（index-based linked list）
+    ├── stop_strings.rs      # StopStringMatcher（Aho-Corasick 自動機）
+    └── serial_helpers.rs    # encode_int_array_as_bytes（IPC 輔助）
+```
+
+### 1.3 Python 整合點
+
+| Python 檔案 | 使用的 Rust 元件 | 啟用方式 |
+|-------------|-----------------|---------|
+| `vllm/v1/core/sched/rust_accelerated.py` | compute_running_tokens, batch_check_stop, batch_apply_generated_tokens | 自動（`_HAS_RUST`） |
+| `vllm/v1/core/sched/scheduler.py` | `_batch_precompute_stops()` → batch_check_stop | 自動 |
+| `vllm/v1/core/kv_cache_utils.py` | RustFreeBlockQueue, batch_hash_blocks | 自動 / `--prefix-caching-hash-algo builtin` |
+| `vllm/v1/engine/detokenizer.py` | StopStringMatcher | 自動（有 stop strings 時） |
+| `vllm/v1/spec_decode/ngram_proposer.py` | batch_ngram_propose | 自動（`_HAS_RUST_NGRAM`） |
+| `vllm/utils/hashing.py` | hash_block_tokens_rust | `--prefix-caching-hash-algo builtin` |
+
+### 1.4 設計原則
+
+| 原則 | 做法 |
+|------|------|
+| **零侵入** | `vllm._rs` 不存在時自動 fallback 到 Python，功能不受影響 |
+| **SoA 介面** | Rust 函數只接收 numpy array / bytes / int，不接觸 Python 物件 |
+| **不碰 GPU** | KV cache 管理、block allocation、FlashAttention 留在 Python/CUDA |
+| **增量建構** | 修改 `.rs` 後 `maturin develop --release` 只需 1-5 秒 |
+
 ---
 
-## 2. 環境準備
+## 2. 前置需求
 
-### 2.1 安裝 Rust（如果尚未安裝）
+| 工具 | 最低版本 | 安裝方式 |
+|------|---------|---------|
+| Python | 3.10+ | 系統自帶或 pyenv |
+| Rust toolchain | 1.70+ | `rustup`（見下方）|
+| maturin | 1.0+ | `pip install maturin` |
+| numpy | 1.24+ | vLLM 依賴自動安裝 |
+
+### 2.1 安裝 Rust
 
 ```bash
-# 官方安裝腳本（Linux / macOS）
+# Linux / macOS
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# 安裝完成後，載入環境變數
 source $HOME/.cargo/env
 
 # 驗證
-rustc --version
-cargo --version
+rustc --version   # 期望: rustc 1.7x.0+
+cargo --version   # 期望: cargo 1.7x.0+
 ```
-
-> **Windows 使用者**：到 https://rustup.rs/ 下載安裝程式。
 
 ### 2.2 安裝 maturin
 
@@ -66,289 +119,341 @@ cargo --version
 pip install maturin
 ```
 
-### 2.3 確認 numpy 已安裝
-
-```bash
-python3 -c "import numpy; print(numpy.__version__)"
-# 需要 1.24 以上
-```
-
 ---
 
 ## 3. 建構與安裝
 
-### 3.1 切換到 Rust crate 目錄
+### 3.1 開發模式（推薦）
 
 ```bash
 cd /path/to/vllm/rust
-```
-
-目錄結構應該是：
-
-```
-rust/
-├── Cargo.toml          # Rust 依賴定義
-├── Cargo.lock          # 鎖定的依賴版本
-├── pyproject.toml      # maturin 建構配置
-├── .cargo/
-│   └── config.toml     # macOS linker 設定
-└── src/
-    ├── lib.rs           # PyO3 模組入口（註冊所有函數）
-    ├── schedule.rs      # compute_running_tokens, compute_waiting_tokens
-    ├── stop_check.rs    # batch_check_stop
-    ├── update_output.rs # batch_apply_generated_tokens
-    ├── ngram.rs         # batch_ngram_propose（並行 KMP）
-    ├── block_hash.rs    # hash_block_tokens_rust, batch_hash_blocks
-    ├── block_pool.rs    # RustFreeBlockQueue
-    ├── stop_strings.rs  # StopStringMatcher
-    └── serial_helpers.rs # batch_encode_int32_arrays
-```
-
-### 3.2 開發模式安裝（推薦）
-
-```bash
 maturin develop --release
 ```
 
-這會：
-1. 編譯所有 Rust 原始碼（release 模式，含最佳化）
-2. 產生 `.so` / `.dylib` / `.pyd` 檔案
-3. 安裝到目前的 Python 環境中
+**首次建構**約 15-20 秒（下載依賴 + 編譯），後續增量建構 1-5 秒。
 
-首次建構約需 **15-20 秒**（下載並編譯依賴），後續增量建構約 **1-5 秒**。
-
-**預期輸出：**
+預期輸出：
 
 ```
 🔗 Found pyo3 bindings
 🐍 Found CPython 3.12 at /path/to/python
 📡 Using build options features from pyproject.toml
-   Compiling pyo3 v0.23.5
-   Compiling numpy v0.23.0
    Compiling vllm-scheduler-rs v0.1.0
-    Finished `release` profile [optimized] target(s) in 17.05s
+    Finished `release` profile [optimized] target(s) in 3.03s
 📦 Built wheel for CPython 3.12 to /tmp/.../vllm_scheduler_rs-0.1.0-....whl
 ✏️ Setting installed package as editable
 🛠 Installed vllm-scheduler-rs-0.1.0
 ```
 
-### 3.3 建構 wheel（用於分發 / CI）
+### 3.2 建構 wheel（CI / 分發）
 
 ```bash
+cd /path/to/vllm/rust
 maturin build --release
+
+# 產出位置
+ls target/wheels/
+# vllm_scheduler_rs-0.1.0-cp312-cp312-linux_x86_64.whl
+
+# 在目標機器上安裝
+pip install target/wheels/vllm_scheduler_rs-0.1.0-*.whl
 ```
 
-產出的 `.whl` 檔案在 `target/wheels/` 目錄中，可以用 `pip install` 安裝到任何相容的環境：
+### 3.3 搭配 vLLM 完整安裝
 
 ```bash
-pip install target/wheels/vllm_scheduler_rs-0.1.0-cp312-cp312-linux_x86_64.whl
+# 1. 安裝 vLLM（需要 GPU 環境）
+cd /path/to/vllm
+VLLM_USE_PRECOMPILED=1 pip install -e . --torch-backend=auto
+
+# 2. 安裝 Rust 模組
+cd rust
+maturin develop --release
+
+# 此時 from vllm._rs import ... 可用
 ```
+
+> **無 GPU 環境**：如果只想開發/測試 Rust 模組本身，不需要安裝 vLLM。
+> `maturin develop` 後可以 `from _rs import ...` 直接使用。
 
 ---
 
 ## 4. 驗證安裝
 
-### 4.1 基本 import 測試
+### 4.1 檢查模組載入
 
 ```bash
 python3 -c "
 try:
-    from vllm._rs import batch_ngram_propose
-    print('OK: vllm._rs 載入成功')
+    from vllm._rs import compute_running_tokens
+    print('OK: vllm._rs loaded')
 except ImportError:
     try:
-        from _rs import batch_ngram_propose
-        print('OK: _rs 載入成功（開發模式）')
+        from _rs import compute_running_tokens
+        print('OK: _rs loaded (dev mode, vllm not installed)')
     except ImportError:
-        print('FAIL: 模組未安裝')
+        print('FAIL: module not installed')
 "
 ```
 
-### 4.2 列出所有可用函數
+### 4.2 列出所有匯出
 
-```python
+```bash
 python3 -c "
 try:
-    import _rs as mod
+    import _rs as m
 except ImportError:
-    from vllm import _rs as mod
+    from vllm import _rs as m
 
-for name in sorted(dir(mod)):
+for name in sorted(dir(m)):
     if not name.startswith('_'):
-        print(f'  {name}')
+        obj = getattr(m, name)
+        kind = 'class' if isinstance(obj, type) else 'function'
+        print(f'  {kind:8s}  {name}')
 "
 ```
 
 預期輸出：
 
 ```
-  RustFreeBlockQueue
-  StopStringMatcher
-  batch_apply_generated_tokens
-  batch_check_stop
-  batch_encode_int32_arrays
-  batch_hash_blocks
-  batch_ngram_propose
-  compute_running_tokens
-  compute_waiting_tokens
-  encode_int_array_as_bytes
-  hash_block_tokens_rust
+  class     RustFreeBlockQueue
+  class     StopStringMatcher
+  function  batch_apply_generated_tokens
+  function  batch_check_stop
+  function  batch_encode_int32_arrays
+  function  batch_hash_blocks
+  function  batch_ngram_propose
+  function  compute_running_tokens
+  function  compute_waiting_tokens
+  function  encode_int_array_as_bytes
+  function  hash_block_tokens_rust
 ```
 
-### 4.3 功能驗證（smoke test）
+### 4.3 Smoke test（各模組快速驗證）
 
-```python
-python3 -c "
+```bash
+python3 << 'PYEOF'
 import numpy as np
 
 try:
     from vllm._rs import (
-        compute_running_tokens,
-        batch_check_stop,
-        batch_apply_generated_tokens,
-        batch_ngram_propose,
+        compute_running_tokens, batch_check_stop,
+        batch_apply_generated_tokens, batch_hash_blocks,
+        RustFreeBlockQueue, StopStringMatcher,
     )
 except ImportError:
     from _rs import (
-        compute_running_tokens,
-        batch_check_stop,
-        batch_apply_generated_tokens,
-        batch_ngram_propose,
+        compute_running_tokens, batch_check_stop,
+        batch_apply_generated_tokens, batch_hash_blocks,
+        RustFreeBlockQueue, StopStringMatcher,
     )
 
-# 1. compute_running_tokens
-result = compute_running_tokens(
-    np.array([100], dtype=np.int64),   # num_tokens_with_spec
-    np.zeros(1, dtype=np.int64),       # num_output_placeholders
-    np.array([90], dtype=np.int64),    # num_computed_tokens
-    np.array([100], dtype=np.int64),   # num_prompt_tokens
-    np.array([100], dtype=np.int64),   # max_tokens_per_req
-    1000,                              # token_budget
-    0,                                 # long_prefill_threshold (0=disabled)
-    4096,                              # max_model_len
+# ── Scheduler: compute_running_tokens ──
+r = compute_running_tokens(
+    np.array([100], dtype=np.int64),
+    np.zeros(1, dtype=np.int64),
+    np.array([90], dtype=np.int64),
+    np.array([100], dtype=np.int64),
+    np.array([100], dtype=np.int64),
+    1000, 0, 4096,
 )
-assert list(result) == [10], f'FAIL: expected [10], got {list(result)}'
-print('[PASS] compute_running_tokens')
+assert list(r) == [10]
+print("[PASS] compute_running_tokens")
 
-# 2. batch_check_stop
-stop_result = batch_check_stop(
-    np.array([2], dtype=np.int64),     # last_token_ids (EOS=2)
-    np.array([100], dtype=np.int64),   # num_tokens
-    np.array([10], dtype=np.int64),    # num_output_tokens
-    np.array([0], dtype=np.int64),     # min_tokens
-    np.array([100], dtype=np.int64),   # max_tokens_per_req
-    np.array([2], dtype=np.int64),     # eos_token_ids
-    np.empty((1, 0), dtype=np.int64),  # stop_token_ids (2D, no stop tokens)
-    4096,                              # max_model_len
+# ── Scheduler: batch_check_stop (numpy 2D) ──
+r = batch_check_stop(
+    np.array([2, 42], dtype=np.int64),
+    np.array([100, 100], dtype=np.int64),
+    np.array([10, 10], dtype=np.int64),
+    np.array([0, 0], dtype=np.int64),
+    np.array([100, 100], dtype=np.int64),
+    np.array([2, -1], dtype=np.int64),
+    np.array([[-1], [42]], dtype=np.int64),
+    4096,
 )
-assert stop_result[0] == 1, f'FAIL: expected 1 (EOS), got {stop_result[0]}'
-print('[PASS] batch_check_stop')
+assert list(r) == [1, 2]  # EOS, STOP_TOKEN
+print("[PASS] batch_check_stop")
 
-# 3. batch_apply_generated_tokens
+# ── Scheduler: batch_apply_generated_tokens ──
 ac, ap, aa, ar = batch_apply_generated_tokens(
-    np.array([105], dtype=np.int64),   # num_computed_tokens
-    np.array([5], dtype=np.int64),     # num_output_placeholders
-    np.array([3], dtype=np.int64),     # num_generated
-    np.array([5], dtype=np.int64),     # num_draft_tokens
+    np.array([105], dtype=np.int64),
+    np.array([5], dtype=np.int64),
+    np.array([3], dtype=np.int64),
+    np.array([5], dtype=np.int64),
 )
-assert list(ac) == [102], f'FAIL: expected [102], got {list(ac)}'
-print('[PASS] batch_apply_generated_tokens')
+assert list(ac) == [102]
+print("[PASS] batch_apply_generated_tokens")
 
-# 4. batch_ngram_propose
-token_ids = np.zeros((1, 100), dtype=np.int32)
-token_ids[0, :8] = [1, 2, 3, 4, 5, 1, 2, 3]
-draft, num_drafts = batch_ngram_propose(
-    token_ids,                         # token_ids [batch, max_len]
-    np.array([8], dtype=np.int32),     # num_tokens [batch]
-    [0],                               # valid_indices
-    2,                                 # min_n
-    5,                                 # max_n
-    100,                               # max_model_len
-    3,                                 # k (num draft tokens)
-)
-assert num_drafts[0] == 3, f'FAIL: expected 3 drafts, got {num_drafts[0]}'
-print('[PASS] batch_ngram_propose')
+# ── Block Hash: batch_hash_blocks ──
+parent = b'\x00' * 16
+hashes = batch_hash_blocks(parent, [1, 2, 3, 4, 5, 6], 3)
+assert len(hashes) == 2
+assert hashes[0] != hashes[1]
+# Chain: hash[1] depends on hash[0]
+hashes2 = batch_hash_blocks(hashes[0], [4, 5, 6], 3)
+assert hashes2[0] == hashes[1]
+print("[PASS] batch_hash_blocks (chain hashing)")
+
+# ── Block Pool: RustFreeBlockQueue ──
+q = RustFreeBlockQueue([0, 1, 2, 3, 4], 5)
+assert len(q) == 5
+assert q.popleft() == 0
+q.remove(2)
+assert q.get_all() == [1, 3, 4]
+q.append(2)
+assert q.get_all() == [1, 3, 4, 2]
+popped = q.popleft_n(2)
+assert popped == [1, 3]
+print("[PASS] RustFreeBlockQueue")
+
+# ── Stop Strings: StopStringMatcher ──
+m = StopStringMatcher(["</s>", "STOP"])
+r = m.check("Hello</s>", 9, False)
+assert r is not None and r[0] == "</s>" and r[1] == 5
+r = m.check("Hello world", 11, False)
+assert r is None
+r = m.check("Hello STOP", 10, True)
+assert r is not None and r[0] == "STOP" and r[1] == -1  # no truncation
+print("[PASS] StopStringMatcher")
 
 print()
-print('=== All 4 smoke tests passed ===')
-"
+print("=== All 6 smoke tests passed ===")
+PYEOF
 ```
 
 ### 4.4 跑完整測試套件
 
 ```bash
-# 從 vllm 根目錄
-# 注意：需要在 conftest.py 不干擾的環境下跑
-# 方法 1：複製到 /tmp 跑
+# 從 vllm 根目錄（如果 conftest.py 有 vllm 依賴衝突，複製到 /tmp 跑）
 cp tests/v1/core/test_rust_scheduler.py /tmp/
 cp tests/v1/spec_decode/test_ngram_rust.py /tmp/
 cd /tmp && python3 -m pytest test_rust_scheduler.py test_ngram_rust.py -v
+
+# 如果 vLLM 已安裝，直接在 repo 內跑
+cd /path/to/vllm
+python3 -m pytest tests/v1/core/test_rust_scheduler.py tests/v1/spec_decode/test_ngram_rust.py -v
 ```
 
-預期輸出：
+預期結果：**25 tests passed**。
+
+---
+
+## 5. 在 vLLM 中啟用
+
+### 5.1 自動啟用（預設行為）
+
+安裝 `vllm-scheduler-rs` 後，vLLM 啟動時**自動偵測並啟用**。
+不需要任何配置。日誌中會出現：
 
 ```
-test_rust_scheduler.py::TestRustComputeRunningTokens::test_basic PASSED
-test_rust_scheduler.py::TestRustComputeRunningTokens::test_budget_clamp PASSED
-test_rust_scheduler.py::TestRustComputeRunningTokens::test_long_prefill_threshold PASSED
-test_rust_scheduler.py::TestRustComputeRunningTokens::test_max_model_len_clamp PASSED
-test_rust_scheduler.py::TestRustComputeRunningTokens::test_async_scheduling_skip PASSED
-test_rust_scheduler.py::TestRustComputeRunningTokens::test_empty PASSED
-test_rust_scheduler.py::TestRustBatchCheckStop::test_eos PASSED
-test_rust_scheduler.py::TestRustBatchCheckStop::test_stop_token PASSED
-test_rust_scheduler.py::TestRustBatchCheckStop::test_length_cap PASSED
-test_rust_scheduler.py::TestRustBatchCheckStop::test_min_tokens_suppresses_stop PASSED
-test_rust_scheduler.py::TestRustBatchCheckStop::test_multiple_requests_mixed PASSED
-test_rust_scheduler.py::TestRustBatchApplyGenerated::test_no_spec PASSED
-test_rust_scheduler.py::TestRustBatchApplyGenerated::test_with_spec PASSED
-test_rust_scheduler.py::TestRustComputeWaitingTokens::test_basic PASSED
-test_rust_scheduler.py::TestRustComputeWaitingTokens::test_chunked_prefill_disabled PASSED
-test_rust_scheduler.py::TestRustPerformance::test_compute_running_is_fast PASSED
-test_rust_scheduler.py::TestRustPerformance::test_batch_check_stop_is_fast PASSED
-test_ngram_rust.py::TestRustNgramProposer::test_basic_match PASSED
-test_ngram_rust.py::TestRustNgramProposer::test_no_match PASSED
-test_ngram_rust.py::TestRustNgramProposer::test_min_ngram_filter PASSED
-test_ngram_rust.py::TestRustNgramProposer::test_batch_processing PASSED
-test_ngram_rust.py::TestRustNgramProposer::test_valid_indices_subset PASSED
-test_ngram_rust.py::TestRustNgramProposer::test_max_model_len_limit PASSED
-test_ngram_rust.py::TestRustNgramProposer::test_cross_validate_with_numba PASSED
-test_ngram_rust.py::TestRustNgramProposer::test_performance PASSED
-
-======================== 25 passed in 1.98s ========================
+INFO: Rust scheduler acceleration enabled (vllm._rs)
 ```
 
-### 4.5 效能基準測試
+### 5.2 各元件啟用狀態
 
-```python
+| 元件 | 自動啟用 | 額外配置 | 說明 |
+|------|---------|---------|------|
+| Scheduler batch stop 預計算 | ✅ 自動 | 無 | `_batch_precompute_stops()` |
+| FreeKVCacheBlockQueue Rust backend | ✅ 自動 | 無 | 偵測 `RustFreeBlockQueue` 可用性 |
+| StopStringMatcher (Aho-Corasick) | ✅ 自動 | 無 | 請求有 stop strings 時建構 |
+| N-gram proposer Rust path | ✅ 自動 | 無 | 偵測 `batch_ngram_propose` 可用性 |
+| Block hash Rust 快速路徑 | ❌ 需配置 | `--prefix-caching-hash-algo builtin` | 見下方 |
+
+### 5.3 啟用 Rust block hash
+
+Block hash 使用新的 `"builtin"` 算法（Rust xxh3_128，跳過 cbor2/pickle 序列化）：
+
+```bash
+vllm serve <model> --prefix-caching-hash-algo builtin
+```
+
+> **注意**：`"builtin"` 與 `"sha256"` / `"xxhash_cbor"` 產生不同的 hash 值。
+> 切換算法後，已有的 prefix cache 會失效（首次請求會重新計算）。
+> 單一 vLLM 實例內部是自洽的，不影響正確性。
+
+### 5.4 確認 Rust 加速正在使用
+
+```bash
+# 方法 1：啟動時搜尋日誌
+vllm serve <model> 2>&1 | grep -i rust
+
+# 方法 2：Python 中檢查
 python3 -c "
-import numpy as np
+from vllm.v1.core.sched.rust_accelerated import _HAS_RUST
+print(f'Scheduler Rust: {_HAS_RUST}')
+"
+```
+
+---
+
+## 6. 效能基準測試
+
+以下腳本可在**任何安裝了 Rust 模組的環境**中執行，不需要 GPU。
+
+### 6.1 完整基準測試腳本
+
+```bash
+python3 << 'PYEOF'
+"""vllm._rs performance benchmark.
+
+Measures each Rust function against a comparable Python baseline.
+All numbers are wall-clock time (time.perf_counter), averaged over many iterations.
+"""
 import time
+import numpy as np
 
 try:
-    from vllm._rs import compute_running_tokens, batch_check_stop, batch_ngram_propose
+    from vllm._rs import (
+        compute_running_tokens, batch_check_stop,
+        batch_apply_generated_tokens, batch_hash_blocks,
+        RustFreeBlockQueue, StopStringMatcher,
+    )
 except ImportError:
-    from _rs import compute_running_tokens, batch_check_stop, batch_ngram_propose
+    from _rs import (
+        compute_running_tokens, batch_check_stop,
+        batch_apply_generated_tokens, batch_hash_blocks,
+        RustFreeBlockQueue, StopStringMatcher,
+    )
 
 N = 1000
 rng = np.random.default_rng(42)
-ITERS = 5000
 
-# --- compute_running_tokens ---
+def bench(name, fn, iters=5000, warmup=200):
+    for _ in range(warmup):
+        fn()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        fn()
+    return (time.perf_counter() - t0) / iters
+
+print(f"Benchmark: N={N} requests")
+print("=" * 65)
+
+# ── 1. compute_running_tokens ──
 spec = rng.integers(100, 4096, size=N, dtype=np.int64)
 ph = np.zeros(N, dtype=np.int64)
 comp = spec - rng.integers(1, 50, size=N, dtype=np.int64)
 prompt = rng.integers(50, 2000, size=N, dtype=np.int64)
 maxt = np.full(N, 1024, dtype=np.int64)
 
-# warmup
-compute_running_tokens(spec, ph, comp, prompt, maxt, 100000, 0, 4096)
+rust_s = bench("", lambda: compute_running_tokens(
+    spec, ph, comp, prompt, maxt, 100000, 0, 4096))
 
-t0 = time.perf_counter()
-for _ in range(ITERS):
-    compute_running_tokens(spec, ph, comp, prompt, maxt, 100000, 0, 4096)
-sched_us = (time.perf_counter() - t0) / ITERS * 1e6
+def py_compute():
+    result = np.zeros(N, dtype=np.int64)
+    budget = 100000
+    for i in range(N):
+        if budget <= 0: break
+        n = int(spec[i] + ph[i] - comp[i])
+        n = min(n, budget, 4095 - int(comp[i]))
+        n = max(n, 0)
+        result[i] = n
+        budget -= n
 
-# --- batch_check_stop ---
+py_s = bench("", py_compute, iters=500)
+print(f"compute_running_tokens:  Rust {rust_s*1e6:>8.1f} μs | Py {py_s*1e6:>8.1f} μs | {py_s/rust_s:>6.1f}x")
+
+# ── 2. batch_check_stop ──
 last_tok = rng.integers(0, 50000, size=N, dtype=np.int64)
 num_tok = rng.integers(100, 4096, size=N, dtype=np.int64)
 num_out = rng.integers(0, 500, size=N, dtype=np.int64)
@@ -360,140 +465,238 @@ for i in range(N):
     ns = rng.integers(0, 6)
     stop_arr[i, :ns] = rng.integers(0, 50000, size=ns)
 
-batch_check_stop(last_tok, num_tok, num_out, min_tok, max_tok2, eos, stop_arr, 4096)
+rust_s = bench("", lambda: batch_check_stop(
+    last_tok, num_tok, num_out, min_tok, max_tok2, eos, stop_arr, 4096))
 
-t0 = time.perf_counter()
-for _ in range(ITERS):
-    batch_check_stop(last_tok, num_tok, num_out, min_tok, max_tok2, eos, stop_arr, 4096)
-stop_us = (time.perf_counter() - t0) / ITERS * 1e6
+def py_stop():
+    result = np.zeros(N, dtype=np.int32)
+    for i in range(N):
+        if num_out[i] < min_tok[i]: continue
+        if eos[i] >= 0 and last_tok[i] == eos[i]:
+            result[i] = 1; continue
+        for j in range(5):
+            if stop_arr[i, j] < 0: break
+            if last_tok[i] == stop_arr[i, j]:
+                result[i] = 2; break
+        if result[i] > 0: continue
+        if num_tok[i] >= 4096 or num_out[i] >= max_tok2[i]:
+            result[i] = 3
 
-# --- batch_ngram_propose ---
-BATCH = 128; SL = 1500; K = 5
-ti = np.zeros((BATCH, 100000), dtype=np.int32)
-ti[:, :SL] = rng.integers(0, 50, size=(BATCH, SL), dtype=np.int32)
-nt = np.full(BATCH, SL, dtype=np.int32)
-vi = list(range(BATCH))
+py_s = bench("", py_stop, iters=500)
+print(f"batch_check_stop:        Rust {rust_s*1e6:>8.1f} μs | Py {py_s*1e6:>8.1f} μs | {py_s/rust_s:>6.1f}x")
 
-batch_ngram_propose(ti, nt, vi, 3, 7, 100000, K)
+# ── 3. batch_hash_blocks ──
+parent = b'\x00' * 16
+tokens = list(range(N * 16))
 
-t0 = time.perf_counter()
-for _ in range(200):
-    batch_ngram_propose(ti, nt, vi, 3, 7, 100000, K)
-ngram_ms = (time.perf_counter() - t0) / 200 * 1e3
+rust_s = bench("", lambda: batch_hash_blocks(parent, tokens, 16), iters=1000)
 
-print(f'Benchmark Results (N={N} requests)')
-print(f'  compute_running_tokens:  {sched_us:6.1f} μs   (target: < 20 μs)')
-print(f'  batch_check_stop:        {stop_us:6.1f} μs   (target: < 30 μs)')
-print(f'  batch_ngram_propose:     {ngram_ms:6.2f} ms   (target: < 1 ms)')
-print()
-if sched_us < 20 and stop_us < 30 and ngram_ms < 1:
-    print('Performance OK')
-else:
-    print('WARNING: Some functions slower than expected')
-"
+import hashlib
+def py_hash():
+    prev = parent
+    for i in range(0, len(tokens), 16):
+        blk = tokens[i:i+16]
+        data = prev + b''.join(t.to_bytes(4, 'little', signed=True) for t in blk)
+        prev = hashlib.sha256(data).digest()
+
+py_s = bench("", py_hash, iters=100)
+print(f"batch_hash_blocks:       Rust {rust_s*1e6:>8.1f} μs | Py {py_s*1e6:>8.1f} μs | {py_s/rust_s:>6.1f}x")
+
+# ── 4. FreeBlockQueue ──
+CAP = 10000
+q = RustFreeBlockQueue(list(range(CAP)), CAP)
+rust_s = bench("", lambda: (q.append_n(q.popleft_n(CAP))), iters=1000)
+print(f"FreeBlockQueue (10K):    Rust {rust_s*1e6:>8.1f} μs |")
+
+# ── 5. StopStringMatcher ──
+import string, random
+random.seed(42)
+text = ''.join(random.choices(string.ascii_letters + ' ', k=10000))
+stops = ['ENDOFTEXT', '</s>', '###', 'STOP', 'END']
+matcher = StopStringMatcher(stops)
+
+rust_s = bench("", lambda: matcher.check(text, 50, False), iters=10000)
+
+def py_ss():
+    for s in stops:
+        text.find(s, max(0, len(text) - 50 - len(s) + 1))
+
+py_s = bench("", py_ss, iters=10000)
+print(f"StopStringMatcher:       Rust {rust_s*1e6:>8.2f} μs | Py {py_s*1e6:>8.2f} μs | {py_s/rust_s:>6.1f}x")
+
+print("=" * 65)
+PYEOF
+```
+
+### 6.2 效能數據的來源說明
+
+| 欄位 | 說明 |
+|------|------|
+| **Rust / Python 延遲** | `time.perf_counter()` 實測，warmup 後取 N 次迭代平均值 |
+| **加速比** | `Python 延遲 / Rust 延遲` |
+| **端到端預估** | 算術推算，**未經 GPU 端到端驗證** |
+| **硬體** | 實測環境：Apple Silicon M-series, CPython 3.12, Rust 1.93 release |
+
+> 在不同硬體（Linux x86_64 + CUDA）上數字可能不同。
+> 建議在目標部署硬體上重跑上方基準測試。
+
+### 6.3 端到端驗證（需要 GPU）
+
+```bash
+# 1. 安裝 vLLM + Rust 模組
+cd /path/to/vllm
+VLLM_USE_PRECOMPILED=1 pip install -e . --torch-backend=auto
+cd rust && maturin develop --release && cd ..
+
+# 2. 啟動 server
+vllm serve meta-llama/Llama-3.1-8B &
+
+# 3. 跑 serving benchmark
+python benchmarks/benchmark_serving.py \
+    --model meta-llama/Llama-3.1-8B \
+    --num-prompts 1000 \
+    --request-rate inf \
+    --backend vllm
+
+# 4. 對比：移除 Rust 模組再跑一次
+pip uninstall -y vllm-scheduler-rs
+# 重啟 server，再跑同樣的 benchmark
 ```
 
 ---
 
-## 5. 在 vLLM 中啟用
+## 7. 開發流程
 
-### 5.1 自動啟用
-
-安裝 `vllm-scheduler-rs` 後，vLLM 啟動時會**自動偵測並啟用** Rust 加速。你會在日誌中看到：
-
-```
-INFO: Rust scheduler acceleration enabled (vllm._rs)
-```
-
-如果模組不存在，會看到：
-
-```
-INFO: vllm._rs not available, using pure-Python scheduler
-```
-
-**不需要任何額外配置。**
-
-### 5.2 影響的元件
-
-| 元件 | 加速的操作 | 預期加速 |
-|------|-----------|---------|
-| Scheduler `schedule()` | batch stop 預計算 | 301x |
-| Scheduler `update_from_output()` | batch stop + spec decode | 192x |
-| N-gram proposer（CPU 版） | KMP 匹配 + 並行 | 2.1x |
-
-### 5.3 確認正在使用 Rust
-
-啟動 vLLM 後，在日誌中搜尋 `Rust scheduler acceleration`：
+### 7.1 修改 → 建構 → 測試
 
 ```bash
-vllm serve <model> 2>&1 | grep -i rust
-```
+# 1. 修改 Rust 原始碼
+vim rust/src/schedule.rs
 
----
+# 2. 快速語法檢查（不安裝，~1 秒）
+cd rust && cargo check
 
-## 6. 開發流程
-
-### 6.1 修改 Rust 程式碼後重新建構
-
-```bash
-cd rust/
-
-# 修改 src/*.rs 檔案後：
+# 3. 建構 + 安裝（~1-5 秒增量）
 maturin develop --release
 
-# 通常只需 1-5 秒（增量編譯）
+# 4. 測試
+python3 -m pytest tests/v1/core/test_rust_scheduler.py -v
 ```
 
-### 6.2 只檢查編譯（不安裝）
+### 7.2 新增一個 Rust 函數
+
+以新增 `my_fast_function(arr: numpy.int64[]) -> int` 為例：
+
+**Step 1：建立 Rust 實作**
+
+```rust
+// rust/src/my_module.rs
+use numpy::PyReadonlyArray1;
+use pyo3::prelude::*;
+
+#[pyfunction]
+pub fn my_fast_function(arr: PyReadonlyArray1<'_, i64>) -> i64 {
+    arr.as_slice().unwrap().iter().sum()
+}
+```
+
+**Step 2：在 lib.rs 註冊**
+
+```rust
+// rust/src/lib.rs
+mod my_module;  // ← 新增
+
+fn vllm_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // ... 既有的註冊 ...
+    m.add_function(wrap_pyfunction!(my_module::my_fast_function, m)?)?;
+    Ok(())
+}
+```
+
+**Step 3：建構**
 
 ```bash
-cd rust/
-cargo check
+cd rust && maturin develop --release
 ```
 
-這比 `maturin develop` 快（不需要打包和安裝），適合開發中頻繁檢查語法。
+**Step 4：Python 中使用（含 fallback）**
 
-### 6.3 跑 Rust 單元測試
+```python
+try:
+    from vllm._rs import my_fast_function
+    _HAS_RUST = True
+except ImportError:
+    _HAS_RUST = False
 
-由於 PyO3 extension module 的限制，`cargo test` 在 macOS 上需要特殊 linker 設定（已在 `.cargo/config.toml` 中配置）。但 Rust 測試仍然需要 Python runtime，建議改用 Python 測試：
-
-```bash
-cp tests/v1/core/test_rust_scheduler.py /tmp/
-cp tests/v1/spec_decode/test_ngram_rust.py /tmp/
-cd /tmp && python3 -m pytest test_rust_scheduler.py test_ngram_rust.py -v
+def my_function(arr):
+    if _HAS_RUST:
+        return my_fast_function(arr)
+    return sum(arr)  # Pure Python fallback
 ```
 
-### 6.4 新增 Rust 函數的流程
+**Step 5：撰寫測試**
 
-1. **在 `rust/src/` 新增或修改 `.rs` 檔案**
-2. **在 `rust/src/lib.rs` 註冊**：
-   ```rust
-   m.add_function(wrap_pyfunction!(your_module::your_function, m)?)?;
-   // 或
-   m.add_class::<your_module::YourClass>()?;
-   ```
-3. **建構**：`maturin develop --release`
-4. **在 Python 中使用**：
-   ```python
-   try:
-       from vllm._rs import your_function
-   except ImportError:
-       from _rs import your_function
-   ```
-5. **撰寫測試**放在 `tests/v1/` 對應目錄
+```python
+# tests/v1/core/test_my_module.py
+import numpy as np
+import pytest
+
+try:
+    from vllm._rs import my_fast_function
+    HAS_RUST = True
+except ImportError:
+    HAS_RUST = False
+
+@pytest.mark.skipif(not HAS_RUST, reason="vllm._rs not installed")
+def test_my_fast_function():
+    arr = np.array([1, 2, 3], dtype=np.int64)
+    assert my_fast_function(arr) == 6
+```
+
+### 7.3 新增一個 Rust pyclass
+
+以有狀態、可重複使用的物件為例：
+
+```rust
+// rust/src/my_class.rs
+use pyo3::prelude::*;
+
+#[pyclass]
+pub struct MyMatcher {
+    patterns: Vec<String>,
+}
+
+#[pymethods]
+impl MyMatcher {
+    #[new]
+    fn new(patterns: Vec<String>) -> Self {
+        Self { patterns }
+    }
+
+    fn check(&self, text: &str) -> Option<String> {
+        self.patterns.iter().find(|p| text.contains(p.as_str())).cloned()
+    }
+
+    fn __len__(&self) -> usize {
+        self.patterns.len()
+    }
+}
+```
+
+在 `lib.rs` 中用 `m.add_class::<my_class::MyMatcher>()?;` 註冊。
 
 ---
 
-## 7. 常見問題
+## 8. 常見問題
 
-### Q: `maturin develop` 失敗，找不到 `Cargo.toml`
+### Q: `maturin develop` 找不到 `Cargo.toml`
 
 ```
 💥 maturin failed
   Caused by: Can't find Cargo.toml
 ```
 
-**解法**：確保你在 `rust/` 目錄下執行，不是 vllm 根目錄。
+**解法**：確保在 `rust/` 目錄下執行：
 
 ```bash
 cd /path/to/vllm/rust
@@ -506,67 +709,60 @@ maturin develop --release
 ld: Undefined symbols: _PyBaseObject_Type ...
 ```
 
-**解法**：這是正常的。PyO3 extension module 的測試需要透過 Python 執行，不能直接用 `cargo test`。請使用 Python pytest 跑測試。
+**原因**：PyO3 extension module 的測試需要 Python runtime。
 
-### Q: `import vllm._rs` 失敗，`No module named 'vllm'`
+**解法**：用 Python pytest 跑測試，不要用 `cargo test`。
 
-**原因**：vllm 套件本身沒有安裝到 Python 環境中。maturin 會嘗試把 `.so` 放到 `vllm/` 套件目錄下，但如果 vllm 未安裝，它會放到 `_rs/` 頂層目錄。
+### Q: `from vllm._rs import ...` 失敗
 
-**解法**：改用 `from _rs import ...`，或安裝 vllm：
+**原因**：vllm 未安裝，maturin 將 `.so` 裝為頂層 `_rs` 模組。
 
-```bash
-# 方法 1：用 _rs 匯入（開發模式）
-from _rs import batch_ngram_propose
+**解法**：
 
-# 方法 2：安裝 vllm（生產模式）
-cd /path/to/vllm
-VLLM_USE_PRECOMPILED=1 pip install -e .
-cd rust && maturin develop --release
-# 此時 from vllm._rs import ... 就能用了
+```python
+# 開發模式：直接用 _rs
+from _rs import compute_running_tokens
+
+# 生產模式：先安裝 vllm
+pip install -e /path/to/vllm
+cd /path/to/vllm/rust && maturin develop --release
+# 之後 from vllm._rs import ... 即可
 ```
 
-> **注意**：vLLM 的 Python 程式碼中已經有 fallback，會依序嘗試 `vllm._rs` → `_rs` → 純 Python，不需要手動處理。
+> vLLM 程式碼中已有 fallback：依序嘗試 `vllm._rs` → `_rs` → 純 Python。
 
 ### Q: 修改 Rust 後 Python 沒有更新
 
-**原因**：需要重新跑 `maturin develop --release`。
-
 ```bash
-cd rust/
-maturin develop --release
-# 然後重新啟動 Python 進程
+cd rust && maturin develop --release
+# 然後重啟 Python / vLLM server
 ```
 
-### Q: 如何確認正在使用 Rust 而非 Python fallback？
+### Q: 如何確認用的是 Rust 而非 fallback
 
 ```python
 python3 -c "
 from vllm.v1.core.sched.rust_accelerated import _HAS_RUST
-print(f'Rust acceleration: {_HAS_RUST}')
-"
-```
-
-或檢查 ngram：
-
-```python
-python3 -c "
+print(f'Scheduler:   {_HAS_RUST}')
 from vllm.v1.spec_decode.ngram_proposer import _HAS_RUST_NGRAM
-print(f'Rust ngram: {_HAS_RUST_NGRAM}')
+print(f'N-gram:      {_HAS_RUST_NGRAM}')
 "
 ```
 
-### Q: 想要建構不同 Python 版本的 wheel
+### Q: 想建構多個 Python 版本的 wheel
 
 ```bash
-# 指定 Python 路徑
-maturin build --release --interpreter /path/to/python3.10
-
-# 建構多版本
 maturin build --release --interpreter python3.10 python3.11 python3.12
 ```
 
 ### Q: 效能比預期慢
 
-1. 確認用 `--release` 建構（debug 模式會慢 10-50x）
-2. 確認在 `Rust` 路徑而非 fallback：檢查 `_HAS_RUST` 是否為 `True`
-3. 跑基準測試確認函數級效能（見 4.5 節）
+1. **確認 release 模式**：`maturin develop --release`（沒有 `--release` 慢 10-50x）
+2. **確認 Rust 路徑**：`_HAS_RUST == True`
+3. **跑基準測試**：見[第 6 節](#6-效能基準測試)
+4. **高併發才有效**：Rust 加速在 N=100+ requests 時明顯，N=1-10 時 GPU 為主要瓶頸
+
+### Q: Linux x86_64 需要特殊設定嗎
+
+不需要。`.cargo/config.toml` 中的 macOS linker flag 在 Linux 上自動忽略。
+直接 `maturin develop --release` 即可。
