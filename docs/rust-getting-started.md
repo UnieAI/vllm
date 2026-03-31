@@ -772,23 +772,25 @@ maturin build --release --interpreter python3.10 python3.11 python3.12
 
 ## 9. TODO — 專案狀態
 
-### 已完成 ✅（13 項）
+### 已完成 ✅（15 項）
 
 | # | 項目 | Rust 檔案 | Python 整合 | 效能 |
 |---|------|----------|-------------|------|
 | 1 | Token 預算計算 | `schedule.rs` | `rust_accelerated.py` | 194x |
-| 2 | 批次 stop 檢查（2D numpy） | `stop_check.rs` | `scheduler.py` | 301x |
-| 3 | Spec decode 接受/拒絕 | `update_output.rs` | `scheduler.py` | 192x |
-| 4 | `schedule()` running 迴圈接入 | `schedule.rs` | `scheduler.py` | Rust 預算 + Python 調整 |
-| 5 | `update_from_output()` batch stop 預計算 | `stop_check.rs` | `scheduler.py` | batch 快速路徑 |
+| 2 | 批次 stop 檢查（2D numpy） | `stop_check.rs` | `scheduler.py` `_batch_precompute_stops()` | 301x |
+| 3 | Spec decode 接受/拒絕 | `update_output.rs` | `scheduler.py` `_batch_precompute_spec_decode()` | 192x |
+| 4 | `schedule()` running 迴圈接入 | `schedule.rs` | `scheduler.py` `_precomputed_running_tokens` | Rust 預算 + Python 調整 |
+| 5 | `"builtin"` hash 算法 | `block_hash.rs` | `config/cache.py` Literal type + `hashing.py` | — |
 | 6 | N-gram KMP 並行 | `ngram.rs` | `ngram_proposer.py` | 2.1x vs Numba |
 | 7 | N-gram Numba 多線程解鎖 | — | `ngram_proposer.py` | 1.8x（改 1 行）|
 | 8 | N-gram set 查找 | — | `ngram_proposer.py` | O(n)→O(1) |
-| 9 | Block hash（xxHash） | `block_hash.rs` | `kv_cache_utils.py` | batch hash |
-| 10 | Free block queue | `block_pool.rs` | `kv_cache_utils.py` | Arena O(1) |
-| 11 | Stop string（Aho-Corasick） | `stop_strings.rs` | `detokenizer.py` | 多模式匹配 |
-| 12 | 模組名 `vllm._rs` | `lib.rs` | 全部 import | fallback chain |
-| 13 | vllm build system 整合 | — | `setup.py` | best-effort auto |
+| 9 | Block hash（xxh3_128） | `block_hash.rs` | `kv_cache_utils.py` `_rs_batch_hash` | 13.7x |
+| 10 | Free block queue | `block_pool.rs` | `kv_cache_utils.py` `_RustQueue` | 6.0x |
+| 11 | Stop string（Aho-Corasick） | `stop_strings.rs` | `detokenizer.py` `_rust_stop_matcher` | 7.3x |
+| 12 | 序列化輔助 | `serial_helpers.rs` | Rust 可用（未接入 Python） | — |
+| 13 | 模組名 `vllm._rs` | `lib.rs` | 全部 import | fallback chain |
+| 14 | vllm build system 整合 | — | `setup.py` `_build_rust_extension()` | best-effort |
+| 15 | `update_from_output()` batch spec decode | `update_output.rs` | `scheduler.py` `_precomputed_spec` | batch 快速路徑 |
 
 ### 未完成（6 項）
 
