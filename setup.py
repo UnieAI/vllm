@@ -345,6 +345,10 @@ class cmake_build_ext(build_ext):
         # First, run the standard build_ext command to compile the extensions
         super().run()
 
+        # Build the optional Rust acceleration module (vllm._rs).
+        # Skipped silently if Rust/maturin are not installed.
+        self._build_rust_extension()
+
         # bundle tcmalloc into CPU wheels for best OOB perf
         if should_bundle_tcmalloc():
             bundle_tcmalloc(self.build_lib)
@@ -378,6 +382,67 @@ class cmake_build_ext(build_ext):
                 "vllm/third_party/triton_kernels",
                 dirs_exist_ok=True,
             )
+
+
+    def _build_rust_extension(self):
+        """Build the vllm._rs Rust extension via maturin (optional).
+
+        The Rust crate lives in ``rust/`` and provides CPU-accelerated
+        scheduler helpers.  Building is best-effort: if Rust or maturin
+        are not installed the build is silently skipped and vLLM falls
+        back to pure-Python implementations at runtime.
+
+        Set ``VLLM_SKIP_RUST=1`` to explicitly skip this step.
+        """
+        if os.environ.get("VLLM_SKIP_RUST", "0") == "1":
+            print("Skipping Rust build (VLLM_SKIP_RUST=1)")
+            return
+
+        rust_dir = os.path.join(ROOT_DIR, "rust")
+        if not os.path.isfile(os.path.join(rust_dir, "Cargo.toml")):
+            print("Skipping Rust build (rust/Cargo.toml not found)")
+            return
+
+        if not which("cargo"):
+            print(
+                "Skipping Rust build (cargo not found). "
+                "Install Rust for ~100x faster scheduling: "
+                "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+            )
+            return
+
+        maturin_path = which("maturin")
+        if not maturin_path:
+            # Try to find maturin in the current Python environment.
+            try:
+                subprocess.check_call(
+                    [sys.executable, "-m", "pip", "install", "maturin"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                maturin_path = "maturin"
+            except subprocess.CalledProcessError:
+                print(
+                    "Skipping Rust build (maturin not available). "
+                    "pip install maturin to enable."
+                )
+                return
+
+        print("Building Rust acceleration module (vllm._rs)...")
+        try:
+            subprocess.check_call(
+                [maturin_path, "develop", "--release"],
+                cwd=rust_dir,
+            )
+            print("Rust acceleration module built successfully.")
+        except subprocess.CalledProcessError as e:
+            print(
+                f"WARNING: Rust build failed (exit code {e.returncode}). "
+                "vLLM will use pure-Python fallbacks. "
+                "Set VLLM_SKIP_RUST=1 to suppress this warning."
+            )
+        except FileNotFoundError:
+            print("Skipping Rust build (maturin command not found).")
 
 
 class precompiled_build_ext(build_ext):
