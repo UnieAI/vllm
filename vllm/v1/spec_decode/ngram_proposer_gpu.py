@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-GPU-accelerated N-gram proposer using fully async PyTorch tensor operations.
+GPU-accelerated N-gram proposer.
 
-This version uses a fully vectorized approach with unfold and argmax for
-finding the first match across all sequences in parallel.
+When the fused CUDA KMP kernel is available (torch.ops._C.ngram_find_and_extract),
+it replaces the PyTorch unfold+argmax approach with a single-pass O(n) kernel.
+Falls back to the vectorized PyTorch implementation otherwise.
 """
 
 import torch
@@ -25,7 +26,11 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 @support_torch_compile()
 class NgramGPUKernel(nn.Module):
-    """GPU-accelerated N-gram proposer using fully async tensor operations."""
+    """GPU-accelerated N-gram proposer.
+
+    Uses the fused CUDA KMP kernel (torch.ops._C.ngram_find_and_extract)
+    when available, falling back to the PyTorch unfold+argmax approach.
+    """
 
     def __init__(
         self, vllm_config: VllmConfig, prefix: str = "", device: torch.device = "cuda"
@@ -42,6 +47,11 @@ class NgramGPUKernel(nn.Module):
         self.max_model_len = vllm_config.model_config.max_model_len
         self.max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         self.device = device
+
+        # Check if fused CUDA KMP kernel is available.
+        self._has_fused_kernel = hasattr(torch.ops, "_C") and hasattr(
+            torch.ops._C, "ngram_find_and_extract"
+        )
 
     def _find_first_and_extract_all_n_parallel(
         self,
@@ -182,6 +192,28 @@ class NgramGPUKernel(nn.Module):
         # Infer batch size to preserve dynamic shape.
         actual_batch_size = token_ids_gpu.shape[0]
 
+        if self._has_fused_kernel:
+            # ── Fused CUDA KMP kernel path ──
+            # Single-pass O(n) per sequence, no temporary tensors.
+            draft_tokens = torch.full(
+                (actual_batch_size, self.k), -1, dtype=torch.int32, device=device
+            )
+            num_valid_draft_tokens = torch.zeros(
+                actual_batch_size, dtype=torch.int32, device=device
+            )
+            torch.ops._C.ngram_find_and_extract(
+                draft_tokens,
+                num_valid_draft_tokens,
+                token_ids_gpu,
+                num_tokens_no_spec,
+                combined_mask,
+                self.min_n,
+                self.max_n,
+                self.k,
+            )
+            return draft_tokens, num_valid_draft_tokens
+
+        # ── PyTorch fallback path (unfold + argmax) ──
         # Allocate in forward so torch.compile can optimize.
         # NOTE(patchy): Do NOT pre-allocate this as a buffer
         #               it breaks torch.compile

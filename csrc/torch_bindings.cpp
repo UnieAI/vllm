@@ -831,4 +831,12 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
 #endif
 }
 
+  // N-gram speculative decoding kernel (fused KMP).
+  ops.def(
+      "ngram_find_and_extract(Tensor! draft_tokens, Tensor! num_valid_drafts, "
+      "Tensor token_ids, Tensor seq_lengths, Tensor valid_mask, "
+      "int min_ngram_len, int max_ngram_len, int num_draft_tokens) -> ()");
+  ops.impl("ngram_find_and_extract", torch::kCUDA, &ngram_find_and_extract);
+}
+
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

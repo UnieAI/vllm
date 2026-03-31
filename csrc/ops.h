@@ -388,6 +388,17 @@ void qr_all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,
 int64_t qr_max_size();
 #endif
 
+// N-gram speculative decoding (fused KMP kernel).
+void ngram_find_and_extract(
+    torch::Tensor& draft_tokens,
+    torch::Tensor& num_valid_drafts,
+    const torch::Tensor& token_ids,
+    const torch::Tensor& seq_lengths,
+    const torch::Tensor& valid_mask,
+    int64_t min_ngram_len,
+    int64_t max_ngram_len,
+    int64_t num_draft_tokens);
+
 #ifndef USE_ROCM
 void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a,
                        torch::Tensor const& mat_b);

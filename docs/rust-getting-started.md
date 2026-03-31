@@ -165,17 +165,17 @@ except ImportError:
 
 ## 4. TODO Roadmap
 
-### 已完成 ✅（15 項）
+### 已完成 ✅（17 項）
 
-| # | 項目 | Rust 檔案 | Python 整合 | 效能 |
-|---|------|----------|-------------|------|
+| # | 項目 | 檔案 | 整合位置 | 效能 |
+|---|------|------|---------|------|
 | 1 | Token 預算計算 | `schedule.rs` | `rust_accelerated.py` | 194x |
 | 2 | 批次 stop 檢查（2D numpy） | `stop_check.rs` | `scheduler.py` | 301x |
 | 3 | Spec decode 接受/拒絕 | `update_output.rs` | `scheduler.py` | 192x |
 | 4 | `schedule()` running 迴圈接入 | `schedule.rs` | `scheduler.py` | Rust 預算 + Python 調整 |
 | 5 | `update_from_output()` batch spec decode | `update_output.rs` | `scheduler.py` | batch 快速路徑 |
 | 6 | `"builtin"` hash 算法 | `block_hash.rs` | `config/cache.py` + `hashing.py` | — |
-| 7 | N-gram KMP 並行 | `ngram.rs` | `ngram_proposer.py` | 2.1x vs Numba |
+| 7 | N-gram KMP 並行（CPU） | `ngram.rs` | `ngram_proposer.py` | 2.1x vs Numba |
 | 8 | N-gram Numba 多線程解鎖 | — | `ngram_proposer.py` | 1.8x |
 | 9 | N-gram set 查找 | — | `ngram_proposer.py` | O(n)→O(1) |
 | 10 | Block hash（xxh3_128） | `block_hash.rs` | `kv_cache_utils.py` | 13.7x |
@@ -184,22 +184,22 @@ except ImportError:
 | 13 | 模組名 `vllm._rs` | `lib.rs` | 全部 import | fallback chain |
 | 14 | vllm build system 整合 | — | `setup.py` | best-effort auto |
 | 15 | 序列化輔助 | `serial_helpers.rs` | Rust 可用 | — |
+| 16 | CUDA n-gram kernel（GPU） | `csrc/ngram_kernels.cu` | `ngram_proposer_gpu.py` | Fused KMP O(n)，需 GPU 驗證 |
+| 17 | CI 自動建構 | `.github/workflows/rust-ci.yml` | GitHub Actions | cargo check + pytest + 效能回歸 |
 
 ### 不做（已驗證不值得）
 
 | 項目 | 原因 |
 |------|------|
-| `serial_helpers.rs` Python 端接入 | Profile 結果：numpy `tobytes()` 比 Rust 快 3x（numpy 直接回傳 buffer pointer，零拷貝；Rust 需逐元素 `to_le_bytes` + 分配 PyBytes）。Rust 函數保留在 crate 中但不接入 Python。 |
+| `serial_helpers.rs` Python 端接入 | numpy `tobytes()` 比 Rust 快 3x（零拷貝 vs 逐元素複製）。Rust 函數保留但不接入。 |
 
-### 未完成（5 項）
+### 未完成（3 項）
 
 | 優先級 | 項目 | 說明 | 難度 |
 |--------|------|------|------|
-| **P2** | CUDA n-gram kernel | GPU 版用 `unfold` O(n×m)；fused CUDA KMP 可快 2-5x | 高 |
 | **P2** | Rust SoA request metadata 鏡像 | Rust 側維護 running requests SoA，避免每步 Python→numpy 收集開銷 | 高 |
 | **P3** | Lock-free IPC queue | Rust SPSC ring buffer 替換 `queue.Queue` | 高 |
 | **P3** | Shared memory IPC | mmap ring buffer 替換 ZMQ | 高 |
-| **P3** | CI 自動建構 | GitHub Actions + 效能回歸 | 低 |
 
 ### 驗證待辦
 

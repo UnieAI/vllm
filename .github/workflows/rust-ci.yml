@@ -1,0 +1,94 @@
+name: Rust CI
+
+on:
+  push:
+    paths:
+      - 'rust/**'
+      - 'tests/v1/core/test_rust_scheduler.py'
+      - 'tests/v1/spec_decode/test_ngram_rust.py'
+  pull_request:
+    paths:
+      - 'rust/**'
+      - 'tests/v1/core/test_rust_scheduler.py'
+      - 'tests/v1/spec_decode/test_ngram_rust.py'
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.12']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            rust/target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: rust-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-
+
+      - name: Install maturin and numpy
+        run: pip install maturin numpy
+
+      - name: Cargo check
+        working-directory: rust
+        run: cargo check
+
+      - name: Build Rust extension
+        working-directory: rust
+        run: maturin develop --release
+
+      - name: Install test dependencies
+        run: pip install pytest numba
+
+      - name: Run Rust scheduler tests
+        run: |
+          cp tests/v1/core/test_rust_scheduler.py /tmp/
+          cd /tmp && python -m pytest test_rust_scheduler.py -v
+
+      - name: Run Rust n-gram tests
+        run: |
+          cp tests/v1/spec_decode/test_ngram_rust.py /tmp/
+          cd /tmp && python -m pytest test_ngram_rust.py -v
+
+      - name: Performance regression check
+        run: |
+          python -c "
+          import time, numpy as np
+          from _rs import compute_running_tokens, batch_check_stop
+
+          N = 1000
+          rng = np.random.default_rng(42)
+          spec = rng.integers(100, 4096, size=N, dtype=np.int64)
+          ph = np.zeros(N, dtype=np.int64)
+          comp = spec - rng.integers(1, 50, size=N, dtype=np.int64)
+          prompt = rng.integers(50, 2000, size=N, dtype=np.int64)
+          maxt = np.full(N, 1024, dtype=np.int64)
+
+          # Warmup
+          for _ in range(100):
+              compute_running_tokens(spec, ph, comp, prompt, maxt, 100000, 0, 4096)
+
+          iters = 2000
+          t0 = time.perf_counter()
+          for _ in range(iters):
+              compute_running_tokens(spec, ph, comp, prompt, maxt, 100000, 0, 4096)
+          elapsed = (time.perf_counter() - t0) / iters
+
+          print(f'compute_running_tokens: {elapsed*1e6:.1f} us')
+          assert elapsed < 0.0005, f'Performance regression: {elapsed*1e6:.1f} us > 500 us'
+          print('Performance OK')
+          "
