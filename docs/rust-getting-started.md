@@ -787,15 +787,17 @@ maturin build --release --interpreter python3.10 python3.11 python3.12
 | Stop string 匹配 | `stop_strings.rs` | `detokenizer.py` | Aho-Corasick 多模式匹配 |
 | 序列化輔助 | `serial_helpers.rs` | （Rust 已實作） | int32 array 編碼 |
 | 模組名遷移 | `lib.rs` + `pyproject.toml` | 全部 import | `vllm._rs` + `_rs` fallback |
+| `schedule()` running 迴圈接入 | `schedule.rs` | `scheduler.py` `schedule()` | Rust 預算 + Python 調整 |
+| vllm build system 整合 | — | `setup.py` | best-effort auto-build |
 
 ### 未完成
 
 | 優先級 | 項目 | 說明 | 難度 |
 |--------|------|------|------|
 | ~~P0~~ | ~~`"builtin"` 加入 `PrefixCachingHashAlgo`~~ | ✅ 已加入 `config/cache.py` Literal type + docstring | — |
-| **P1** | `schedule()` running 迴圈完整接入 | `compute_running_tokens` 已可用，但排程迴圈中穿插了 KV cache allocation、encoder scheduling、preemption，需拆解 budget 回收邏輯後才能用 Rust 結果驅動迴圈 | 中 |
+| ~~P1~~ | ~~`schedule()` running 迴圈完整接入~~ | ✅ Rust 預計算結果作為初始值，encoder/mamba/preemption 仍在 Python 調整，re-clamp budget | — |
 | ~~P1~~ | ~~`batch_apply_spec_decode` 接入 `update_from_output()`~~ | ✅ 已整合 `_batch_precompute_spec_decode()` + 迴圈內 `_precomputed_spec` 快速路徑 | — |
-| **P1** | vllm build system 整合 | 將 `maturin build` 嵌入 vllm 的 `pyproject.toml`，讓 `pip install vllm` 自動編譯 Rust 模組（或作為 optional dependency） | 中 |
+| ~~P1~~ | ~~vllm build system 整合~~ | ✅ `setup.py` `_build_rust_extension()` — best-effort：有 cargo 就編，沒有就跳過，`VLLM_SKIP_RUST=1` 可強制跳過 | — |
 | **P1** | `serial_helpers.rs` Python 端接入 | Rust 函數已寫好，尚未接入 `serial_utils.py` 的 `MsgpackEncoder.enc_hook()` tensor 編碼路徑。注意：numpy `tobytes()` 已是 C 最佳化，Rust 可能無額外收益，需先 profile 確認瓶頸 | 低 |
 | **P2** | CUDA n-gram kernel | GPU 版 n-gram 用 PyTorch `unfold` 做 O(n×m) 暴力匹配 + Python `for` 遍歷 ngram 長度；寫 fused CUDA kernel 做 O(n) KMP 可快 2-5x | 高 |
 | **P2** | Rust SoA request metadata 鏡像 | 在 Rust 側維護 running requests 的 struct-of-arrays 鏡像（num_computed_tokens 等），避免每步從 Python 物件收集到 numpy 的開銷 | 高 |
