@@ -161,6 +161,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
+from vllm.v1.spec_decode.self_draft import SelfDraftProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
@@ -518,8 +519,15 @@ class GPUModelRunner(
                 | DraftModelProposer
                 | MedusaProposer
                 | ExtractHiddenStatesProposer
+                | SelfDraftProposer
             )
-            if self.speculative_config.method == "ngram":
+            if self.speculative_config.method == "self_draft":
+                # Deferred init: SelfDraftProposer needs the loaded
+                # target model, which isn't available until load_model().
+                # Set to None and initialize in load_model().
+                self.drafter = None  # type: ignore[assignment]
+                self._self_draft_pending = True
+            elif self.speculative_config.method == "ngram":
                 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
                 self.drafter = NgramProposer(self.vllm_config)
@@ -4516,7 +4524,24 @@ class GPUModelRunner(
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
         assert spec_config is not None
-        if spec_config.method == "ngram":
+        if spec_config.method == "self_draft":
+            assert isinstance(self.drafter, SelfDraftProposer)
+            assert isinstance(sampled_token_ids, list)
+            # Build input_ids and positions from the last accepted tokens.
+            batch_size = self.input_batch.num_reqs
+            input_ids = torch.tensor(
+                [ids[-1] if ids else 0 for ids in sampled_token_ids[:batch_size]],
+                dtype=torch.int32,
+                device=self.device,
+            )
+            positions = torch.tensor(
+                self.input_batch.num_tokens_no_spec[:batch_size],
+                dtype=torch.long,
+                device=self.device,
+            )
+            draft_token_ids = self.drafter.propose(input_ids, positions)
+
+        elif spec_config.method == "ngram":
             from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
             assert isinstance(sampled_token_ids, list)
@@ -4781,7 +4806,17 @@ class GPUModelRunner(
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
                     )
-                if hasattr(self, "drafter"):
+                if getattr(self, "_self_draft_pending", False):
+                    # Deferred init: now we have the loaded target model.
+                    self.drafter = SelfDraftProposer(
+                        target_model=self.model,
+                        draft_depth=self.speculative_config.self_draft_depth,
+                        k=self.speculative_config.num_speculative_tokens,
+                        device=self.device,
+                        vllm_config=self.vllm_config,
+                    )
+                    self._self_draft_pending = False
+                elif hasattr(self, "drafter"):
                     logger.info_once("Loading drafter model...")
                     self.drafter.load_model(self.model)
                     if (

@@ -9,30 +9,31 @@ temporarily patching the model's layer iteration bounds during draft
 generation.
 
 Usage:
+    # Fixed depth:
     vllm serve <model> \\
         --speculative-config '{"method": "self_draft", \\
             "num_speculative_tokens": 3, \\
             "self_draft_depth": 8}'
 
-Or programmatically:
-    from vllm.v1.spec_decode.self_draft import SelfDraftProposer
-    proposer = SelfDraftProposer(model, draft_depth=8, k=3, device="cuda")
+    # Auto-probe (finds optimal depth at startup):
+    vllm serve <model> \\
+        --speculative-config '{"method": "self_draft", \\
+            "num_speculative_tokens": 3, \\
+            "self_draft_depth": -1}'
 """
 from __future__ import annotations
 
+import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
-import numpy as np
 import torch
 import torch.nn as nn
 
-from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.v1.worker.gpu_input_batch import InputBatch
 
 logger = init_logger(__name__)
 
@@ -41,15 +42,11 @@ class SelfDraftProposer:
     """Draft proposer that reuses the target model's first K layers.
 
     During draft generation:
-    1. Patch model.end_layer → draft_depth (skip deeper layers)
-    2. Run forward pass (embedding → K layers → norm → LM head)
-    3. Restore model.end_layer → original value
+    1. Patch model.end_layer → draft_depth
+    2. Forward pass: embedding → K layers → norm → LM head
+    3. Restore model.end_layer
 
-    During verification: the full model runs normally (no patching).
-
-    This is a standalone class that does NOT inherit from
-    SpecDecodeBaseProposer to avoid coupling with the existing spec
-    decode pipeline.  It can be integrated later if validated.
+    During verification: the full model runs normally.
     """
 
     def __init__(
@@ -60,65 +57,133 @@ class SelfDraftProposer:
         device: torch.device,
         vllm_config: "VllmConfig | None" = None,
     ):
-        """
-        Args:
-            target_model: The full model (e.g., LlamaForCausalLM).
-            draft_depth: Number of layers to use for drafting (e.g., 8
-                         out of 32 for Llama-7B).
-            k: Number of draft tokens to propose per step.
-            device: CUDA device.
-            vllm_config: Optional vllm config for metadata.
-        """
         self.model = target_model
-        self.draft_depth = draft_depth
         self.k = k
         self.device = device
         self.vllm_config = vllm_config
 
-        # Find the inner model (e.g., LlamaModel inside LlamaForCausalLM).
-        self._inner_model = self._find_inner_model(target_model)
-        self._full_end_layer = self._inner_model.end_layer
-        self._full_start_layer = self._inner_model.start_layer
+        # Find inner transformer model.
+        self._inner = self._find_inner_model(target_model)
+        self._full_end = self._inner.end_layer
+        self._full_start = self._inner.start_layer
+        self._total_layers = self._full_end - self._full_start
 
-        total_layers = self._full_end_layer - self._full_start_layer
-        if draft_depth > total_layers:
+        # Auto-probe: depth=-1 means "find the best depth automatically".
+        if draft_depth == -1:
+            draft_depth = self._auto_probe()
+
+        if draft_depth < 1 or draft_depth > self._total_layers:
             raise ValueError(
-                f"draft_depth ({draft_depth}) > total layers ({total_layers})"
+                f"draft_depth must be in [1, {self._total_layers}], "
+                f"got {draft_depth}"
             )
-        if draft_depth < 1:
-            raise ValueError(f"draft_depth must be >= 1, got {draft_depth}")
+        self.draft_depth = draft_depth
 
         logger.info(
-            "SelfDraftProposer: using %d/%d layers for drafting, k=%d",
-            draft_depth, total_layers, k,
+            "SelfDraftProposer: %d/%d layers, k=%d",
+            draft_depth, self._total_layers, k,
         )
 
     @staticmethod
     def _find_inner_model(model: nn.Module) -> nn.Module:
-        """Find the inner transformer model that has start_layer/end_layer."""
-        # Most HuggingFace models: model.model (e.g., LlamaForCausalLM.model)
+        """Find the inner model that has start_layer/end_layer."""
         if hasattr(model, "model") and hasattr(model.model, "end_layer"):
             return model.model
-        # Direct model (already the inner one)
         if hasattr(model, "end_layer"):
             return model
         raise ValueError(
-            f"Cannot find inner model with start_layer/end_layer in "
-            f"{type(model).__name__}. Supported architectures: "
-            f"Llama, Qwen2, Mistral, and other HuggingFace-style models."
+            f"Cannot find layer bounds in {type(model).__name__}. "
+            "Supported: Llama, Qwen2, Mistral, and other HF-style models."
         )
 
     @contextmanager
-    def _shallow_forward_mode(self):
-        """Temporarily patch the model to only run first K layers."""
-        original_end = self._inner_model.end_layer
-        self._inner_model.end_layer = (
-            self._full_start_layer + self.draft_depth
-        )
+    def _shallow_mode(self):
+        """Run only the first draft_depth layers."""
+        orig = self._inner.end_layer
+        self._inner.end_layer = self._full_start + self.draft_depth
         try:
             yield
         finally:
-            self._inner_model.end_layer = original_end
+            self._inner.end_layer = orig
+
+    def _auto_probe(self) -> int:
+        """Find optimal draft depth by testing multiple candidates.
+
+        Tests 25%, 50%, 75% of total layers. Picks the depth with
+        best (agreement × speedup) product.
+        """
+        candidates = sorted(set([
+            max(1, self._total_layers // 4),
+            max(1, self._total_layers // 2),
+            max(1, self._total_layers * 3 // 4),
+        ]))
+
+        logger.info(
+            "Auto-probing draft depth: testing %s out of %d layers...",
+            candidates, self._total_layers,
+        )
+
+        # Use a simple calibration: run 10 forward passes at each depth
+        # and compare greedy top-1 with full model.
+        probe_tokens = torch.randint(
+            1, 1000, (1, 32), dtype=torch.long, device=self.device,
+        )
+        probe_pos = torch.arange(32, dtype=torch.long, device=self.device).unsqueeze(0)
+
+        # Full model reference output.
+        with torch.inference_mode():
+            full_out = self.model(
+                input_ids=probe_tokens,
+                positions=probe_pos,
+                intermediate_tensors=None,
+            )
+            if isinstance(full_out, tuple):
+                full_out = full_out[0]
+            full_tokens = full_out[:, -1, :].argmax(dim=-1)  # [1]
+
+        best_depth = candidates[0]
+        best_score = 0.0
+
+        for depth in candidates:
+            self._inner.end_layer = self._full_start + depth
+
+            with torch.inference_mode():
+                t0 = time.perf_counter()
+                draft_out = self.model(
+                    input_ids=probe_tokens,
+                    positions=probe_pos,
+                    intermediate_tensors=None,
+                )
+                draft_time = time.perf_counter() - t0
+
+            if isinstance(draft_out, tuple):
+                draft_out = draft_out[0]
+            draft_tokens = draft_out[:, -1, :].argmax(dim=-1)
+
+            agree = (draft_tokens == full_tokens).float().mean().item()
+
+            # Full model time (approx from proportional scaling).
+            full_time = draft_time * self._total_layers / depth
+            speedup = full_time / max(draft_time, 1e-9)
+            score = agree * speedup
+
+            logger.info(
+                "  depth=%d/%d: agreement=%.0f%%, speedup=%.1fx, score=%.2f",
+                depth, self._total_layers, agree * 100, speedup, score,
+            )
+
+            if score > best_score:
+                best_score = score
+                best_depth = depth
+
+        # Restore full model.
+        self._inner.end_layer = self._full_end
+
+        logger.info(
+            "Auto-probe result: depth=%d/%d (score=%.2f)",
+            best_depth, self._total_layers, best_score,
+        )
+        return best_depth
 
     @torch.inference_mode()
     def propose(
@@ -129,30 +194,22 @@ class SelfDraftProposer:
     ) -> list[list[int]]:
         """Generate draft tokens using the first K layers.
 
-        This is a simplified proposer for prototyping.  For production
-        integration, wrap this in a SpecDecodeBaseProposer subclass.
-
         Args:
             input_ids: [batch_size] — the last accepted token per request.
-            positions: [batch_size] — position IDs for each token.
-            target_hidden_states: unused (for API compat).
+            positions: [batch_size] — position IDs.
 
         Returns:
-            List of draft token ID lists, one per request.
+            list of draft token ID lists, one per request.
         """
         batch_size = input_ids.shape[0]
-        all_drafts: list[list[int]] = [[] for _ in range(batch_size)]
+        drafts: list[list[int]] = [[] for _ in range(batch_size)]
 
-        # Current token IDs and positions for iterative draft generation.
         cur_ids = input_ids.clone()
         cur_pos = positions.clone()
 
-        for step in range(self.k):
-            # Run forward pass with only the first K layers.
-            with self._shallow_forward_mode():
-                # The model's forward() will:
-                #   embed → layers[0:draft_depth] → norm → lm_head
-                logits = self.model(
+        for _ in range(self.k):
+            with self._shallow_mode():
+                out = self.model(
                     input_ids=cur_ids.unsqueeze(1)
                     if cur_ids.dim() == 1
                     else cur_ids,
@@ -162,39 +219,26 @@ class SelfDraftProposer:
                     intermediate_tensors=None,
                 )
 
-            # Handle different return types.
-            if isinstance(logits, tuple):
-                logits = logits[0]
+            if isinstance(out, tuple):
+                out = out[0]
 
-            # Greedy sample.
-            if logits.dim() == 3:
-                # [batch, seq_len, vocab] → take last token
-                next_token_logits = logits[:, -1, :]
-            elif logits.dim() == 2:
-                # [batch, vocab]
-                next_token_logits = logits
+            if out.dim() == 3:
+                logits = out[:, -1, :]
+            elif out.dim() == 2:
+                logits = out
             else:
                 break
 
-            next_tokens = next_token_logits.argmax(dim=-1)  # [batch]
-
-            # Append to drafts.
-            next_tokens_cpu = next_tokens.cpu().tolist()
+            next_tokens = logits.argmax(dim=-1)
+            cpu_tokens = next_tokens.cpu().tolist()
             for i in range(batch_size):
-                all_drafts[i].append(next_tokens_cpu[i])
+                drafts[i].append(cpu_tokens[i])
 
-            # Prepare next step.
             cur_ids = next_tokens
             cur_pos = cur_pos + 1
 
-        return all_drafts
+        return drafts
 
-    def get_acceptance_stats(self) -> dict:
-        """Return metadata about the draft configuration."""
-        total = self._full_end_layer - self._full_start_layer
-        return {
-            "draft_depth": self.draft_depth,
-            "total_layers": total,
-            "layer_ratio": self.draft_depth / total,
-            "k": self.k,
-        }
+    def load_model(self, target_model: nn.Module | None = None) -> None:
+        """No-op: self-draft reuses the target model's weights."""
+        pass

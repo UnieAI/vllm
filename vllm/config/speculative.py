@@ -55,6 +55,7 @@ SpeculativeMethod = Literal[
     "medusa",
     "mlp_speculator",
     "draft_model",
+    "self_draft",
     "suffix",
     EagleModelTypes,
     NgramGPUTypes,
@@ -151,6 +152,13 @@ class SpeculativeConfig:
     speculative_token_tree: str | None = None
     """Specifies the tree structure for speculative token generation.
     """
+    # Self-speculative decoding (layer-skip draft)
+    self_draft_depth: int | None = Field(default=None, ge=1)
+    """Number of transformer layers to use as draft model in self-speculative
+    decoding.  For example, self_draft_depth=8 on a 32-layer model uses the
+    first 8 layers + LM head for drafting.  Requires method='self_draft'.
+    Use tools/probe_draft_layers.py to find the optimal depth."""
+
     parallel_drafting: bool = False
     """Enable parallel drafting, where all speculative tokens are generated
     in parallel rather than sequentially. This can improve performance but
@@ -401,6 +409,8 @@ class SpeculativeConfig:
                 self.model = "ngram"
             elif self.method == "ngram_gpu":
                 self.model = "ngram_gpu"
+            elif self.method == "self_draft":
+                self.model = "self_draft"
             elif self.method == "suffix":
                 self.model = "suffix"
             elif self.method == "extract_hidden_states":
@@ -446,6 +456,15 @@ class SpeculativeConfig:
             # TODO: current we still need extract vocab_size from target model
             # config, in future, we may try refactor it out, and set
             # draft related config as None here.
+            self.draft_model_config = self.target_model_config
+            self.draft_parallel_config = self.target_parallel_config
+        elif self.method == "self_draft":
+            if self.self_draft_depth is None:
+                raise ValueError(
+                    "self_draft_depth is required when method='self_draft'. "
+                    "Use tools/probe_draft_layers.py to find the optimal value."
+                )
+            # Self-draft reuses the target model — same config.
             self.draft_model_config = self.target_model_config
             self.draft_parallel_config = self.target_parallel_config
         elif self.method == "suffix":
