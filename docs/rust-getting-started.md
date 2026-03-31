@@ -208,52 +208,78 @@ except ImportError:
 - [ ] `py-spy` profile 確認 CPU 熱點轉移
 - [ ] `block_hash` / `RustFreeBlockQueue` / `StopStringMatcher` 整合測試
 
-### 4.3 Draft 品質優化（大模型吞吐量的關鍵）
+### 4.3 Draft 品質優化（D1-D5，已完成）
 
-大模型（70B+）的 GPU forward 佔 25-50ms，CPU 加速只省 ~8%。真正提升大模型吞吐量的方向是 **speculative decoding 的 draft 品質**——每步 GPU forward 時間固定，但如果 draft 接受率從 60% → 80%，等效吞吐量提升 ~33%。
+大模型（70B+）的 GPU forward 佔 25-50ms，CPU 加速只省 ~8%。D1-D5 嘗試從 **speculative decoding 的 draft 控制** 層面提升吞吐量。
 
-#### 現有 N-gram 演算法的限制
+#### N-gram 的適用場景
 
-| 限制 | 說明 | 影響 |
-|------|------|------|
-| **純語法匹配** | KMP 只匹配 token 序列，不理解語義 | "The dog ran" vs "A canine sprinted" → 無法匹配 |
-| **單一匹配** | 只回傳最長 match（一條路徑） | 無法生成多樣化 draft candidates |
-| **末尾匹配** | 只搜尋序列末尾的 n-gram | 錯過前面出現過的重複模式 |
-| **固定 n-gram 範圍** | `[min_n, max_n]` 靜態配置 | 重複性文本（code）適合大 n，多樣文本適合小 n |
-| **無回饋機制** | Draft 品質沒有回饋給 proposer | 持續提出低品質 draft，浪費 GPU 驗證時間 |
-| **二元 DSC 開關** | 高負載時完全關閉 n-gram speculation | 應該漸進降級（減少 k）而非全關 |
+N-gram speculative decoding **不是所有場景都有效**。接受率取決於輸出是否重複 context 中的 token 模式：
 
-#### 優化方向（按可行性排序）
+| 場景 | 預估接受率 | 原因 |
+|------|-----------|------|
+| Code generation | 50-70% | 大量重複模式（boilerplate, imports） |
+| RAG + 長 context | 40-60% | 回答常引用 context 原文 |
+| 長文件 summarization | 40-60% | 輸出重複原文片段 |
+| 翻譯 | 20-40% | 部分術語/格式重複 |
+| Multi-turn chat（短回覆）| 10-30% | 回覆多樣，很少重複 |
+| Creative writing | 5-15% | 幾乎不重複 |
 
-**可在目前架構內做的（不改模型）：**
+#### D1-D5 做了什麼
 
-| # | 方向 | 做法 | 預期效果 | 難度 |
-|---|------|------|---------|------|
-| D1 | **Adaptive k** | 根據每個 request 的歷史接受率動態調整 k。高接受率 → 增加 k，低接受率 → 減少 k 或跳過 | 減少無效 GPU 驗證，提升吞吐量 5-15% | 低 |
-| D2 | **Frequency-weighted match** | 對多個 n-gram match 候選，選最高頻出現的而非最長的。高頻模式更可能被接受 | 提升接受率 5-10% | 低 |
-| D3 | **Gradual DSC** | 將 DSC 從 binary（全開/全關）改為 `k = max(1, base_k * (1 - load_ratio))`，高負載時減少 draft 數量但不完全關閉 | 高負載下仍保留部分 spec decode 收益 | 低 |
-| D4 | **Multi-match candidates** | 回傳 top-N 個 n-gram match（而非只回傳最長），用簡單啟發式選分數最高的 | 增加匹配多樣性，提升接受率 | 中 |
-| D5 | **Position-aware draft decay** | 位置越後的 draft token 越不可能被接受。根據歷史 per-position 接受率，動態決定每個位置是否值得 draft | 減少尾部無效 draft，節省 GPU 驗證時間 | 中 |
-
-**需要額外模型/資源的（長期方向）：**
-
-| # | 方向 | 做法 | 預期效果 | 難度 |
-|---|------|------|---------|------|
-| D6 | **Token embedding 相似度匹配** | 用 embedding cosine similarity 擴展 n-gram 搜尋範圍，匹配語義近似的 token 序列 | 大幅提升非重複性文本的接受率 | 高 |
-| D7 | **Lightweight draft model** | 用小模型（如 EAGLE head）生成 draft token，而非純 n-gram 匹配 | 接受率 70-90%（vs n-gram 40-60%） | 高 |
-| D8 | **Tree-based speculation** | 同時 draft 多條分支（樹狀），一次 GPU forward 驗證多條路徑 | 等效吞吐量 2-3x | 很高 |
-
-#### 建議路線
+D1-D5 **不提升接受率本身**，而是**減少無效 GPU 驗證時間**：
 
 ```
-D1 (adaptive k) → D3 (gradual DSC) → D5 (position decay) → D2 (freq match)
-       低難度              低難度             中難度              低難度
+沒有 D1-D5：
+  k=5, 接受率 20% → 每步驗證 5 tokens，只接受 1 token
+  浪費 = 4 tokens 的 GPU 驗證時間（~80% 白跑）
+
+有 D1-D5：
+  D1 偵測接受率 20% → k 自動降至 1
+  每步只驗證 1 token，接受 1 token → 0 浪費
+  等效：對低接受率 request 關閉 spec decode（正確決策）
 ```
 
-D1-D3 可以在 1-2 週內完成，且完全不改動 Rust 或 CUDA code，只修改 Python 端的 `ngram_proposer.py` 和 `scheduler.py`。
+| # | 優化 | 觸發條件 | 機制 |
+|---|------|---------|------|
+| **D1** Adaptive k | 接受率 < 40% | `_adaptive_k()`: k 按 `rate/0.4` 比例縮減 |
+| **D2** Low-confidence filter | 接受率 < 20% 且 50+ tokens | `_is_low_confidence_draft()`: draft 減半 |
+| **D3** Gradual DSC | enable~disable 閾值之間 | `_get_effective_spec_k()`: k 線性插值，取代 binary 開關 |
+| **D4** Relaxed retry | min_n > 1 且 0 draft | `_run_propose_backend()`: 以 min_n=1 重試 |
+| **D5** Position decay | 位置 N 接受率 < 15% | `_position_decay_k()`: 截斷至位置 N |
+
+#### 預估效果（誠實評估）
+
+| 優化 | 預估吞吐量改善 | 信心度 | 條件 |
+|------|---------------|--------|------|
+| D1 Adaptive k | +3-8% | 中 | 混合 workload（有高有低接受率） |
+| D2 Low-confidence | +1-3% | 低 | 只影響持續低接受率的 request |
+| D3 Gradual DSC | +2-5% | 中 | 只在 DSC 啟用 + 中等負載時有效 |
+| D4 Relaxed retry | +1-3% | 低 | 只在 min_n > 1 且嚴格設定時有效 |
+| D5 Position decay | +2-5% | 中 | 幾乎所有場景尾部位置都衰減 |
+| **D1-D5 合計** | **+5-15%** | **低-中** | **高度依賴 workload** |
+
+> **重要聲明**：以上數字全部是推算，**沒有 GPU 實測數據**。
+>
+> D1-D5 的效果高度依賴：
+> - 具體 workload（code vs chat vs RAG）
+> - 原始接受率分佈（如果所有 request 接受率都很高，D1-D5 幾乎無效）
+> - k 的原始設定（k=3 vs k=7 差異大）
+> - 模型大小（小模型 GPU 快，spec decode 開銷佔比更大）
+>
+> **最誠實的結論**：在 chat workload + 大模型場景下，D1-D5 可能只帶來 **0-5%** 的吞吐量改善。
+> 真正要大幅提升大模型吞吐量，需要 **EAGLE/Medusa 等 learned draft model**（接受率 70-90%）。
+
+#### N-gram 以外的方向（未實作）
+
+| # | 方向 | 預期效果 | 難度 |
+|---|------|---------|------|
+| D6 | Token embedding 相似度匹配 | 提升非重複文本接受率 | 高 |
+| D7 | Lightweight draft model (EAGLE) | 接受率 70-90% | 高 |
+| D8 | Tree-based speculation | 等效吞吐量 2-3x | 很高 |
 
 ### Next Step
 
-1. **D1 Adaptive k**：在 `ngram_proposer.py` 加入 per-request 接受率追蹤，動態調整 draft 數量
-2. **驗證**：Linux GPU 機器跑 `benchmark_serving.py` A/B 對比
-3. **D3 Gradual DSC**：將 binary DSC 開關改為漸進式降級
+1. **驗證**：Linux GPU 機器跑 `benchmark_serving.py` A/B 對比，用不同 workload（code / chat / RAG）驗證 D1-D5 實際效果
+2. **根據驗證結果調參**：D1 的 0.4 閾值、D5 的 0.15 閾值可能需要根據實測調整
+3. **如果 D1-D5 效果不顯著**：考慮移除以減少代碼複雜度，專注 EAGLE 整合
