@@ -792,9 +792,9 @@ maturin build --release --interpreter python3.10 python3.11 python3.12
 
 | 優先級 | 項目 | 說明 | 難度 |
 |--------|------|------|------|
-| **P0** | `"builtin"` 加入 `PrefixCachingHashAlgo` | `config/cache.py` 的 `Literal` 型別未包含 `"builtin"`，CLI `--prefix-caching-hash-algo builtin` 會被 argparse 拒絕。需加入 type 定義 + 測試 | 低 |
+| ~~P0~~ | ~~`"builtin"` 加入 `PrefixCachingHashAlgo`~~ | ✅ 已加入 `config/cache.py` Literal type + docstring | — |
 | **P1** | `schedule()` running 迴圈完整接入 | `compute_running_tokens` 已可用，但排程迴圈中穿插了 KV cache allocation、encoder scheduling、preemption，需拆解 budget 回收邏輯後才能用 Rust 結果驅動迴圈 | 中 |
-| **P1** | `batch_apply_spec_decode` 接入 `update_from_output()` | `batch_apply_generated_tokens` Rust 函數已就緒（192x），但 `update_from_output()` 的 spec decode 調整段仍逐 request 處理。可用 batch precompute 模式（類似 batch stop check）在迴圈前批次計算 | 中 |
+| ~~P1~~ | ~~`batch_apply_spec_decode` 接入 `update_from_output()`~~ | ✅ 已整合 `_batch_precompute_spec_decode()` + 迴圈內 `_precomputed_spec` 快速路徑 | — |
 | **P1** | vllm build system 整合 | 將 `maturin build` 嵌入 vllm 的 `pyproject.toml`，讓 `pip install vllm` 自動編譯 Rust 模組（或作為 optional dependency） | 中 |
 | **P1** | `serial_helpers.rs` Python 端接入 | Rust 函數已寫好，尚未接入 `serial_utils.py` 的 `MsgpackEncoder.enc_hook()` tensor 編碼路徑。注意：numpy `tobytes()` 已是 C 最佳化，Rust 可能無額外收益，需先 profile 確認瓶頸 | 低 |
 | **P2** | CUDA n-gram kernel | GPU 版 n-gram 用 PyTorch `unfold` 做 O(n×m) 暴力匹配 + Python `for` 遍歷 ngram 長度；寫 fused CUDA kernel 做 O(n) KMP 可快 2-5x | 高 |

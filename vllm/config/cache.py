@@ -23,7 +23,8 @@ CacheDType = Literal[
 ]
 MambaDType = Literal["auto", "float32", "float16"]
 MambaCacheMode = Literal["all", "align", "none"]
-PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
+PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor",
+                               "builtin"]
 KVOffloadingBackend = Literal["native", "lmcache"]
 
 
@@ -81,7 +82,11 @@ class CacheConfig:
     important to consider your security risk tolerance against the performance
     benefits before turning this on.\n
     - "xxhash_cbor" combines canonical CBOR serialization with xxHash for
-    reproducible hashing. Requires the optional ``xxhash`` package."""
+    reproducible hashing. Requires the optional ``xxhash`` package.\n
+    - "builtin" uses Rust xxh3_128 to hash raw token bytes directly,
+    skipping serialization entirely. Fastest option. Requires the optional
+    ``vllm-scheduler-rs`` package (``cd rust && maturin develop --release``).
+    Falls back to xxhash_cbor (or sha256_cbor) if Rust is unavailable."""
     calculate_kv_scales: bool = False
     """Deprecated: This option is deprecated and will be removed in v0.19.
     It enables dynamic calculation of `k_scale` and `v_scale` when
