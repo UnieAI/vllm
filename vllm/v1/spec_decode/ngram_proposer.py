@@ -101,48 +101,23 @@ class NgramProposer:
         # avoid calling numba function with empty list which causes error
         # ValueError: cannot compute fingerprint of empty list
         if num_ngram_requests := len(valid_ngram_requests):
-            if _HAS_RUST_NGRAM:
-                # Rust path: faster KMP with native parallelism.
-                draft_arr, ndrafts_arr = _rs_batch_ngram_propose(
-                    token_ids_cpu,
-                    num_tokens_no_spec,
-                    valid_ngram_requests,
-                    self.min_n,
-                    self.max_n,
-                    self.max_model_len,
-                    self.k,
-                )
-                self.valid_ngram_draft[:num_requests, :] = (
-                    draft_arr[:num_requests, :]
-                )
-                self.valid_ngram_num_drafts[:num_requests] = (
-                    ndrafts_arr[:num_requests]
-                )
-            else:
-                # Numba fallback.
-                original_num_numba_threads = get_num_threads()
-                total_tokens = np.sum(num_tokens_no_spec)
-                if total_tokens >= self.num_tokens_threshold:
-                    final_num_threads = max(
-                        1, min(self.num_numba_thread_available,
-                               num_ngram_requests)
-                    )
-                    set_num_threads(final_num_threads)
-                else:
-                    set_num_threads(1)
+            self._run_propose_backend(
+                valid_ngram_requests, num_tokens_no_spec,
+                token_ids_cpu, num_requests, self.min_n, self.max_n,
+            )
 
-                batch_propose_numba(
-                    valid_ngram_requests,
-                    num_tokens_no_spec,
-                    token_ids_cpu,
-                    self.min_n,
-                    self.max_n,
-                    self.max_model_len,
-                    self.k,
-                    self.valid_ngram_draft,
-                    self.valid_ngram_num_drafts,
-                )
-                set_num_threads(original_num_numba_threads)
+            # D4: Relaxed retry — for requests that got 0 drafts with
+            # min_n > 1, retry with min_n=1 to find shorter matches.
+            if self.min_n > 1:
+                retry_indices = [
+                    idx for idx in valid_ngram_requests
+                    if self.valid_ngram_num_drafts[idx] == 0
+                ]
+                if retry_indices:
+                    self._run_propose_backend(
+                        retry_indices, num_tokens_no_spec,
+                        token_ids_cpu, num_requests, 1, self.max_n,
+                    )
 
         valid_set = set(valid_ngram_requests)
         for i in range(num_requests):
@@ -154,6 +129,56 @@ class NgramProposer:
                 draft_token_ids.append([])
 
         return draft_token_ids
+
+    def _run_propose_backend(
+        self,
+        valid_requests: list,
+        num_tokens_no_spec: np.ndarray,
+        token_ids_cpu: np.ndarray,
+        num_requests: int,
+        min_n: int,
+        max_n: int,
+    ) -> None:
+        """Run the n-gram propose backend (Rust or Numba)."""
+        if _HAS_RUST_NGRAM:
+            draft_arr, ndrafts_arr = _rs_batch_ngram_propose(
+                token_ids_cpu,
+                num_tokens_no_spec,
+                valid_requests,
+                min_n,
+                max_n,
+                self.max_model_len,
+                self.k,
+            )
+            # Only update slots that were processed.
+            for idx in valid_requests:
+                if idx < num_requests:
+                    self.valid_ngram_draft[idx, :] = draft_arr[idx, :]
+                    self.valid_ngram_num_drafts[idx] = ndrafts_arr[idx]
+        else:
+            original_num_numba_threads = get_num_threads()
+            total_tokens = np.sum(num_tokens_no_spec)
+            if total_tokens >= self.num_tokens_threshold:
+                final_num_threads = max(
+                    1, min(self.num_numba_thread_available,
+                           len(valid_requests))
+                )
+                set_num_threads(final_num_threads)
+            else:
+                set_num_threads(1)
+
+            batch_propose_numba(
+                valid_requests,
+                num_tokens_no_spec,
+                token_ids_cpu,
+                min_n,
+                max_n,
+                self.max_model_len,
+                self.k,
+                self.valid_ngram_draft,
+                self.valid_ngram_num_drafts,
+            )
+            set_num_threads(original_num_numba_threads)
 
     def propose(
         self,
