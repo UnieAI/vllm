@@ -792,11 +792,22 @@ maturin build --release --interpreter python3.10 python3.11 python3.12
 
 | 優先級 | 項目 | 說明 | 難度 |
 |--------|------|------|------|
+| **P0** | `"builtin"` 加入 `PrefixCachingHashAlgo` | `config/cache.py` 的 `Literal` 型別未包含 `"builtin"`，CLI `--prefix-caching-hash-algo builtin` 會被 argparse 拒絕。需加入 type 定義 + 測試 | 低 |
 | **P1** | `schedule()` running 迴圈完整接入 | `compute_running_tokens` 已可用，但排程迴圈中穿插了 KV cache allocation、encoder scheduling、preemption，需拆解 budget 回收邏輯後才能用 Rust 結果驅動迴圈 | 中 |
+| **P1** | `batch_apply_spec_decode` 接入 `update_from_output()` | `batch_apply_generated_tokens` Rust 函數已就緒（192x），但 `update_from_output()` 的 spec decode 調整段仍逐 request 處理。可用 batch precompute 模式（類似 batch stop check）在迴圈前批次計算 | 中 |
 | **P1** | vllm build system 整合 | 將 `maturin build` 嵌入 vllm 的 `pyproject.toml`，讓 `pip install vllm` 自動編譯 Rust 模組（或作為 optional dependency） | 中 |
-| **P1** | `serial_helpers.rs` Python 端接入 | Rust 函數已寫好，尚未接入 `serial_utils.py` 的 `MsgpackEncoder.enc_hook()` tensor 編碼路徑 | 低 |
+| **P1** | `serial_helpers.rs` Python 端接入 | Rust 函數已寫好，尚未接入 `serial_utils.py` 的 `MsgpackEncoder.enc_hook()` tensor 編碼路徑。注意：numpy `tobytes()` 已是 C 最佳化，Rust 可能無額外收益，需先 profile 確認瓶頸 | 低 |
 | **P2** | CUDA n-gram kernel | GPU 版 n-gram 用 PyTorch `unfold` 做 O(n×m) 暴力匹配 + Python `for` 遍歷 ngram 長度；寫 fused CUDA kernel 做 O(n) KMP 可快 2-5x | 高 |
 | **P2** | Rust SoA request metadata 鏡像 | 在 Rust 側維護 running requests 的 struct-of-arrays 鏡像（num_computed_tokens 等），避免每步從 Python 物件收集到 numpy 的開銷 | 高 |
 | **P3** | Lock-free IPC queue | 替換 EngineCore 的 `queue.Queue`（每次 put/get 需 GIL + mutex 雙重鎖）為 Rust SPSC ring buffer，透過 PyO3 暴露 | 高 |
 | **P3** | Shared memory IPC | 用 Rust 管理的 memory-mapped ring buffer 替換 ZMQ（同機器內），消除 socket + kernel copy 開銷 | 高 |
 | **P3** | CI 自動建構 | GitHub Actions：PR 中自動 `maturin build` + `pytest` Rust 測試 + 效能回歸檢查 | 低 |
+
+### 驗證待辦
+
+- [ ] Linux x86_64 + NVIDIA GPU 環境下建構並驗證所有 Rust 模組
+- [ ] `benchmark_serving.py` 做有/無 Rust 的 A/B 對比（不同併發數 1/10/100/500/1000）
+- [ ] `py-spy` 或 `scalene` profile 確認 CPU 熱點是否已從 scheduler 迴圈轉移
+- [ ] 新增 `block_hash` Python 整合測試（`"builtin"` + chain hashing 正確性）
+- [ ] 新增 `RustFreeBlockQueue` 與原 Python 版本的行為交叉驗證測試
+- [ ] 新增 `StopStringMatcher` 邊界測試（Unicode、空 stop list、跨 token boundary）
