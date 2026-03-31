@@ -284,6 +284,18 @@ class Scheduler(SchedulerInterface):
                     self.max_num_scheduled_tokens,
                 )
 
+        # ── Draft quality optimization (D1/D3/D5) ──
+        # D1: Per-request acceptance rate tracking.
+        # {req_id: (num_accepted, num_drafted)} — cleared on request finish.
+        self._req_acceptance: dict[str, tuple[int, int]] = {}
+        # D5: Global per-position acceptance tracking.
+        if self.num_spec_tokens > 0:
+            self._pos_accepted = np.zeros(self.num_spec_tokens, dtype=np.int64)
+            self._pos_total = np.zeros(self.num_spec_tokens, dtype=np.int64)
+        else:
+            self._pos_accepted = np.empty(0, dtype=np.int64)
+            self._pos_total = np.empty(0, dtype=np.int64)
+
         # Create the KV cache manager.
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
@@ -1480,13 +1492,25 @@ class Scheduler(SchedulerInterface):
                 # the scheduled spec tokens count and so is similarly adjusted.
                 if request.num_output_placeholders > 0:
                     request.num_output_placeholders -= num_rejected
+                num_draft_tokens = len(scheduled_spec_token_ids)
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
-                    num_draft_tokens=len(scheduled_spec_token_ids),
+                    num_draft_tokens=num_draft_tokens,
                     num_accepted_tokens=num_accepted,
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
                 )
+
+                # D1: Update per-request acceptance tracking.
+                prev = self._req_acceptance.get(req_id, (0, 0))
+                self._req_acceptance[req_id] = (
+                    prev[0] + num_accepted, prev[1] + num_draft_tokens,
+                )
+                # D5: Update global per-position acceptance tracking.
+                for pos in range(min(num_accepted, len(self._pos_accepted))):
+                    self._pos_accepted[pos] += 1
+                for pos in range(min(num_draft_tokens, len(self._pos_total))):
+                    self._pos_total[pos] += 1
 
             stopped = False
             new_logprobs = None
@@ -1924,32 +1948,133 @@ class Scheduler(SchedulerInterface):
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
 
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
-        use_ngram_spec = self._should_use_ngram_spec()
+        # D3: Gradual DSC — get proportional k instead of binary on/off.
+        effective_k = self._get_effective_spec_k()
+
         for req_id, spec_token_ids in zip(
             draft_token_ids.req_ids,
             draft_token_ids.draft_token_ids,
         ):
             request = self.requests.get(req_id)
             if request is None or request.is_finished():
-                # The request may have been finished. Skip.
+                # Clean up acceptance tracking for finished requests.
+                self._req_acceptance.pop(req_id, None)
                 continue
 
             if request.is_prefill_chunk:
-                # Ignore draft tokens for prefill chunks.
                 if request.spec_token_ids:
                     request.spec_token_ids = []
                 continue
 
-            if not use_ngram_spec:
+            if effective_k == 0:
                 if request.spec_token_ids:
                     request.spec_token_ids = []
                 continue
 
-            # Add newly generated spec token ids to the request.
+            # D1: Adaptive k — reduce draft count for low-acceptance requests.
+            req_k = self._adaptive_k(req_id, effective_k)
+
+            # D5: Position-aware decay — trim positions with low acceptance.
+            req_k = self._position_decay_k(req_k)
+
+            # Trim draft tokens to effective k.
+            if len(spec_token_ids) > req_k:
+                spec_token_ids = spec_token_ids[:req_k]
+
+            # D2: Confirmation check — skip if proposed tokens look like
+            # noise (single occurrence of the n-gram in the entire context).
+            if (
+                spec_token_ids
+                and request.num_output_tokens > 50
+                and self._is_low_confidence_draft(req_id)
+            ):
+                spec_token_ids = spec_token_ids[:max(1, len(spec_token_ids) // 2)]
+
+            # Structured output validation.
             if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request
                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
             request.spec_token_ids = spec_token_ids
+
+    def _adaptive_k(self, req_id: str, base_k: int) -> int:
+        """D1: Reduce k for requests with historically low acceptance rate."""
+        history = self._req_acceptance.get(req_id)
+        if history is None:
+            return base_k  # No history yet — use full k.
+        accepted, drafted = history
+        if drafted < 10:
+            return base_k  # Not enough data.
+        rate = accepted / drafted
+        if rate >= 0.4:
+            return base_k  # Good acceptance — keep full k.
+        # Scale k proportionally: rate=0.4 → full k, rate=0 → 1.
+        return max(1, int(base_k * rate / 0.4))
+
+    def _position_decay_k(self, base_k: int) -> int:
+        """D5: Trim k to the last position with decent acceptance rate."""
+        if len(self._pos_total) == 0 or self._pos_total[0] < 50:
+            return base_k  # Not enough data.
+        for pos in range(min(base_k, len(self._pos_total))):
+            if self._pos_total[pos] == 0:
+                return max(1, pos)
+            rate = self._pos_accepted[pos] / self._pos_total[pos]
+            if rate < 0.15:
+                return max(1, pos)
+        return base_k
+
+    def _is_low_confidence_draft(self, req_id: str) -> bool:
+        """D2: Check if recent drafts have been consistently rejected."""
+        history = self._req_acceptance.get(req_id)
+        if history is None:
+            return False
+        accepted, drafted = history
+        if drafted < 20:
+            return False
+        return (accepted / drafted) < 0.2
+
+    def _get_effective_spec_k(self) -> int:
+        """D3: Gradual DSC — return proportional k instead of binary.
+
+        Returns 0 to self.num_spec_tokens. In the transition zone between
+        enable and disable thresholds, k decreases linearly.
+        """
+        if not self._ngram_dsc_enabled:
+            return self.num_spec_tokens
+
+        decode_load = self._get_running_decode_token_load()
+        now = time.monotonic()
+        enable_t = self._ngram_dsc_enable_decode_tokens
+        disable_t = self._ngram_dsc_disable_decode_tokens
+
+        if decode_load <= enable_t:
+            return self.num_spec_tokens
+
+        # Cooldown check.
+        if (
+            not self._ngram_dsc_spec_enabled
+            and now - self._ngram_dsc_last_switch_time
+            < self._ngram_dsc_switch_cooldown_sec
+        ):
+            return 0
+
+        if decode_load >= disable_t:
+            if self._ngram_dsc_spec_enabled:
+                self._ngram_dsc_spec_enabled = False
+                self._ngram_dsc_last_switch_time = now
+                logger.info(
+                    "NGRAM_DSC_SWITCH to=normal_decode "
+                    "decode_token_load=%d", decode_load,
+                )
+            return 0
+
+        # Transition zone: linear interpolation.
+        if not self._ngram_dsc_spec_enabled:
+            self._ngram_dsc_spec_enabled = True
+            self._ngram_dsc_last_switch_time = now
+        ratio = (decode_load - enable_t) / max(1, disable_t - enable_t)
+        k = max(1, int(self.num_spec_tokens * (1.0 - ratio)))
+        self._log_ngram_dsc_state(now, decode_load, True)
+        return k
 
     def _get_running_decode_token_load(self) -> int:
         return sum(
@@ -1959,52 +2084,8 @@ class Scheduler(SchedulerInterface):
         )
 
     def _should_use_ngram_spec(self) -> bool:
-        if not self._ngram_dsc_enabled:
-            return True
-
-        decode_token_load = self._get_running_decode_token_load()
-        now = time.monotonic()
-
-        if self._ngram_dsc_spec_enabled:
-            if decode_token_load >= self._ngram_dsc_disable_decode_tokens:
-                self._ngram_dsc_spec_enabled = False
-                self._ngram_dsc_last_switch_time = now
-                logger.info(
-                    "NGRAM_DSC_SWITCH to=normal_decode "
-                    "decode_token_load=%d disable_threshold=%d "
-                    "enable_threshold=%d cooldown_sec=%.2f",
-                    decode_token_load,
-                    self._ngram_dsc_disable_decode_tokens,
-                    self._ngram_dsc_enable_decode_tokens,
-                    self._ngram_dsc_switch_cooldown_sec,
-                )
-            decision = self._ngram_dsc_spec_enabled
-            self._log_ngram_dsc_state(now, decode_token_load, decision)
-            return decision
-
-        if (
-            now - self._ngram_dsc_last_switch_time
-            < self._ngram_dsc_switch_cooldown_sec
-        ):
-            decision = False
-            self._log_ngram_dsc_state(now, decode_token_load, decision)
-            return decision
-
-        if decode_token_load <= self._ngram_dsc_enable_decode_tokens:
-            self._ngram_dsc_spec_enabled = True
-            self._ngram_dsc_last_switch_time = now
-            logger.info(
-                "NGRAM_DSC_SWITCH to=ngram_spec "
-                "decode_token_load=%d disable_threshold=%d "
-                "enable_threshold=%d cooldown_sec=%.2f",
-                decode_token_load,
-                self._ngram_dsc_disable_decode_tokens,
-                self._ngram_dsc_enable_decode_tokens,
-                self._ngram_dsc_switch_cooldown_sec,
-            )
-        decision = self._ngram_dsc_spec_enabled
-        self._log_ngram_dsc_state(now, decode_token_load, decision)
-        return decision
+        """Backward-compatible wrapper: True if effective k > 0."""
+        return self._get_effective_spec_k() > 0
 
     def _log_ngram_dsc_state(
         self, now: float, decode_token_load: int, decision_use_ngram_spec: bool
