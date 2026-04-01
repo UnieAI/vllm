@@ -445,10 +445,11 @@ class cmake_build_ext(build_ext):
             print("Skipping Rust build (maturin command not found).")
 
 
-class precompiled_build_ext(build_ext):
+class precompiled_build_ext(cmake_build_ext):
     """Disables extension building when using precompiled binaries."""
 
     def run(self) -> None:
+        self._build_rust_extension()
         return
 
     def build_extensions(self) -> None:
@@ -932,14 +933,20 @@ def get_nvcc_cuda_version() -> Version:
 
 
 def get_vllm_version() -> str:
+    scm_version_kwargs = {
+        "write_to": "vllm/_version.py",
+        "root": str(ROOT_DIR),
+        "relative_to": __file__,
+    }
+
     # Allow overriding the version. This is useful to build platform-specific
     # wheels (e.g. CPU, TPU) without modifying the source.
     if env_version := os.getenv("VLLM_VERSION_OVERRIDE"):
         print(f"Overriding VLLM version with {env_version} from VLLM_VERSION_OVERRIDE")
         os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = env_version
-        return get_version(write_to="vllm/_version.py")
+        return get_version(**scm_version_kwargs)
 
-    version = get_version(write_to="vllm/_version.py")
+    version = get_version(**scm_version_kwargs)
     sep = "+" if "+" not in version else "."  # dev versions might contain +
 
     if _no_device():

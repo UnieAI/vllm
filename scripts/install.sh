@@ -2,7 +2,68 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT_DIR"
+RUST_DIR="${ROOT_DIR}/rust"
+INSTALL_LOG="${INSTALL_LOG:-install.log}"
+EXPECTED_BRANCH="${EXPECTED_BRANCH:-roy/rs}"
+PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
+
+if [[ "${INSTALL_LOG}" != /* ]]; then
+    INSTALL_LOG="${ROOT_DIR}/${INSTALL_LOG}"
+fi
+
+RUST_ONLY=0
+SKIP_RUST_BOOTSTRAP=0
+INSTALL_ARGS=()
+
+usage() {
+    cat <<'EOF'
+Usage:
+  ./scripts/install.sh [install args...]
+  ./scripts/install.sh --rust-only [maturin args...]
+
+Installs the current checkout of vLLM on this branch.
+
+Default mode:
+  - uses the active virtualenv, or creates .venv with python -m venv
+  - installs Rust if cargo is missing
+  - installs Python build dependencies into the environment
+  - runs: pip install -e . --no-build-isolation
+
+Rust-only mode:
+  - uses the active virtualenv, or creates .venv with python -m venv
+  - installs Rust if cargo is missing
+  - installs maturin into the environment if needed
+  - runs: cd rust && maturin develop --release
+
+Options:
+  --rust-only            Build only the Rust extension via maturin.
+  --skip-rust-bootstrap  Fail instead of installing Rust when cargo is missing.
+  -h, --help             Show this help message.
+
+Examples:
+  ./scripts/install.sh
+  VLLM_USE_PRECOMPILED=1 ./scripts/install.sh
+  ./scripts/install.sh --rust-only
+EOF
+}
+
+log() {
+    printf '==> %s\n' "$*"
+}
+
+warn() {
+    printf 'warning: %s\n' "$*" >&2
+}
+
+die() {
+    printf 'error: %s\n' "$*" >&2
+    exit 1
+}
+
+ensure_command() {
+    local cmd="$1"
+    command -v "${cmd}" >/dev/null 2>&1 || die "required command not found: ${cmd}"
+}
 
 default_python_bin() {
     if command -v python >/dev/null 2>&1; then
@@ -15,11 +76,8 @@ default_python_bin() {
         return 0
     fi
 
-    printf '%s\n' "python"
+    return 1
 }
-
-PYTHON_BIN="${PYTHON_BIN:-$(default_python_bin)}"
-INSTALL_LOG="${INSTALL_LOG:-install.log}"
 
 append_cmake_arg() {
     local arg="$1"
@@ -129,59 +187,223 @@ find_cuda_include_dir() {
     return 1
 }
 
-if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
-    echo "error: python executable not found: ${PYTHON_BIN}" >&2
-    exit 1
-fi
+ensure_venv() {
+    local python_bin
+    python_bin="${PYTHON_BIN:-$(default_python_bin || true)}"
+    [[ -n "${python_bin}" ]] || die "python executable not found"
 
-CUDA_HOME_DETECTED=""
-if CUDA_HOME_DETECTED="$(resolve_cuda_home)"; then
-    export CUDA_HOME="${CUDA_HOME_DETECTED}"
-    append_cmake_arg "-DCUDAToolkit_ROOT=${CUDA_HOME}"
-fi
-
-NVRTC_LIBRARY=""
-if NVRTC_LIBRARY="$(find_nvrtc "${CUDA_HOME_DETECTED:-}")"; then
-    export CUDA_NVRTC_LIBRARY="${NVRTC_LIBRARY}"
-    append_cmake_arg "-DCUDA_nvrtc_LIBRARY=${NVRTC_LIBRARY}"
-else
-    echo "warning: libnvrtc.so was not found automatically; the install may still fail during CMake configure." >&2
-fi
-
-CUDA_INCLUDE_DIR_DETECTED=""
-if CUDA_INCLUDE_DIR_DETECTED="$(find_cuda_include_dir "${CUDA_HOME_DETECTED:-}")"; then
-    export CUDA_INCLUDE_DIR="${CUDA_INCLUDE_DIR_DETECTED}"
-    # Ensure nvcc and host compiler see CUDA headers like cusparse.h / cublas_v2.h.
-    export CPATH="${CUDA_INCLUDE_DIR_DETECTED}${CPATH:+:${CPATH}}"
-    export CPLUS_INCLUDE_PATH="${CUDA_INCLUDE_DIR_DETECTED}${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}"
-else
-    if [[ "${VLLM_USE_PRECOMPILED:-}" =~ ^(1|true)$ || "${ALLOW_NO_CUDA_HEADERS:-0}" == "1" ]]; then
-        echo "warning: CUDA headers (cusparse.h/cublas_v2.h) not found; build may fail without dev headers." >&2
-    else
-        echo "error: CUDA headers (cusparse.h/cublas_v2.h) not found." >&2
-        echo "Install CUDA Toolkit dev headers or set CUDA_INCLUDE_DIR to a valid include path." >&2
-        echo "If you cannot install headers, try: VLLM_USE_PRECOMPILED=1 ./scripts/install.sh" >&2
-        exit 1
+    if [[ -n "${VIRTUAL_ENV:-}" ]]; then
+        return 0
     fi
+
+    if [[ ! -x "${ROOT_DIR}/.venv/bin/python" ]]; then
+        log "Creating .venv with Python ${PYTHON_VERSION}"
+        "${python_bin}" -m venv "${ROOT_DIR}/.venv"
+    fi
+
+    # shellcheck disable=SC1091
+    source "${ROOT_DIR}/.venv/bin/activate"
+}
+
+ensure_pip() {
+    python -m ensurepip --upgrade >/dev/null 2>&1 || true
+    python -m pip --version >/dev/null 2>&1 || die "pip is not available in the active Python environment"
+}
+
+ensure_rust() {
+    if command -v cargo >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if [[ -f "${HOME}/.cargo/env" ]]; then
+        # shellcheck disable=SC1090
+        source "${HOME}/.cargo/env"
+    fi
+
+    if command -v cargo >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if [[ "${SKIP_RUST_BOOTSTRAP}" == "1" ]]; then
+        die "cargo not found; install Rust first or omit --skip-rust-bootstrap"
+    fi
+
+    ensure_command curl
+    log "Installing Rust with rustup"
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+
+    if [[ ! -f "${HOME}/.cargo/env" ]]; then
+        die "Rust installation completed but ${HOME}/.cargo/env was not created"
+    fi
+
+    # shellcheck disable=SC1090
+    source "${HOME}/.cargo/env"
+    command -v cargo >/dev/null 2>&1 || die "cargo still not found after rustup install"
+}
+
+ensure_python_packages() {
+    if [[ $# -eq 0 ]]; then
+        return 0
+    fi
+
+    python -m pip install "$@"
+}
+
+ensure_maturin() {
+    if command -v maturin >/dev/null 2>&1; then
+        return 0
+    fi
+
+    log "Installing maturin into the active environment"
+    ensure_python_packages maturin
+}
+
+ensure_build_dependencies() {
+    local build_requirements="${ROOT_DIR}/requirements/build.txt"
+    local filtered_requirements=""
+
+    [[ -f "${build_requirements}" ]] || die "missing build requirements file: ${build_requirements}"
+
+    if python -c 'import torch' >/dev/null 2>&1; then
+        filtered_requirements="$(mktemp)"
+        grep -v '^torch==' "${build_requirements}" > "${filtered_requirements}"
+        log "Installing Python build dependencies (reusing existing torch)"
+        python -m pip install -r "${filtered_requirements}"
+        rm -f "${filtered_requirements}"
+        return 0
+    fi
+
+    log "Installing Python build dependencies"
+    python -m pip install -r "${build_requirements}"
+}
+
+ensure_version_override() {
+    if command -v git >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if [[ -n "${VLLM_VERSION_OVERRIDE:-}" ]]; then
+        return 0
+    fi
+
+    export VLLM_VERSION_OVERRIDE="0.0.0.dev0"
+    warn "git is not available; setting VLLM_VERSION_OVERRIDE=${VLLM_VERSION_OVERRIDE} for local editable install"
+}
+
+prepare_cuda_env() {
+    local cuda_home_detected=""
+    local nvrtc_library=""
+    local cuda_include_dir_detected=""
+    local precompiled_is_set=0
+
+    if [[ -n "${VLLM_USE_PRECOMPILED+x}" ]]; then
+        precompiled_is_set=1
+    fi
+
+    if cuda_home_detected="$(resolve_cuda_home)"; then
+        export CUDA_HOME="${cuda_home_detected}"
+        append_cmake_arg "-DCUDAToolkit_ROOT=${CUDA_HOME}"
+    fi
+
+    if nvrtc_library="$(find_nvrtc "${cuda_home_detected:-}")"; then
+        export CUDA_NVRTC_LIBRARY="${nvrtc_library}"
+        append_cmake_arg "-DCUDA_nvrtc_LIBRARY=${nvrtc_library}"
+    else
+        warn "libnvrtc.so was not found automatically; the install may still fail during CMake configure"
+    fi
+
+    if cuda_include_dir_detected="$(find_cuda_include_dir "${cuda_home_detected:-}")"; then
+        export CUDA_INCLUDE_DIR="${cuda_include_dir_detected}"
+        export CPATH="${cuda_include_dir_detected}${CPATH:+:${CPATH}}"
+        export CPLUS_INCLUDE_PATH="${cuda_include_dir_detected}${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}"
+    else
+        if [[ "${VLLM_USE_PRECOMPILED:-}" =~ ^(1|true)$ || "${ALLOW_NO_CUDA_HEADERS:-0}" == "1" ]]; then
+            warn "CUDA headers (cusparse.h/cublas_v2.h) not found; build may fail without dev headers"
+        elif [[ "${precompiled_is_set}" == "0" ]]; then
+            export VLLM_USE_PRECOMPILED=1
+            warn "CUDA headers (cusparse.h/cublas_v2.h) not found; enabling VLLM_USE_PRECOMPILED=1 automatically"
+        else
+            die "CUDA headers (cusparse.h/cublas_v2.h) not found. Install CUDA Toolkit dev headers, set CUDA_INCLUDE_DIR, or use VLLM_USE_PRECOMPILED=1"
+        fi
+    fi
+
+    if [[ -n "${cuda_home_detected}" ]]; then
+        log "Using CUDA_HOME=${cuda_home_detected}"
+    fi
+    if [[ -n "${nvrtc_library}" ]]; then
+        log "Using CUDA_NVRTC_LIBRARY=${nvrtc_library}"
+    fi
+    if [[ -n "${cuda_include_dir_detected}" ]]; then
+        log "Using CUDA_INCLUDE_DIR=${cuda_include_dir_detected}"
+    fi
+    if [[ -n "${CMAKE_ARGS:-}" ]]; then
+        log "Using CMAKE_ARGS=${CMAKE_ARGS}"
+    fi
+    if [[ "${VLLM_USE_PRECOMPILED:-}" =~ ^(1|true)$ ]]; then
+        log "Using VLLM_USE_PRECOMPILED=1"
+    fi
+}
+
+run_and_log() {
+    "$@" 2>&1 | tee "${INSTALL_LOG}"
+    return "${PIPESTATUS[0]}"
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --rust-only)
+            RUST_ONLY=1
+            shift
+            ;;
+        --skip-rust-bootstrap)
+            SKIP_RUST_BOOTSTRAP=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            INSTALL_ARGS+=("$@")
+            break
+            ;;
+        *)
+            INSTALL_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+cd "${ROOT_DIR}"
+
+current_branch="$(git branch --show-current 2>/dev/null || true)"
+if [[ -n "${current_branch}" && "${current_branch}" != "${EXPECTED_BRANCH}" ]]; then
+    warn "expected branch ${EXPECTED_BRANCH}, current branch is ${current_branch}"
 fi
 
-# Reuse the already-installed torch/CUDA stack instead of creating an isolated
-# build env that may lose local toolkit visibility.
-export PIP_NO_BUILD_ISOLATION="${PIP_NO_BUILD_ISOLATION:-1}"
+ensure_venv
+ensure_pip
 
-echo "Using ${PYTHON_BIN}: $(${PYTHON_BIN} -c 'import sys; print(sys.executable)')"
-if [[ -n "${CUDA_HOME_DETECTED}" ]]; then
-    echo "Using CUDA_HOME=${CUDA_HOME_DETECTED}"
-fi
-if [[ -n "${NVRTC_LIBRARY}" ]]; then
-    echo "Using CUDA_NVRTC_LIBRARY=${NVRTC_LIBRARY}"
-fi
-if [[ -n "${CUDA_INCLUDE_DIR_DETECTED}" ]]; then
-    echo "Using CUDA_INCLUDE_DIR=${CUDA_INCLUDE_DIR_DETECTED}"
-fi
-if [[ -n "${CMAKE_ARGS:-}" ]]; then
-    echo "Using CMAKE_ARGS=${CMAKE_ARGS}"
+if [[ "${RUST_ONLY}" == "1" || "${VLLM_SKIP_RUST:-0}" != "1" ]]; then
+    ensure_rust
+    ensure_maturin
 fi
 
-"${PYTHON_BIN}" -m pip install -e . "$@" 2>&1 | tee "${INSTALL_LOG}"
-exit "${PIPESTATUS[0]}"
+log "Using Python $(python -c 'import sys; print(sys.executable)')"
+
+if [[ "${RUST_ONLY}" == "1" ]]; then
+    log "Building the Rust extension with maturin"
+    (
+        cd "${RUST_DIR}"
+        run_and_log maturin develop --release "${INSTALL_ARGS[@]}"
+    )
+    exit $?
+fi
+
+prepare_cuda_env
+ensure_build_dependencies
+ensure_version_override
+
+log "Installing editable vLLM from ${current_branch:-current checkout}"
+run_and_log pip install -e . --no-build-isolation "${INSTALL_ARGS[@]}"
