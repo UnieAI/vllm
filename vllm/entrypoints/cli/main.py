@@ -20,6 +20,7 @@ def main():
     import vllm.entrypoints.cli.openai
     import vllm.entrypoints.cli.run_batch
     import vllm.entrypoints.cli.serve
+    import vllm.entrypoints.cli.serve_optuna
     from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
@@ -27,6 +28,7 @@ def main():
         vllm.entrypoints.cli.openai,
         vllm.entrypoints.cli.serve,
         vllm.entrypoints.cli.launch,
+        vllm.entrypoints.cli.serve_optuna,
         vllm.entrypoints.cli.benchmark.main,
         vllm.entrypoints.cli.collect_env,
         vllm.entrypoints.cli.run_batch,
@@ -34,10 +36,11 @@ def main():
 
     cli_env_setup()
 
-    # For 'vllm bench *': use CPU instead of UnspecifiedPlatform by default
-    if len(sys.argv) > 1 and sys.argv[1] == "bench":
+    # For benchmark-style commands: use CPU instead of
+    # UnspecifiedPlatform by default.
+    if len(sys.argv) > 1 and sys.argv[1] in ("bench", "serve-optuna", "serve_optuna"):
         logger.debug(
-            "Bench command detected, must ensure current platform is not "
+            "Benchmark command detected, must ensure current platform is not "
             "UnspecifiedPlatform to avoid device type inference error"
         )
         from vllm import platforms

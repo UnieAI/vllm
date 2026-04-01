@@ -103,6 +103,12 @@ bench_sweep_serve = auto_mock("vllm.benchmarks.sweep.serve", "SweepServeArgs")
 bench_sweep_serve_workload = auto_mock(
     "vllm.benchmarks.sweep.serve_workload", "SweepServeWorkloadArgs"
 )
+bench_sweep_serve_optuna = auto_mock(
+    "vllm.benchmarks.sweep.serve_optuna", "SweepServeOptunaArgs"
+)
+bench_sweep_serve_sla = auto_mock(
+    "vllm.benchmarks.sweep.serve_sla", "SweepServeSLAArgs"
+)
 bench_throughput = auto_mock("vllm.benchmarks", "throughput")
 AsyncEngineArgs = auto_mock("vllm.engine.arg_utils", "AsyncEngineArgs")
 EngineArgs = auto_mock("vllm.engine.arg_utils", "EngineArgs")
@@ -232,6 +238,10 @@ def on_startup(command: Literal["build", "gh-deploy", "serve"], dirty: bool):
         "bench_sweep_serve_workload": create_parser(
             bench_sweep_serve_workload.add_cli_args
         ),
+        "bench_sweep_serve_optuna": create_parser(
+            bench_sweep_serve_optuna.add_cli_args
+        ),
+        "bench_sweep_serve_sla": create_parser(bench_sweep_serve_sla.add_cli_args),
         "bench_throughput": create_parser(bench_throughput.add_cli_args),
     }
 
