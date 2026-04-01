@@ -341,7 +341,6 @@ def test_run_main_starts_best_server_when_enabled(tmp_path, monkeypatch):
 
     def mock_start_best_server(*args, **kwargs):  # noqa: ARG001
         start_calls["count"] += 1
-        return 12345
 
     monkeypatch.setattr(
         "vllm.benchmarks.sweep.serve_optuna._start_best_server",
@@ -483,10 +482,15 @@ def test_run_main_starts_best_server_with_effective_sanitized_params(
 
     start_call: dict[str, object] = {}
 
-    def mock_start_best_server(serve_cmd, serve_overrides, **kwargs):  # noqa: ARG001
+    def mock_start_best_server(
+        serve_cmd,
+        after_bench_cmd,
+        serve_overrides,
+        **kwargs,
+    ):  # noqa: ARG001
         start_call["serve_cmd"] = serve_cmd
+        start_call["after_bench_cmd"] = after_bench_cmd
         start_call["serve_overrides"] = dict(serve_overrides)
-        return 12345
 
     monkeypatch.setattr(
         "vllm.benchmarks.sweep.serve_optuna._start_best_server",
@@ -532,5 +536,67 @@ def test_run_main_starts_best_server_with_effective_sanitized_params(
     assert best_record is not None
     assert best_record["params"]["max_num_batched_tokens"] is None
     assert "serve_overrides" in start_call
+    assert start_call["after_bench_cmd"] == []
     # None-valued overrides must not be emitted into the final serve command.
     assert "max_num_batched_tokens" not in start_call["serve_overrides"]
+
+
+def test_start_best_server_runs_in_foreground(monkeypatch):
+    events: list[object] = []
+
+    class FakeProcess:
+        pid = 4321
+
+        def wait(self):
+            events.append("wait")
+
+    class FakeServerProcess:
+        def __init__(self, server_cmd, after_bench_cmd, *, show_stdout):
+            events.append(
+                ("init", server_cmd, after_bench_cmd, show_stdout)
+            )
+            self._server_process = FakeProcess()
+
+        def __enter__(self):
+            events.append("enter")
+            return self
+
+        def __exit__(self, exc_type, exc, tb):  # noqa: ARG002
+            events.append("exit")
+
+        def wait_until_ready(self, timeout):
+            events.append(("ready", timeout))
+
+    monkeypatch.setattr(
+        "vllm.benchmarks.sweep.serve_optuna.ServerProcess",
+        FakeServerProcess,
+    )
+
+    serve_optuna._start_best_server(
+        ["vllm", "serve", "Qwen/Qwen3-0.6B", "--port", "8123"],
+        ["echo", "after"],
+        ParameterSweepItem({"gpu_memory_utilization": 0.9}),
+        show_stdout=True,
+        server_ready_timeout=9,
+    )
+
+    assert events == [
+        (
+            "init",
+            [
+                "vllm",
+                "serve",
+                "Qwen/Qwen3-0.6B",
+                "--port",
+                "8123",
+                "--gpu-memory-utilization",
+                "0.9",
+            ],
+            ["echo", "after"],
+            True,
+        ),
+        "enter",
+        ("ready", 9),
+        "wait",
+        "exit",
+    ]

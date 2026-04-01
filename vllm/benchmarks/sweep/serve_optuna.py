@@ -1,22 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
-import json
 import copy
-import os
-import subprocess
-import time
+import json
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, ClassVar
 
-import requests
-
 from vllm.utils.import_utils import PlaceholderModule
 
 from .param_sweep import ParameterSweepItem
 from .serve import SweepServeArgs, run_benchmark, run_server
+from .server import ServerProcess
 
 try:
     import optuna
@@ -319,45 +315,28 @@ def _drop_none_values(params: dict[str, Any] | ParameterSweepItem) -> ParameterS
 
 def _start_best_server(
     serve_cmd: list[str],
+    after_bench_cmd: list[str],
     serve_overrides: ParameterSweepItem,
     *,
     show_stdout: bool,
     server_ready_timeout: int,
-) -> int:
+) -> None:
     best_server_cmd = serve_overrides.apply_to_cmd(serve_cmd)
     print("[START BEST SERVER]")
     print(f"Best server command: {best_server_cmd}")
 
-    process = subprocess.Popen(
-        best_server_cmd,
-        start_new_session=True,
-        stdout=None if show_stdout else subprocess.DEVNULL,
-        stderr=None if show_stdout else subprocess.DEVNULL,
-        env=os.environ | {"VLLM_SERVER_DEV_MODE": "1"},
-    )
-
-    start_time = time.monotonic()
     server_address = _extract_server_base_url_from_serve_cmd(best_server_cmd)
-    health_url = server_address + "/health"
-    while True:
-        if process.poll() is not None:
-            raise RuntimeError(
-                f"Best server process crashed with return code {process.returncode}"
-            )
-        try:
-            response = requests.get(health_url, timeout=3)
-            if response.status_code == 200:
-                print(f"Best server is ready at {server_address} (pid={process.pid})")
-                return process.pid
-        except requests.RequestException:
-            pass
-
-        if time.monotonic() - start_time > server_ready_timeout:
-            process.kill()
-            raise TimeoutError(
-                f"Best server failed to become ready within {server_ready_timeout} seconds"
-            )
-        time.sleep(1)
+    with ServerProcess(
+        best_server_cmd,
+        after_bench_cmd,
+        show_stdout=show_stdout,
+    ) as server:
+        server.wait_until_ready(timeout=server_ready_timeout)
+        print(
+            "Best server is ready at "
+            f"{server_address} (pid={server._server_process.pid})"
+        )
+        server._server_process.wait()
 
 
 def score_benchmark_runs(
@@ -796,6 +775,7 @@ def run_main(args: SweepServeOptunaArgs):
         )
         _start_best_server(
             args.serve_cmd,
+            args.after_bench_cmd,
             effective_best_overrides,
             show_stdout=args.show_stdout,
             server_ready_timeout=args.server_ready_timeout,
