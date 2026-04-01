@@ -27,17 +27,17 @@ except ImportError:
 DEFAULT_VLLM_SEARCH_SPACE: dict[str, Any] = {
     "gpu_memory_utilization": {
         "type": "float",
-        "low": 0.7,
+        "low": 0.5,
         "high": 0.98,
         "step": 0.02,
     },
     "max_num_batched_tokens": {
         "type": "categorical",
-        "choices": [None, 512, 1024, 2048, 4096, 8192],
+        "choices": [None, 512, 1024, 2048, 4096, 8192, 10240, 20480, 40960, 81920, 102400],
     },
     "max_num_seqs": {
         "type": "categorical",
-        "choices": [None, 8, 16, 32, 64, 128, 256],
+        "choices": [None, 4, 8, 16, 32, 64, 128, 256, 512, 1024],
     },
     "enable_chunked_prefill": {"type": "bool"},
     "enable_prefix_caching": {"type": "bool"},
