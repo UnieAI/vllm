@@ -19,6 +19,7 @@ class AsyncScheduler(Scheduler):
         super()._update_after_schedule(scheduler_output)
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
         use_ngram_spec = scheduler_output.enable_spec_decode
+        effective_num_spec_tokens = scheduler_output.effective_num_spec_tokens
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests[req_id]
             if request.is_prefill_chunk:
@@ -36,7 +37,9 @@ class AsyncScheduler(Scheduler):
             # Add placeholders for the new draft/spec tokens.
             # We will update the actual spec token ids in the worker process.
             request.spec_token_ids = (
-                self._spec_token_placeholders if use_ngram_spec else []
+                self._spec_token_placeholders[:effective_num_spec_tokens]
+                if use_ngram_spec
+                else []
             )
 
     def _update_request_with_output(

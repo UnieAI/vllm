@@ -1219,6 +1219,43 @@ def test_ngram_gpu_dsc_disables_speculation_in_async_scheduler():
         assert output.num_scheduled_tokens[req_id] == 1
 
 
+def test_ngram_gpu_dsc_goodput_disables_speculation_in_async_scheduler():
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        num_speculative_tokens=4,
+        speculative_config_kwargs={
+            "method": "ngram_gpu",
+            "ngram_dsc": True,
+            "ngram_dsc_strategy": "goodput",
+            "ngram_dsc_initial_acceptance_rate": 0.05,
+            "ngram_dsc_acceptance_ema_alpha": 1.0,
+            "ngram_dsc_base_latency_tokens": 32.0,
+        },
+    )
+    requests = create_requests(num_requests=2, num_tokens=1)
+    for request in requests:
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    req_ids = [req.request_id for req in requests]
+    req_id_to_index = {req_id: idx for idx, req_id in enumerate(req_ids)}
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+            sampled_token_ids=[[0], [0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    decode_output = scheduler.schedule()
+    assert decode_output.enable_spec_decode is False
+    assert decode_output.effective_num_spec_tokens == 0
+
+
 def test_ngram_dsc_auto_disable_threshold_is_capped():
     scheduler = create_scheduler(
         max_num_seqs=1024,
@@ -1231,6 +1268,532 @@ def test_ngram_dsc_auto_disable_threshold_is_capped():
     # decode_capacity = min(max_num_seqs=1024, max_num_scheduled_tokens=8192)
     # raw half would be 512, but auto threshold is capped at 128.
     assert scheduler._ngram_dsc_disable_decode_tokens == 128
+
+
+def test_ngram_dsc_goodput_uses_effective_spec_length():
+    def get_decode_step_effective_spec_tokens(
+        initial_acceptance_rate: float,
+    ) -> tuple[bool, int]:
+        scheduler = create_scheduler(
+            num_speculative_tokens=4,
+            speculative_config_kwargs={
+                "ngram_dsc": True,
+                "ngram_dsc_strategy": "goodput",
+                "ngram_dsc_initial_acceptance_rate": initial_acceptance_rate,
+                "ngram_dsc_acceptance_ema_alpha": 1.0,
+                "ngram_dsc_base_latency_tokens": 32.0,
+            },
+        )
+        requests = create_requests(num_requests=2, num_tokens=1)
+        for request in requests:
+            scheduler.add_request(request)
+
+        prefill_output = scheduler.schedule()
+        req_ids = [req.request_id for req in requests]
+        req_id_to_index = {req_id: idx for idx, req_id in enumerate(req_ids)}
+        scheduler.update_from_output(
+            prefill_output,
+            ModelRunnerOutput(
+                req_ids=req_ids,
+                req_id_to_index=req_id_to_index,
+                sampled_token_ids=[[0], [0]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+
+        decode_output = scheduler.schedule()
+        return (
+            decode_output.enable_spec_decode,
+            decode_output.effective_num_spec_tokens,
+        )
+
+    low_acceptance_enabled, low_acceptance_k = (
+        get_decode_step_effective_spec_tokens(0.05)
+    )
+    assert low_acceptance_enabled is False
+    assert low_acceptance_k == 0
+
+    high_acceptance_enabled, high_acceptance_k = (
+        get_decode_step_effective_spec_tokens(0.95)
+    )
+    assert high_acceptance_enabled is True
+    assert high_acceptance_k == 4
+
+
+def test_ngram_dsc_goodput_updates_after_rejections():
+    scheduler = create_scheduler(
+        num_speculative_tokens=4,
+        speculative_config_kwargs={
+            "ngram_dsc": True,
+            "ngram_dsc_strategy": "goodput",
+            "ngram_dsc_initial_acceptance_rate": 0.95,
+            "ngram_dsc_acceptance_ema_alpha": 1.0,
+            "ngram_dsc_initial_max_k": 4,
+            "ngram_dsc_base_latency_tokens": 32.0,
+        },
+    )
+    requests = create_requests(num_requests=2, num_tokens=1)
+    for request in requests:
+        scheduler.add_request(request)
+
+    prefill_output = scheduler.schedule()
+    req_ids = [req.request_id for req in requests]
+    req_id_to_index = {req_id: idx for idx, req_id in enumerate(req_ids)}
+    scheduler.update_from_output(
+        prefill_output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+            sampled_token_ids=[[0], [0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    decode_output = scheduler.schedule()
+    assert decode_output.effective_num_spec_tokens == 4
+
+    scheduler.update_draft_token_ids(
+        DraftTokenIds(req_ids, [[1, 2, 3, 4], [5, 6, 7, 8]])
+    )
+
+    verify_output = scheduler.schedule()
+    assert verify_output.scheduled_spec_decode_tokens == {
+        req_ids[0]: [1, 2, 3, 4],
+        req_ids[1]: [5, 6, 7, 8],
+    }
+
+    scheduler.update_from_output(
+        verify_output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+            sampled_token_ids=[[0], [0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    next_decode_output = scheduler.schedule()
+    assert scheduler._ngram_dsc_acceptance_rate_ema == 0.0
+    assert next_decode_output.enable_spec_decode is False
+    assert next_decode_output.effective_num_spec_tokens == 0
+
+
+def test_ngram_dsc_records_predicted_vs_realized_goodput():
+    scheduler = create_scheduler(
+        num_speculative_tokens=2,
+        speculative_config_kwargs={
+            "ngram_dsc": True,
+            "ngram_dsc_strategy": "goodput",
+            "ngram_dsc_initial_acceptance_rate": 0.95,
+            "ngram_dsc_acceptance_ema_alpha": 1.0,
+            "ngram_dsc_initial_max_k": 2,
+            "ngram_dsc_latency_model": "profiled",
+            "ngram_dsc_profiled_latency_intercept_s": 0.01,
+            "ngram_dsc_profiled_latency_scheduled_tokens_coeff_s": 0.01,
+            "ngram_dsc_profiled_latency_spec_tokens_coeff_s": 0.005,
+            "ngram_dsc_goodput_margin": 0.0,
+            "ngram_dsc_goodput_increase_margin": 0.0,
+            "ngram_dsc_goodput_min_dwell_sec": 0.0,
+            "ngram_dsc_max_step_delta": 2,
+        },
+    )
+    requests = create_requests(num_requests=2, num_tokens=1)
+    for request in requests:
+        scheduler.add_request(request)
+
+    prefill_output = scheduler.schedule()
+    req_ids = [req.request_id for req in requests]
+    req_id_to_index = {req_id: idx for idx, req_id in enumerate(req_ids)}
+    scheduler.update_from_output(
+        prefill_output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+            sampled_token_ids=[[0], [0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    decode_output = scheduler.schedule()
+    assert decode_output.effective_num_spec_tokens == 2
+
+    scheduler.update_draft_token_ids(DraftTokenIds(req_ids, [[1, 2], [3, 4]]))
+    verify_output = scheduler.schedule()
+    assert verify_output.ngram_dsc_predicted_goodput is not None
+    assert verify_output.ngram_dsc_predicted_latency_s is not None
+    assert verify_output.ngram_dsc_predicted_generated_tokens is not None
+    assert verify_output.ngram_dsc_predicted_k0_goodput is not None
+    assert verify_output.ngram_dsc_baseline_goodput is not None
+    assert verify_output.ngram_dsc_baseline_latency_s is not None
+    assert verify_output.ngram_dsc_baseline_source is not None
+    assert verify_output.ngram_dsc_decode_token_load == 1
+    assert verify_output.ngram_dsc_smoothed_total_num_scheduled_tokens is not None
+
+    scheduler.update_from_output(
+        verify_output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+            sampled_token_ids=[[1, 9], [3, 10]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            model_execute_time_s=0.5,
+        ),
+    )
+
+    assert scheduler._ngram_dsc_last_predicted_goodput == pytest.approx(
+        verify_output.ngram_dsc_predicted_goodput
+    )
+    assert scheduler._ngram_dsc_last_predicted_latency_s == pytest.approx(
+        verify_output.ngram_dsc_predicted_latency_s
+    )
+    assert scheduler._ngram_dsc_last_predicted_generated_tokens == pytest.approx(
+        verify_output.ngram_dsc_predicted_generated_tokens
+    )
+    assert scheduler._ngram_dsc_last_realized_latency_s == pytest.approx(0.5)
+    assert scheduler._ngram_dsc_last_realized_generated_tokens == pytest.approx(2.0)
+    assert scheduler._ngram_dsc_last_realized_goodput == pytest.approx(4.0)
+
+
+def test_ngram_dsc_online_latency_fit_observes_realized_scheduler_batch():
+    scheduler = create_scheduler(
+        speculative_config_kwargs={
+            "method": "ngram",
+            "num_speculative_tokens": 2,
+            "prompt_lookup_min": 1,
+            "prompt_lookup_max": 2,
+            "ngram_dsc": True,
+            "ngram_dsc_strategy": "goodput",
+            "ngram_dsc_initial_acceptance_rate": 0.95,
+            "ngram_dsc_acceptance_ema_alpha": 1.0,
+            "ngram_dsc_initial_max_k": 2,
+            "ngram_dsc_latency_model": "profiled",
+            "ngram_dsc_profiled_latency_intercept_s": 0.01,
+            "ngram_dsc_profiled_latency_scheduled_tokens_coeff_s": 0.01,
+            "ngram_dsc_profiled_latency_spec_tokens_coeff_s": 0.005,
+            "ngram_dsc_online_latency_fitting": True,
+            "ngram_dsc_online_latency_fit_min_samples": 1,
+            "ngram_dsc_online_latency_fit_warmup_samples": 0,
+            "ngram_dsc_online_latency_fit_refit_interval_samples": 1,
+            "ngram_dsc_goodput_margin": 0.0,
+            "ngram_dsc_goodput_increase_margin": 0.0,
+            "ngram_dsc_goodput_min_dwell_sec": 0.0,
+            "ngram_dsc_max_step_delta": 2,
+        },
+    )
+    assert scheduler._ngram_dsc_controller is not None
+    scheduler._ngram_dsc_controller.observe_realized_latency = Mock(  # type: ignore[method-assign]
+        return_value=None
+    )
+
+    requests = create_requests(num_requests=2, num_tokens=1)
+    for request in requests:
+        scheduler.add_request(request)
+
+    prefill_output = scheduler.schedule()
+    req_ids = [req.request_id for req in requests]
+    req_id_to_index = {req_id: idx for idx, req_id in enumerate(req_ids)}
+    scheduler.update_from_output(
+        prefill_output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+            sampled_token_ids=[[0], [0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    scheduler.schedule()
+    scheduler.update_draft_token_ids(DraftTokenIds(req_ids, [[1, 2], [3, 4]]))
+    verify_output = scheduler.schedule()
+    scheduler.update_from_output(
+        verify_output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+            sampled_token_ids=[[1, 9], [3, 10]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            model_execute_time_s=0.5,
+        ),
+    )
+
+    scheduler._ngram_dsc_controller.observe_realized_latency.assert_called_once_with(
+        decode_token_load=1,
+        smoothed_total_num_scheduled_tokens=(
+            verify_output.ngram_dsc_smoothed_total_num_scheduled_tokens or 0.0
+        ),
+        effective_num_spec_tokens=verify_output.effective_num_spec_tokens,
+        realized_latency_s=0.5,
+        realized_generated_tokens=2.0,
+        predicted_k0_goodput=verify_output.ngram_dsc_predicted_k0_goodput,
+        baseline_goodput=verify_output.ngram_dsc_baseline_goodput,
+    )
+
+
+def test_ngram_dsc_observes_realized_normal_decode_batch_when_k0():
+    scheduler = create_scheduler(
+        speculative_config_kwargs={
+            "method": "ngram",
+            "num_speculative_tokens": 2,
+            "prompt_lookup_min": 1,
+            "prompt_lookup_max": 2,
+            "ngram_dsc": True,
+            "ngram_dsc_strategy": "goodput",
+            "ngram_dsc_initial_acceptance_rate": 0.2,
+            "ngram_dsc_acceptance_ema_alpha": 1.0,
+            "ngram_dsc_position_acceptance_ema_alpha": 1.0,
+            "ngram_dsc_position_acceptance_prior_rate": 0.0,
+            "ngram_dsc_position_acceptance_prior_strength": 0.0,
+            "ngram_dsc_position_acceptance_confidence_z": 0.0,
+            "ngram_dsc_latency_model": "profiled",
+            "ngram_dsc_profiled_latency_intercept_s": 0.02,
+            "ngram_dsc_profiled_latency_spec_tokens_coeff_s": 0.05,
+            "ngram_dsc_online_latency_fitting": True,
+            "ngram_dsc_online_latency_fit_min_samples": 1,
+            "ngram_dsc_online_latency_fit_warmup_samples": 0,
+            "ngram_dsc_online_latency_fit_refit_interval_samples": 1,
+        },
+    )
+    assert scheduler._ngram_dsc_controller is not None
+    scheduler._ngram_dsc_controller.observe_realized_latency = Mock(  # type: ignore[method-assign]
+        return_value=None
+    )
+
+    requests = create_requests(num_requests=2, num_tokens=1)
+    for request in requests:
+        scheduler.add_request(request)
+
+    prefill_output = scheduler.schedule()
+    req_ids = [req.request_id for req in requests]
+    req_id_to_index = {req_id: idx for idx, req_id in enumerate(req_ids)}
+    scheduler.update_from_output(
+        prefill_output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+            sampled_token_ids=[[0], [0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    decode_output = scheduler.schedule()
+    assert decode_output.effective_num_spec_tokens == 0
+    scheduler.update_from_output(
+        decode_output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+            sampled_token_ids=[[1], [2]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            model_execute_time_s=0.5,
+        ),
+    )
+
+    scheduler._ngram_dsc_controller.observe_realized_latency.assert_called_once_with(
+        decode_token_load=decode_output.ngram_dsc_decode_token_load or 1,
+        smoothed_total_num_scheduled_tokens=(
+            decode_output.ngram_dsc_smoothed_total_num_scheduled_tokens or 0.0
+        ),
+        effective_num_spec_tokens=0,
+        realized_latency_s=0.5,
+        realized_generated_tokens=1.0,
+        predicted_k0_goodput=decode_output.ngram_dsc_predicted_k0_goodput,
+        baseline_goodput=decode_output.ngram_dsc_baseline_goodput,
+    )
+
+
+def test_ngram_dsc_skips_unstable_normal_decode_realized_batch():
+    scheduler = create_scheduler(
+        speculative_config_kwargs={
+            "method": "ngram",
+            "num_speculative_tokens": 2,
+            "prompt_lookup_min": 1,
+            "prompt_lookup_max": 2,
+            "ngram_dsc": True,
+            "ngram_dsc_strategy": "goodput",
+            "ngram_dsc_initial_acceptance_rate": 0.2,
+            "ngram_dsc_acceptance_ema_alpha": 1.0,
+            "ngram_dsc_position_acceptance_ema_alpha": 1.0,
+            "ngram_dsc_position_acceptance_prior_rate": 0.0,
+            "ngram_dsc_position_acceptance_prior_strength": 0.0,
+            "ngram_dsc_position_acceptance_confidence_z": 0.0,
+            "ngram_dsc_latency_model": "profiled",
+            "ngram_dsc_profiled_latency_intercept_s": 0.02,
+            "ngram_dsc_profiled_latency_spec_tokens_coeff_s": 0.05,
+            "ngram_dsc_online_latency_fitting": True,
+            "ngram_dsc_online_latency_fit_min_samples": 1,
+            "ngram_dsc_online_latency_fit_warmup_samples": 0,
+            "ngram_dsc_online_latency_fit_refit_interval_samples": 1,
+            "ngram_dsc_realized_sample_min_decode_token_load": 1,
+            "ngram_dsc_realized_sample_min_smoothed_scheduled_tokens": 1.0,
+            "ngram_dsc_realized_sample_min_latency_s": 0.001,
+        },
+    )
+    assert scheduler._ngram_dsc_controller is not None
+    scheduler._ngram_dsc_controller.observe_realized_latency = Mock(  # type: ignore[method-assign]
+        return_value=None
+    )
+
+    requests = create_requests(num_requests=2, num_tokens=1)
+    for request in requests:
+        scheduler.add_request(request)
+
+    prefill_output = scheduler.schedule()
+    req_ids = [req.request_id for req in requests]
+    req_id_to_index = {req_id: idx for idx, req_id in enumerate(req_ids)}
+    scheduler.update_from_output(
+        prefill_output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+            sampled_token_ids=[[0], [0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    decode_output = scheduler.schedule()
+    assert decode_output.effective_num_spec_tokens == 0
+    decode_output = dataclasses.replace(
+        decode_output,
+        ngram_dsc_decode_token_load=0,
+        ngram_dsc_smoothed_total_num_scheduled_tokens=0.64,
+    )
+    scheduler.update_from_output(
+        decode_output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+            sampled_token_ids=[[1], [2]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            model_execute_time_s=0.000351,
+        ),
+    )
+
+    scheduler._ngram_dsc_controller.observe_realized_latency.assert_not_called()
+
+
+def test_ngram_dsc_observes_position_acceptance_batch_counts():
+    scheduler = create_scheduler(
+        speculative_config_kwargs={
+            "method": "ngram",
+            "num_speculative_tokens": 3,
+            "prompt_lookup_min": 1,
+            "prompt_lookup_max": 3,
+            "ngram_dsc": True,
+            "ngram_dsc_strategy": "goodput",
+            "ngram_dsc_initial_acceptance_rate": 0.95,
+            "ngram_dsc_acceptance_ema_alpha": 1.0,
+        },
+    )
+    assert scheduler._ngram_dsc_controller is not None
+    scheduler._ngram_dsc_controller.observe_draft = Mock()  # type: ignore[method-assign]
+
+    requests = create_requests(num_requests=2, num_tokens=1)
+    for request in requests:
+        scheduler.add_request(request)
+
+    prefill_output = scheduler.schedule()
+    req_ids = [req.request_id for req in requests]
+    req_id_to_index = {req_id: idx for idx, req_id in enumerate(req_ids)}
+    scheduler.update_from_output(
+        prefill_output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+            sampled_token_ids=[[0], [0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    scheduler.update_draft_token_ids(DraftTokenIds(req_ids, [[1, 2, 3], [4, 5, 6]]))
+    verify_output = scheduler.schedule()
+    scheduler.update_from_output(
+        verify_output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+            sampled_token_ids=[[1, 2, 9], [4, 10]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            model_execute_time_s=0.5,
+        ),
+    )
+
+    scheduler._ngram_dsc_controller.observe_draft.assert_called_once_with(
+        num_draft_tokens=6,
+        num_accepted_tokens=3,
+        speculation_attempted=True,
+        num_eligible_decode_reqs=2,
+        num_draft_reqs=2,
+        position_draft_counts=(2, 2, 2),
+        position_accept_counts=(2, 1, 0),
+    )
+
+
+def test_ngram_dsc_records_decode_clean_batch_stats():
+    scheduler = create_scheduler(
+        speculative_config_kwargs={
+            "method": "ngram",
+            "num_speculative_tokens": 3,
+            "prompt_lookup_min": 1,
+            "prompt_lookup_max": 3,
+            "ngram_dsc": True,
+            "ngram_dsc_strategy": "goodput",
+            "ngram_dsc_initial_acceptance_rate": 0.95,
+            "ngram_dsc_acceptance_ema_alpha": 1.0,
+        },
+    )
+
+    requests = create_requests(num_requests=2, num_tokens=1)
+    for request in requests:
+        scheduler.add_request(request)
+
+    prefill_output = scheduler.schedule()
+    assert prefill_output.ngram_dsc_decode_batch_reqs == 0
+    assert prefill_output.ngram_dsc_decode_batch_tokens == 0
+
+    req_ids = [req.request_id for req in requests]
+    req_id_to_index = {req_id: idx for idx, req_id in enumerate(req_ids)}
+    scheduler.update_from_output(
+        prefill_output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+            sampled_token_ids=[[0], [0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    decode_output = scheduler.schedule()
+    assert decode_output.ngram_dsc_decode_batch_reqs == 2
+    assert decode_output.ngram_dsc_decode_batch_tokens == 2
+
 
 def _assert_right_scheduler_output(
     output: SchedulerOutput,

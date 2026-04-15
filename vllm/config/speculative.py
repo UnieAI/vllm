@@ -3,6 +3,8 @@
 
 import ast
 import copy
+import json
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from pydantic import Field, SkipValidation, model_validator
@@ -30,6 +32,103 @@ else:
     )
 
 logger = init_logger(__name__)
+
+_NGRAM_DSC_TURBOSPEC_DEFAULTS: dict[str, object] = {
+    "ngram_dsc_strategy": "goodput",
+    "ngram_dsc_initial_acceptance_rate": 0.8,
+    "ngram_dsc_acceptance_ema_alpha": 0.3,
+    "ngram_dsc_position_acceptance_prior_rate": 0.4,
+    "ngram_dsc_position_acceptance_prior_decay": 0.5,
+    "ngram_dsc_position_acceptance_prior_strength": 8.0,
+    "ngram_dsc_position_acceptance_confidence_z": 1.0,
+    "ngram_dsc_base_latency_tokens": 32.0,
+    "ngram_dsc_latency_model": "profiled",
+    "ngram_dsc_profiled_latency_intercept_s": 0.015,
+    "ngram_dsc_profiled_latency_decode_token_load_coeff_s": 0.002,
+    "ngram_dsc_profiled_latency_scheduled_tokens_coeff_s": 0.006,
+    "ngram_dsc_profiled_latency_spec_tokens_coeff_s": 0.004,
+    "ngram_dsc_profiled_latency_spec_scheduled_tokens_interaction_coeff_s": 0.0005,
+    "ngram_dsc_online_latency_fitting": True,
+    "ngram_dsc_online_latency_fit_min_samples": 32,
+    "ngram_dsc_online_latency_fit_warmup_samples": 4,
+    "ngram_dsc_online_latency_fit_refit_interval_samples": 8,
+    "ngram_dsc_online_latency_fit_max_samples": 256,
+    "ngram_dsc_online_latency_fit_max_latency_ratio_to_median": 3.0,
+    "ngram_dsc_online_latency_fit_ema_alpha": 0.25,
+    "ngram_dsc_online_latency_fit_max_relative_update": 0.5,
+    "ngram_dsc_online_latency_fit_min_feature_range": 0.5,
+    "ngram_dsc_online_latency_fit_min_nonzero_k_samples": 8,
+    "ngram_dsc_realized_sample_min_decode_token_load": 1,
+    "ngram_dsc_realized_sample_min_smoothed_scheduled_tokens": 1.0,
+    "ngram_dsc_realized_sample_min_latency_s": 0.001,
+    "ngram_dsc_normal_decode_realized_log_interval": 64,
+    "ngram_dsc_near_best_goodput_ratio": 0.0,
+    "ngram_dsc_switch_hysteresis_ratio": 0.02,
+    "ngram_dsc_goodput_margin": 0.05,
+    "ngram_dsc_goodput_increase_margin": 0.10,
+    "ngram_dsc_realized_goodput_ema_alpha": 0.25,
+    "ngram_dsc_k0_baseline_min_samples": 1,
+    "ngram_dsc_initial_max_k": 1,
+    "ngram_dsc_min_spec_realized_samples_before_k0": 8,
+    "ngram_dsc_k0_sparse_evidence_margin": 0.10,
+    "ngram_dsc_fast_fail_min_steps": 2,
+    "ngram_dsc_fast_fail_max_steps": 3,
+    "ngram_dsc_fast_fail_max_acceptance_rate": 0.05,
+    "ngram_dsc_realized_goodput_guard_min_samples": 8,
+    "ngram_dsc_realized_goodput_guard_margin": 0.05,
+    "ngram_dsc_goodput_min_dwell_sec": 0.25,
+    "ngram_dsc_upward_min_position_samples": 8,
+    "ngram_dsc_scheduled_tokens_ema_alpha": 0.2,
+    "ngram_dsc_max_step_delta": 1,
+}
+
+
+def _load_ngram_dsc_profiled_latency_coefficients(
+    path_str: str,
+) -> dict[str, float]:
+    path = Path(path_str).expanduser()
+    with path.open("r", encoding="utf-8") as file:
+        payload = json.load(file)
+
+    if not isinstance(payload, dict):
+        raise ValueError(
+            "ngram_dsc profiled latency coefficient file must contain a JSON object."
+        )
+
+    coefficients_obj = payload.get("coefficients", payload)
+    if not isinstance(coefficients_obj, dict):
+        raise ValueError(
+            "ngram_dsc profiled latency coefficient file must contain a "
+            "'coefficients' object or direct coefficient keys."
+        )
+
+    aliases = {
+        "intercept_s": "ngram_dsc_profiled_latency_intercept_s",
+        "decode_token_load_coeff_s": (
+            "ngram_dsc_profiled_latency_decode_token_load_coeff_s"
+        ),
+        "scheduled_tokens_coeff_s": (
+            "ngram_dsc_profiled_latency_scheduled_tokens_coeff_s"
+        ),
+        "spec_tokens_coeff_s": "ngram_dsc_profiled_latency_spec_tokens_coeff_s",
+        "spec_scheduled_tokens_interaction_coeff_s": (
+            "ngram_dsc_profiled_latency_spec_scheduled_tokens_interaction_coeff_s"
+        ),
+    }
+
+    coefficients: dict[str, float] = {}
+    for key, value in coefficients_obj.items():
+        normalized_key = aliases.get(key, key)
+        if normalized_key not in {
+            "ngram_dsc_profiled_latency_intercept_s",
+            "ngram_dsc_profiled_latency_decode_token_load_coeff_s",
+            "ngram_dsc_profiled_latency_scheduled_tokens_coeff_s",
+            "ngram_dsc_profiled_latency_spec_tokens_coeff_s",
+            "ngram_dsc_profiled_latency_spec_scheduled_tokens_interaction_coeff_s",
+        }:
+            continue
+        coefficients[normalized_key] = float(value)
+    return coefficients
 
 MTPModelTypes = Literal[
     "deepseek_mtp",
@@ -60,6 +159,8 @@ SpeculativeMethod = Literal[
     NgramGPUTypes,
 ]
 RejectionSampleMethod = Literal["strict", "probabilistic"]
+NgramDSCStrategy = Literal["threshold", "goodput"]
+NgramDSCLatencyModel = Literal["heuristic", "profiled"]
 
 
 @config
@@ -133,8 +234,13 @@ class SpeculativeConfig:
     provided. Defaults to 1."""
     ngram_dsc: bool = False
     """Enable dynamic switching control (DSC) for ngram speculation. When
-    enabled, the scheduler disables ngram speculative tokens under heavy decode
-    load and re-enables them after load drops and cooldown elapses."""
+    enabled, the scheduler dynamically controls the speculative ngram length.
+    The default threshold strategy disables ngram speculation under heavy
+    decode load and re-enables it after load drops and cooldown elapses."""
+    ngram_dsc_strategy: NgramDSCStrategy = "threshold"
+    """Scheduler policy used by ngram DSC. `threshold` preserves the existing
+    binary on/off behavior. `goodput` uses a TurboSpec-style goodput estimate
+    to choose an effective speculative length in [0, num_speculative_tokens]."""
     ngram_dsc_disable_decode_tokens: int | None = Field(default=None, ge=1)
     """Disable ngram speculation when the current number of running decode
     tokens reaches this threshold. If None, the scheduler picks an automatic
@@ -146,6 +252,214 @@ class SpeculativeConfig:
     ngram_dsc_switch_cooldown_sec: float = Field(default=30.0, ge=0.0)
     """Minimum time in seconds between DSC mode switches, used to avoid
     oscillation under fluctuating load."""
+    ngram_dsc_initial_acceptance_rate: float = Field(default=0.8, ge=0.0, le=1.0)
+    """Initial acceptance-rate estimate used by the goodput-based ngram DSC
+    controller before any online observations are available."""
+    ngram_dsc_acceptance_ema_alpha: float = Field(default=0.3, gt=0.0, le=1.0)
+    """Smoothing factor for the goodput-based ngram DSC acceptance-rate EMA.
+    Larger values adapt faster to recent acceptance observations."""
+    ngram_dsc_position_acceptance_ema_alpha: float | None = Field(
+        default=None, gt=0.0, le=1.0
+    )
+    """Optional smoothing factor for per-position acceptance-rate EMAs. When
+    omitted, the controller reuses `ngram_dsc_acceptance_ema_alpha`."""
+    ngram_dsc_position_acceptance_prior_rate: float | None = Field(
+        default=None, ge=0.0, le=1.0
+    )
+    """Optional prior mean used to shrink per-position acceptance estimates
+    under sparse evidence. When omitted, the controller reuses
+    `ngram_dsc_initial_acceptance_rate`."""
+    ngram_dsc_position_acceptance_prior_decay: float = Field(
+        default=1.0, ge=0.0, le=1.0
+    )
+    """Per-position multiplicative decay applied to the cold-start prior
+    acceptance rate. Values below 1.0 make later draft positions more
+    pessimistic before any evidence exists."""
+    ngram_dsc_position_acceptance_prior_strength: float = Field(
+        default=8.0, ge=0.0
+    )
+    """Pseudo-count strength for the per-position acceptance prior. Larger
+    values make the controller rely more on the prior until enough
+    observations are collected."""
+    ngram_dsc_position_acceptance_confidence_z: float = Field(
+        default=1.0, ge=0.0
+    )
+    """Confidence penalty applied to per-position posterior estimates. The
+    controller subtracts `z * stddev` from the posterior mean to avoid
+    overestimating late-position acceptance under sparse evidence."""
+    ngram_dsc_base_latency_tokens: float = Field(default=32.0, gt=0.0)
+    """Fixed per-step latency term for the goodput-based ngram DSC estimator.
+    This approximates non-token-dependent target-model overhead."""
+    ngram_dsc_latency_model: NgramDSCLatencyModel = "heuristic"
+    """Latency estimator used by the goodput-based ngram DSC controller.
+    `heuristic` preserves the current token-count proxy. `profiled` uses a
+    fitted offline latency model with coefficients supplied below."""
+    ngram_dsc_profiled_latency_coefficients_path: str | None = None
+    """Optional path to a JSON file containing fitted profiled latency
+    coefficients. When provided, the file values override the inline profiled
+    latency coefficients and force `ngram_dsc_latency_model='profiled'`."""
+    ngram_dsc_profiled_latency_intercept_s: float = Field(default=0.0, ge=0.0)
+    """Intercept term for the profiled latency model, in seconds."""
+    ngram_dsc_profiled_latency_decode_token_load_coeff_s: float = Field(
+        default=0.0, ge=0.0
+    )
+    """Coefficient for running decode load in the profiled latency model,
+    in seconds per decode request."""
+    ngram_dsc_profiled_latency_scheduled_tokens_coeff_s: float = Field(
+        default=0.0, ge=0.0
+    )
+    """Coefficient for total scheduled tokens in the profiled latency model,
+    in seconds per scheduled token."""
+    ngram_dsc_profiled_latency_spec_tokens_coeff_s: float = Field(
+        default=0.0, ge=0.0
+    )
+    """Coefficient for speculative width k in the profiled latency model,
+    in seconds per speculative token."""
+    ngram_dsc_profiled_latency_spec_scheduled_tokens_interaction_coeff_s: float = (
+        Field(default=0.0, ge=0.0)
+    )
+    """Interaction coefficient for speculative width and scheduled tokens in
+    the profiled latency model, in seconds per (k * scheduled_tokens)."""
+    ngram_dsc_online_latency_fitting: bool = False
+    """Enable automatic online refitting of the profiled latency model from
+    realized decode-step latency samples observed during serving."""
+    ngram_dsc_online_latency_fit_min_samples: int = Field(default=32, ge=1)
+    """Minimum number of filtered realized-latency samples required before
+    the controller updates profiled latency coefficients online."""
+    ngram_dsc_online_latency_fit_warmup_samples: int = Field(default=4, ge=0)
+    """Number of initial realized-latency samples to ignore before online
+    fitting starts. This helps avoid warmup and graph-capture skew."""
+    ngram_dsc_online_latency_fit_refit_interval_samples: int = Field(
+        default=8, ge=1
+    )
+    """Minimum number of new filtered samples required between online
+    latency-model refits."""
+    ngram_dsc_online_latency_fit_max_samples: int = Field(default=256, ge=1)
+    """Maximum number of recent realized-latency samples retained for online
+    fitting. Older samples are evicted FIFO once this cap is reached."""
+    ngram_dsc_online_latency_fit_max_latency_ratio_to_median: float = Field(
+        default=3.0, gt=0.0
+    )
+    """Discard realized-latency samples above median * ratio during online
+    fitting. This filters warmup spikes and transient outliers."""
+    ngram_dsc_online_latency_fit_ema_alpha: float = Field(
+        default=0.25, gt=0.0, le=1.0
+    )
+    """EMA factor used to blend each new online latency-model fit into the
+    existing coefficients. Smaller values preserve the bootstrap profile
+    longer and reduce oscillation."""
+    ngram_dsc_online_latency_fit_max_relative_update: float = Field(
+        default=0.5, ge=0.0
+    )
+    """Maximum per-refit relative coefficient change for online latency-model
+    updates. This bounds abrupt shifts when the regression is underdetermined."""
+    ngram_dsc_online_latency_fit_min_feature_range: float = Field(
+        default=0.5, ge=0.0
+    )
+    """Minimum feature range required before a non-intercept latency
+    coefficient is allowed to refit online. Features with insufficient
+    variation remain frozen at their current values."""
+    ngram_dsc_online_latency_fit_min_nonzero_k_samples: int = Field(
+        default=0, ge=0
+    )
+    """Minimum number of recent valid realized-latency samples with
+    `effective_num_spec_tokens > 0` required before any structural profiled
+    latency coefficients other than the intercept are allowed to refit
+    online. This keeps narrow `k=0` traces from overwriting the bootstrap
+    latency shape."""
+    ngram_dsc_online_latency_fit_max_realized_latency_s: float | None = Field(
+        default=None, gt=0.0
+    )
+    """Optional hard upper bound for realized-latency samples included in
+    online latency-model fitting."""
+    ngram_dsc_realized_sample_min_decode_token_load: int = Field(default=1, ge=0)
+    """Minimum decode-token load required before a normal-decode (`k=0`)
+    realized sample is considered stable enough for TurboSpec telemetry and
+    online latency fitting."""
+    ngram_dsc_realized_sample_min_smoothed_scheduled_tokens: float = Field(
+        default=1.0, ge=0.0
+    )
+    """Minimum smoothed scheduled-token count required before a normal-decode
+    (`k=0`) realized sample is considered stable enough for TurboSpec
+    telemetry and online latency fitting."""
+    ngram_dsc_realized_sample_min_latency_s: float = Field(default=0.001, ge=0.0)
+    """Minimum realized decode-step latency required before a normal-decode
+    (`k=0`) realized sample is considered stable enough for TurboSpec
+    telemetry and online latency fitting."""
+    ngram_dsc_normal_decode_realized_log_interval: int = Field(default=64, ge=1)
+    """Emit at most one detailed `NGRAM_DSC_REALIZED` log per this many valid
+    normal-decode (`k=0`) samples. Speculative realized steps are always
+    logged."""
+    ngram_dsc_near_best_goodput_ratio: float = Field(default=0.0, ge=0.0)
+    """Relative tolerance for TTFT-aware tie-breaking. When multiple
+    candidates are within this fraction of the best predicted goodput, the
+    controller chooses the lower-latency candidate."""
+    ngram_dsc_switch_hysteresis_ratio: float = Field(default=0.02, ge=0.0)
+    """Minimum relative predicted-goodput improvement required before the
+    controller changes from the current speculative width to a different
+    width. This suppresses flapping on near-tied candidates."""
+    ngram_dsc_goodput_margin: float = Field(default=0.05, ge=0.0)
+    """Minimum relative goodput improvement required before the goodput-based
+    DSC controller changes the current speculative length."""
+    ngram_dsc_goodput_increase_margin: float = Field(default=0.10, ge=0.0)
+    """Minimum relative goodput improvement required before the goodput-based
+    DSC controller increases the current speculative length. This is
+    intentionally stricter than the general margin to reduce oscillation."""
+    ngram_dsc_realized_goodput_ema_alpha: float = Field(
+        default=0.25, gt=0.0, le=1.0
+    )
+    """EMA factor used for recent realized-goodput tracking by speculative
+    width. This keeps the controller anchored to recent serving behavior
+    instead of a full-history average."""
+    ngram_dsc_k0_baseline_min_samples: int = Field(default=1, ge=1)
+    """Minimum number of realized `k=0` decode steps required before the
+    controller is allowed to replace the predicted `k=0` baseline with the
+    realized normal-decode baseline."""
+    ngram_dsc_initial_max_k: int = Field(default=1, ge=0)
+    """Maximum speculative width allowed at cold start before the controller
+    has accumulated meaningful acceptance evidence. This reduces one-request
+    speculative waste by starting conservatively."""
+    ngram_dsc_min_spec_realized_samples_before_k0: int = Field(default=8, ge=0)
+    """Minimum number of realized speculative (`k>0`) samples before the
+    controller is allowed to disable speculation on a small predicted
+    goodput advantage alone."""
+    ngram_dsc_k0_sparse_evidence_margin: float = Field(default=0.10, ge=0.0)
+    """When speculative evidence is still sparse, `k=0` must beat the best
+    positive speculative width by at least this relative goodput margin
+    before the controller shuts prompt lookup off."""
+    ngram_dsc_fast_fail_min_steps: int = Field(default=2, ge=1)
+    """Minimum number of early speculative verify steps required before the
+    controller can trigger an immediate fast-fail to `k=0`."""
+    ngram_dsc_fast_fail_max_steps: int = Field(default=3, ge=1)
+    """Maximum number of early speculative verify steps during which the
+    fast-fail rule is active. After this window, normal goodput control
+    takes over."""
+    ngram_dsc_fast_fail_max_acceptance_rate: float = Field(
+        default=0.05, ge=0.0, le=1.0
+    )
+    """If early accepted / drafted token ratio stays at or below this value
+    during the fast-fail window, the controller immediately disables
+    speculation by switching to `k=0`."""
+    ngram_dsc_realized_goodput_guard_min_samples: int = Field(default=8, ge=1)
+    """Minimum number of realized samples required before recent realized
+    goodput for a speculative width can be used to block upward moves."""
+    ngram_dsc_realized_goodput_guard_margin: float = Field(default=0.05, ge=0.0)
+    """Relative underperformance margin used by the realized-goodput guard.
+    If a wider speculative width underperforms a narrower recent baseline by
+    more than this margin, the controller will not move upward into it."""
+    ngram_dsc_upward_min_position_samples: int = Field(default=8, ge=0)
+    """Minimum number of observed opportunities required for each new draft
+    position before the goodput controller is allowed to increase `k` into
+    that position."""
+    ngram_dsc_goodput_min_dwell_sec: float = Field(default=0.25, ge=0.0)
+    """Minimum time to keep the current speculative length before the
+    goodput-based DSC controller can switch again."""
+    ngram_dsc_max_step_delta: int = Field(default=1, ge=1)
+    """Maximum change in effective speculative length per scheduler step for
+    the goodput-based DSC controller. This reduces oscillation."""
+    ngram_dsc_scheduled_tokens_ema_alpha: float = Field(default=0.2, gt=0.0, le=1.0)
+    """Smoothing factor for the scheduler-load EMA used by the goodput-based
+    DSC controller. Smaller values trade responsiveness for stability."""
 
     # Alternative drafting strategies
     speculative_token_tree: str | None = None
@@ -358,6 +672,12 @@ class SpeculativeConfig:
         return hf_config
 
     def __post_init__(self):
+        fields_set = set(getattr(self, "__pydantic_fields_set__", set()))
+        uses_ngram_dsc_alias = (
+            self.method == "ngram_dsc"
+            or (self.method is None and self.model == "ngram_dsc")
+        )
+
         # Note: "method" is a new parameter that helps to extend the
         # configuration of non-model-based proposers, and the "model" parameter
         # will be used to set the draft model, eagle head, or additional weight
@@ -414,6 +734,11 @@ class SpeculativeConfig:
             if self.method == "ngram_dsc":
                 self.ngram_dsc = True
             self.method = "ngram"
+
+        if uses_ngram_dsc_alias:
+            for field_name, value in _NGRAM_DSC_TURBOSPEC_DEFAULTS.items():
+                if field_name not in fields_set:
+                    setattr(self, field_name, value)
 
         if self.method in ("ngram", "ngram_gpu"):
             # Set default values if not provided
@@ -811,6 +1136,48 @@ class SpeculativeConfig:
             raise ValueError(
                 "ngram_dsc_enable_decode_tokens must be <= "
                 "ngram_dsc_disable_decode_tokens."
+            )
+        if self.ngram_dsc_strategy == "goodput" and not self.ngram_dsc:
+            raise ValueError(
+                "ngram_dsc_strategy='goodput' requires ngram_dsc to be enabled."
+            )
+        if self.ngram_dsc_profiled_latency_coefficients_path is not None:
+            try:
+                coefficients = _load_ngram_dsc_profiled_latency_coefficients(
+                    self.ngram_dsc_profiled_latency_coefficients_path
+                )
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                raise ValueError(
+                    "Failed to load ngram_dsc profiled latency coefficients from "
+                    f"{self.ngram_dsc_profiled_latency_coefficients_path!r}: {exc}"
+                ) from exc
+            for field_name, value in coefficients.items():
+                setattr(self, field_name, value)
+            self.ngram_dsc_latency_model = "profiled"
+        if self.ngram_dsc_online_latency_fitting:
+            self.ngram_dsc_latency_model = "profiled"
+        if (
+            self.ngram_dsc_latency_model == "profiled"
+            and (
+                self.ngram_dsc_profiled_latency_intercept_s
+                + self.ngram_dsc_profiled_latency_decode_token_load_coeff_s
+                + self.ngram_dsc_profiled_latency_scheduled_tokens_coeff_s
+                + self.ngram_dsc_profiled_latency_spec_tokens_coeff_s
+                + self.ngram_dsc_profiled_latency_spec_scheduled_tokens_interaction_coeff_s
+            )
+            <= 0.0
+        ):
+            raise ValueError(
+                "ngram_dsc_latency_model='profiled' requires at least one "
+                "positive profiled latency coefficient."
+            )
+        if (
+            self.ngram_dsc_online_latency_fit_min_samples
+            > self.ngram_dsc_online_latency_fit_max_samples
+        ):
+            raise ValueError(
+                "ngram_dsc_online_latency_fit_min_samples must be <= "
+                "ngram_dsc_online_latency_fit_max_samples."
             )
 
         if self.draft_model_config:

@@ -317,6 +317,7 @@ class NgramProposerGPU:
         token_ids_gpu: torch.Tensor,  # [batch_size, max_len]
         valid_sampled_token_ids_gpu: torch.Tensor,  # [batch_size, num_spec_tokens + 1]
         valid_sampled_tokens_count: torch.Tensor,  # [batch_size]
+        effective_num_spec_tokens: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Propose draft tokens using GPU-accelerated n-gram matching.
@@ -337,6 +338,22 @@ class NgramProposerGPU:
         """
         assert token_ids_gpu.device == self.device
         assert num_tokens_no_spec.device == self.device
+
+        runtime_k = (
+            self.k if effective_num_spec_tokens is None else effective_num_spec_tokens
+        )
+        runtime_k = max(0, min(self.k, runtime_k))
+        if runtime_k <= 0:
+            batch_size = num_tokens_no_spec.shape[0]
+            return (
+                torch.full(
+                    (batch_size, self.k),
+                    -1,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                torch.zeros(batch_size, dtype=torch.int32, device=self.device),
+            )
 
         batch_size = num_tokens_no_spec.shape[0]
         max_seq_len = token_ids_gpu.shape[1]
@@ -380,6 +397,12 @@ class NgramProposerGPU:
                     num_tokens_tmp,
                     token_ids_gpu,
                     combined_mask,
+                )
+
+            if runtime_k < self.k:
+                draft_tokens[:, runtime_k:] = -1
+                num_valid_draft_tokens = torch.clamp(
+                    num_valid_draft_tokens, max=runtime_k
                 )
 
             return draft_tokens, num_valid_draft_tokens

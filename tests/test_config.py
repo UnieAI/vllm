@@ -81,6 +81,78 @@ def test_async_scheduling_with_ngram_dsc_promotes_to_ngram_gpu():
     assert cfg.speculative_config.ngram_dsc is True
 
 
+def test_ngram_dsc_method_applies_turbospec_defaults():
+    cfg = SpeculativeConfig(
+        method="ngram_dsc",
+        num_speculative_tokens=4,
+        prompt_lookup_min=3,
+        prompt_lookup_max=8,
+    )
+
+    assert cfg.method == "ngram"
+    assert cfg.ngram_dsc is True
+    assert cfg.ngram_dsc_strategy == "goodput"
+    assert cfg.ngram_dsc_latency_model == "profiled"
+    assert cfg.ngram_dsc_position_acceptance_prior_rate == pytest.approx(0.4)
+    assert cfg.ngram_dsc_position_acceptance_prior_decay == pytest.approx(0.5)
+    assert cfg.ngram_dsc_profiled_latency_intercept_s == pytest.approx(0.015)
+    assert cfg.ngram_dsc_profiled_latency_decode_token_load_coeff_s == pytest.approx(
+        0.002
+    )
+    assert cfg.ngram_dsc_profiled_latency_scheduled_tokens_coeff_s == pytest.approx(
+        0.006
+    )
+    assert cfg.ngram_dsc_profiled_latency_spec_tokens_coeff_s == pytest.approx(
+        0.004
+    )
+    assert (
+        cfg.ngram_dsc_profiled_latency_spec_scheduled_tokens_interaction_coeff_s
+        == pytest.approx(0.0005)
+    )
+    assert cfg.ngram_dsc_online_latency_fitting is True
+    assert cfg.ngram_dsc_online_latency_fit_min_samples == 32
+    assert cfg.ngram_dsc_online_latency_fit_warmup_samples == 4
+    assert cfg.ngram_dsc_online_latency_fit_refit_interval_samples == 8
+    assert cfg.ngram_dsc_online_latency_fit_max_samples == 256
+    assert cfg.ngram_dsc_online_latency_fit_max_latency_ratio_to_median == pytest.approx(
+        3.0
+    )
+    assert cfg.ngram_dsc_online_latency_fit_min_nonzero_k_samples == 8
+    assert cfg.ngram_dsc_realized_sample_min_decode_token_load == 1
+    assert cfg.ngram_dsc_realized_sample_min_smoothed_scheduled_tokens == pytest.approx(
+        1.0
+    )
+    assert cfg.ngram_dsc_realized_sample_min_latency_s == pytest.approx(0.001)
+    assert cfg.ngram_dsc_normal_decode_realized_log_interval == 64
+    assert cfg.ngram_dsc_near_best_goodput_ratio == pytest.approx(0.0)
+    assert cfg.ngram_dsc_realized_goodput_ema_alpha == pytest.approx(0.25)
+    assert cfg.ngram_dsc_k0_baseline_min_samples == 1
+    assert cfg.ngram_dsc_initial_max_k == 1
+    assert cfg.ngram_dsc_min_spec_realized_samples_before_k0 == 8
+    assert cfg.ngram_dsc_k0_sparse_evidence_margin == pytest.approx(0.10)
+    assert cfg.ngram_dsc_fast_fail_min_steps == 2
+    assert cfg.ngram_dsc_fast_fail_max_steps == 3
+    assert cfg.ngram_dsc_fast_fail_max_acceptance_rate == pytest.approx(0.05)
+    assert cfg.ngram_dsc_realized_goodput_guard_min_samples == 8
+    assert cfg.ngram_dsc_realized_goodput_guard_margin == pytest.approx(0.05)
+    assert cfg.ngram_dsc_position_acceptance_prior_strength == pytest.approx(8.0)
+    assert cfg.ngram_dsc_position_acceptance_confidence_z == pytest.approx(1.0)
+
+
+def test_ngram_dsc_method_keeps_explicit_turbospec_overrides():
+    cfg = SpeculativeConfig(
+        method="ngram_dsc",
+        num_speculative_tokens=4,
+        prompt_lookup_min=3,
+        prompt_lookup_max=8,
+        ngram_dsc_strategy="threshold",
+        ngram_dsc_online_latency_fitting=False,
+    )
+
+    assert cfg.ngram_dsc_strategy == "threshold"
+    assert cfg.ngram_dsc_online_latency_fitting is False
+
+
 @dataclass
 class _TestConfigFields:
     a: int

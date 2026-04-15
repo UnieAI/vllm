@@ -4514,8 +4514,12 @@ class GPUModelRunner(
         slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
     ) -> list[list[int]] | torch.Tensor:
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        effective_num_spec_tokens = scheduler_output.effective_num_spec_tokens
         spec_config = self.speculative_config
         assert spec_config is not None
+        proposer_num_spec_tokens = (
+            None if spec_config.ngram_dsc else effective_num_spec_tokens
+        )
         if spec_config.method == "ngram":
             from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
@@ -4525,6 +4529,7 @@ class GPUModelRunner(
                 sampled_token_ids,
                 self.input_batch.num_tokens_no_spec,
                 self.input_batch.token_ids_cpu,
+                effective_num_spec_tokens=proposer_num_spec_tokens,
                 slot_mappings=slot_mappings,
             )
         elif spec_config.use_ngram_gpu():
@@ -4551,6 +4556,7 @@ class GPUModelRunner(
                 self.token_ids_gpu_tensor[:batch_size],
                 valid_sampled_token_ids_gpu,
                 valid_sampled_tokens_count,
+                effective_num_spec_tokens=proposer_num_spec_tokens,
             )
 
             # Cache valid draft counts for scheduler-side trimming.

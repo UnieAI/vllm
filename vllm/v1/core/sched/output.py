@@ -226,6 +226,23 @@ class SchedulerOutput:
 
     # Whether speculative drafting should run in the worker for this step.
     enable_spec_decode: bool = True
+    # Effective ngram speculative length chosen for drafting in this step.
+    effective_num_spec_tokens: int = 0
+    # Controller estimates captured when the speculative width was chosen.
+    ngram_dsc_predicted_goodput: float | None = None
+    ngram_dsc_predicted_latency_s: float | None = None
+    ngram_dsc_predicted_generated_tokens: float | None = None
+    ngram_dsc_predicted_k0_goodput: float | None = None
+    ngram_dsc_baseline_k: int | None = None
+    ngram_dsc_baseline_goodput: float | None = None
+    ngram_dsc_baseline_latency_s: float | None = None
+    ngram_dsc_baseline_source: str | None = None
+    ngram_dsc_latency_model: str | None = None
+    ngram_dsc_best_candidate_k: int | None = None
+    ngram_dsc_decode_token_load: int | None = None
+    ngram_dsc_smoothed_total_num_scheduled_tokens: float | None = None
+    ngram_dsc_decode_batch_tokens: int | None = None
+    ngram_dsc_decode_batch_reqs: int | None = None
 
     # Used for adjusting acceptance rate calculation.
     num_invalid_spec_tokens: dict[str, int] | None = None
@@ -253,6 +270,7 @@ class SchedulerOutput:
             num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
+            effective_num_spec_tokens=0,
         )
 
 

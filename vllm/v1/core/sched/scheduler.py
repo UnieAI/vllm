@@ -57,6 +57,7 @@ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.spec_decode.ngram_dsc_controller import NgramDSCController
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
@@ -219,10 +220,51 @@ class Scheduler(SchedulerInterface):
         self._ngram_dsc_enable_decode_tokens = 0
         self._ngram_dsc_switch_cooldown_sec = 0.0
         self._ngram_dsc_last_switch_time = 0.0
-        self._ngram_dsc_last_status_log_time = 0.0
-        self._ngram_dsc_status_log_interval_sec = 5.0
+        self._ngram_dsc_last_summary_log_time = 0.0
+        self._ngram_dsc_summary_log_interval_sec = 10.0
+        self._ngram_dsc_logged_first_latency_refit = False
+        self._ngram_dsc_logged_full_latency_refit = False
+        self._ngram_dsc_strategy = "threshold"
+        self._ngram_dsc_effective_num_spec_tokens = 0
+        self._ngram_dsc_pending_effective_num_spec_tokens = 0
+        self._ngram_dsc_acceptance_rate_ema = 0.0
+        self._ngram_dsc_load_regime = "adaptive"
+        self._ngram_dsc_smoothed_total_num_scheduled_tokens = 0.0
+        self._ngram_dsc_proposal_coverage_ema = 1.0
+        self._ngram_dsc_decode_token_load = 0
+        self._ngram_dsc_current_goodput = 0.0
+        self._ngram_dsc_selected_goodput = 0.0
+        self._ngram_dsc_current_latency_s = 0.0
+        self._ngram_dsc_selected_latency_s = 0.0
+        self._ngram_dsc_selected_expected_tokens = 0.0
+        self._ngram_dsc_baseline_k = 0
+        self._ngram_dsc_baseline_goodput = 0.0
+        self._ngram_dsc_baseline_latency_s = 0.0
+        self._ngram_dsc_baseline_source = "predicted"
+        self._ngram_dsc_best_candidate_k = 0
+        self._ngram_dsc_candidate_goodputs: tuple[float, ...] = ()
+        self._ngram_dsc_candidate_latencies_s: tuple[float, ...] = ()
+        self._ngram_dsc_position_acceptance_rates: tuple[float, ...] = ()
+        self._ngram_dsc_conservative_position_acceptance_rates: tuple[float, ...] = ()
+        self._ngram_dsc_realized_goodputs_by_k: tuple[float, ...] = ()
+        self._ngram_dsc_realized_expected_tokens_by_k: tuple[float, ...] = ()
+        self._ngram_dsc_realized_speedups_vs_k0_by_k: tuple[float, ...] = ()
+        self._ngram_dsc_realized_speedups_vs_predicted_k0_by_k: tuple[float, ...] = ()
+        self._ngram_dsc_realized_speedups_vs_realized_k0_by_k: tuple[float, ...] = ()
+        self._ngram_dsc_realized_latencies_by_k: tuple[float, ...] = ()
+        self._ngram_dsc_realized_samples_by_k: tuple[int, ...] = ()
+        self._ngram_dsc_latency_model = "heuristic"
+        self._ngram_dsc_last_predicted_goodput = 0.0
+        self._ngram_dsc_last_predicted_latency_s = 0.0
+        self._ngram_dsc_last_predicted_generated_tokens = 0.0
+        self._ngram_dsc_last_realized_goodput = 0.0
+        self._ngram_dsc_last_realized_latency_s = 0.0
+        self._ngram_dsc_last_realized_generated_tokens = 0.0
+        self._ngram_dsc_controller: NgramDSCController | None = None
         if speculative_config:
             self.num_spec_tokens = speculative_config.num_speculative_tokens
+            self._ngram_dsc_effective_num_spec_tokens = self.num_spec_tokens
+            self._ngram_dsc_pending_effective_num_spec_tokens = self.num_spec_tokens
             if speculative_config.use_eagle():
                 self.use_eagle = True
                 self.num_lookahead_tokens = self.num_spec_tokens
@@ -233,35 +275,92 @@ class Scheduler(SchedulerInterface):
                 and speculative_config.ngram_dsc
             ):
                 self._ngram_dsc_enabled = True
-                decode_capacity = max(
-                    1, min(self.max_num_running_reqs, self.max_num_scheduled_tokens)
+                self._ngram_dsc_strategy = speculative_config.ngram_dsc_strategy
+                self._ngram_dsc_controller = NgramDSCController(
+                    speculative_config=speculative_config,
+                    max_num_running_reqs=self.max_num_running_reqs,
+                    max_num_scheduled_tokens=self.max_num_scheduled_tokens,
                 )
-                # Auto threshold should not scale unbounded with max_num_seqs;
-                # a cap keeps switching responsive on large-capacity servers.
-                auto_disable = max(1, min(128, decode_capacity // 2))
-                disable_decode_tokens = (
-                    speculative_config.ngram_dsc_disable_decode_tokens
-                    or auto_disable
+                self._ngram_dsc_disable_decode_tokens = (
+                    self._ngram_dsc_controller.disable_decode_tokens
                 )
-                enable_decode_tokens = (
-                    speculative_config.ngram_dsc_enable_decode_tokens
-                )
-                if enable_decode_tokens is None:
-                    enable_decode_tokens = max(1, int(disable_decode_tokens * 0.8))
-                self._ngram_dsc_disable_decode_tokens = disable_decode_tokens
-                self._ngram_dsc_enable_decode_tokens = min(
-                    enable_decode_tokens, disable_decode_tokens
+                self._ngram_dsc_enable_decode_tokens = (
+                    self._ngram_dsc_controller.enable_decode_tokens
                 )
                 self._ngram_dsc_switch_cooldown_sec = (
-                    speculative_config.ngram_dsc_switch_cooldown_sec
+                    self._ngram_dsc_controller.switch_cooldown_sec
+                )
+                self._ngram_dsc_acceptance_rate_ema = (
+                    self._ngram_dsc_controller.acceptance_rate_ema
+                )
+                self._ngram_dsc_effective_num_spec_tokens = (
+                    self._ngram_dsc_controller.current_effective_num_spec_tokens
+                )
+                self._ngram_dsc_pending_effective_num_spec_tokens = (
+                    self._ngram_dsc_effective_num_spec_tokens
+                )
+                self._ngram_dsc_latency_model = (
+                    self._ngram_dsc_controller.latency_model
                 )
                 logger.info(
-                    "NGRAM_DSC_INIT disable_decode_tokens=%d "
-                    "enable_decode_tokens=%d switch_cooldown_sec=%.2f "
-                    "method=%s max_num_seqs=%d max_num_scheduled_tokens=%d",
-                    self._ngram_dsc_disable_decode_tokens,
-                    self._ngram_dsc_enable_decode_tokens,
-                    self._ngram_dsc_switch_cooldown_sec,
+                    "NGRAM_DSC_INIT strategy=%s initial_acceptance_rate=%.3f "
+                    "goodput_margin=%.3f "
+                    "position_acceptance_prior_rate=%.2f "
+                    "position_acceptance_prior_strength=%.2f "
+                    "position_acceptance_confidence_z=%.2f "
+                    "latency_model=%s profiled_latency_coeffs="
+                    "(intercept=%.6f,decode_load=%.6f,scheduled_tokens=%.6f,"
+                    "spec_tokens=%.6f,spec_x_scheduled_tokens=%.6f) "
+                    "online_latency_fitting=%s min_fit_samples=%d "
+                    "warmup_fit_samples=%d refit_interval_samples=%d "
+                    "max_fit_samples=%d max_latency_ratio_to_median=%.2f "
+                    "online_fit_ema_alpha=%.2f "
+                    "online_fit_max_relative_update=%.2f "
+                    "online_fit_min_feature_range=%.2f "
+                    "goodput_increase_margin=%.3f "
+                    "realized_goodput_ema_alpha=%.2f "
+                    "k0_baseline_min_samples=%d "
+                    "initial_max_k=%d "
+                    "fast_fail_min_steps=%d fast_fail_max_steps=%d "
+                    "fast_fail_max_acceptance_rate=%.3f "
+                    "realized_goodput_guard_min_samples=%d "
+                    "realized_goodput_guard_margin=%.3f "
+                    "upward_min_position_samples=%d "
+                    "scheduled_tokens_ema_alpha=%.3f method=%s max_num_seqs=%d "
+                    "max_num_scheduled_tokens=%d",
+                    self._ngram_dsc_strategy,
+                    self._ngram_dsc_acceptance_rate_ema,
+                    speculative_config.ngram_dsc_goodput_margin,
+                    speculative_config.ngram_dsc_position_acceptance_prior_rate
+                    or 0.0,
+                    speculative_config.ngram_dsc_position_acceptance_prior_strength,
+                    speculative_config.ngram_dsc_position_acceptance_confidence_z,
+                    self._ngram_dsc_latency_model,
+                    speculative_config.ngram_dsc_profiled_latency_intercept_s,
+                    speculative_config.ngram_dsc_profiled_latency_decode_token_load_coeff_s,
+                    speculative_config.ngram_dsc_profiled_latency_scheduled_tokens_coeff_s,
+                    speculative_config.ngram_dsc_profiled_latency_spec_tokens_coeff_s,
+                    speculative_config.ngram_dsc_profiled_latency_spec_scheduled_tokens_interaction_coeff_s,
+                    speculative_config.ngram_dsc_online_latency_fitting,
+                    speculative_config.ngram_dsc_online_latency_fit_min_samples,
+                    speculative_config.ngram_dsc_online_latency_fit_warmup_samples,
+                    speculative_config.ngram_dsc_online_latency_fit_refit_interval_samples,
+                    speculative_config.ngram_dsc_online_latency_fit_max_samples,
+                    speculative_config.ngram_dsc_online_latency_fit_max_latency_ratio_to_median,
+                    speculative_config.ngram_dsc_online_latency_fit_ema_alpha,
+                    speculative_config.ngram_dsc_online_latency_fit_max_relative_update,
+                    speculative_config.ngram_dsc_online_latency_fit_min_feature_range,
+                    speculative_config.ngram_dsc_goodput_increase_margin,
+                    speculative_config.ngram_dsc_realized_goodput_ema_alpha,
+                    speculative_config.ngram_dsc_k0_baseline_min_samples,
+                    speculative_config.ngram_dsc_initial_max_k,
+                    speculative_config.ngram_dsc_fast_fail_min_steps,
+                    speculative_config.ngram_dsc_fast_fail_max_steps,
+                    speculative_config.ngram_dsc_fast_fail_max_acceptance_rate,
+                    speculative_config.ngram_dsc_realized_goodput_guard_min_samples,
+                    speculative_config.ngram_dsc_realized_goodput_guard_margin,
+                    speculative_config.ngram_dsc_upward_min_position_samples,
+                    speculative_config.ngram_dsc_scheduled_tokens_ema_alpha,
                     speculative_config.method,
                     self.max_num_running_reqs,
                     self.max_num_scheduled_tokens,
@@ -950,6 +1049,18 @@ class Scheduler(SchedulerInterface):
             else None
         )
 
+        decode_batch_reqs, decode_batch_tokens = (
+            self._get_scheduled_decode_batch_stats(
+                scheduled_running_reqs + scheduled_resumed_reqs + scheduled_new_reqs,
+                num_scheduled_tokens,
+            )
+        )
+        effective_num_spec_tokens = self._get_effective_ngram_spec_tokens(
+            decode_batch_tokens=decode_batch_tokens
+        )
+        self._ngram_dsc_pending_effective_num_spec_tokens = (
+            effective_num_spec_tokens
+        )
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -966,7 +1077,56 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
-            enable_spec_decode=self._should_use_ngram_spec(),
+            enable_spec_decode=effective_num_spec_tokens > 0,
+            effective_num_spec_tokens=effective_num_spec_tokens,
+            ngram_dsc_predicted_goodput=(
+                self._ngram_dsc_selected_goodput if self._ngram_dsc_enabled else None
+            ),
+            ngram_dsc_predicted_latency_s=(
+                self._ngram_dsc_selected_latency_s if self._ngram_dsc_enabled else None
+            ),
+            ngram_dsc_predicted_generated_tokens=(
+                self._ngram_dsc_selected_expected_tokens
+                if self._ngram_dsc_enabled
+                else None
+            ),
+            ngram_dsc_predicted_k0_goodput=(
+                self._ngram_dsc_candidate_goodputs[0]
+                if self._ngram_dsc_enabled and self._ngram_dsc_candidate_goodputs
+                else None
+            ),
+            ngram_dsc_baseline_goodput=(
+                self._ngram_dsc_baseline_goodput if self._ngram_dsc_enabled else None
+            ),
+            ngram_dsc_baseline_k=(
+                self._ngram_dsc_baseline_k if self._ngram_dsc_enabled else None
+            ),
+            ngram_dsc_baseline_latency_s=(
+                self._ngram_dsc_baseline_latency_s if self._ngram_dsc_enabled else None
+            ),
+            ngram_dsc_baseline_source=(
+                self._ngram_dsc_baseline_source if self._ngram_dsc_enabled else None
+            ),
+            ngram_dsc_latency_model=(
+                self._ngram_dsc_latency_model if self._ngram_dsc_enabled else None
+            ),
+            ngram_dsc_best_candidate_k=(
+                self._ngram_dsc_best_candidate_k if self._ngram_dsc_enabled else None
+            ),
+            ngram_dsc_decode_token_load=(
+                self._ngram_dsc_decode_token_load if self._ngram_dsc_enabled else None
+            ),
+            ngram_dsc_smoothed_total_num_scheduled_tokens=(
+                self._ngram_dsc_smoothed_total_num_scheduled_tokens
+                if self._ngram_dsc_enabled
+                else None
+            ),
+            ngram_dsc_decode_batch_tokens=(
+                decode_batch_tokens if self._ngram_dsc_enabled else None
+            ),
+            ngram_dsc_decode_batch_reqs=(
+                decode_batch_reqs if self._ngram_dsc_enabled else None
+            ),
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1359,6 +1519,11 @@ class Scheduler(SchedulerInterface):
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
+        ngram_dsc_num_drafts = 0
+        ngram_dsc_total_draft_tokens = 0
+        ngram_dsc_total_accepted_tokens = 0
+        ngram_dsc_position_draft_counts = [0] * self.num_spec_tokens
+        ngram_dsc_position_accept_counts = [0] * self.num_spec_tokens
         kv_connector_stats: KVConnectorStats | None = (
             kv_connector_output.kv_connector_stats if kv_connector_output else None
         )
@@ -1410,6 +1575,11 @@ class Scheduler(SchedulerInterface):
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_accepted = len(generated_token_ids) - 1
                 num_rejected = num_draft_tokens - num_accepted
+                adjusted_num_draft_tokens = self._get_adjusted_ngram_dsc_draft_tokens(
+                    num_draft_tokens=num_draft_tokens,
+                    num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
+                    request_id=req_id,
+                )
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
                 # tokens and rejections. If some tokens are rejected,
@@ -1421,6 +1591,14 @@ class Scheduler(SchedulerInterface):
                 # the scheduled spec tokens count and so is similarly adjusted.
                 if request.num_output_placeholders > 0:
                     request.num_output_placeholders -= num_rejected
+                ngram_dsc_num_drafts += 1
+                ngram_dsc_total_draft_tokens += adjusted_num_draft_tokens
+                ngram_dsc_total_accepted_tokens += num_accepted
+                adjusted_num_accepted = min(num_accepted, adjusted_num_draft_tokens)
+                for position in range(adjusted_num_draft_tokens):
+                    ngram_dsc_position_draft_counts[position] += 1
+                for position in range(adjusted_num_accepted):
+                    ngram_dsc_position_accept_counts[position] += 1
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
@@ -1593,6 +1771,25 @@ class Scheduler(SchedulerInterface):
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
 
+        self._observe_ngram_dsc_batch(
+            num_draft_tokens=ngram_dsc_total_draft_tokens,
+            num_accepted_tokens=ngram_dsc_total_accepted_tokens,
+            speculation_attempted=scheduler_output.enable_spec_decode,
+            num_eligible_decode_reqs=(
+                scheduler_output.ngram_dsc_decode_batch_reqs or 0
+            ),
+            num_draft_reqs=ngram_dsc_num_drafts,
+            position_draft_counts=tuple(ngram_dsc_position_draft_counts),
+            position_accept_counts=tuple(ngram_dsc_position_accept_counts),
+        )
+        self._log_ngram_dsc_realized_batch(
+            scheduler_output=scheduler_output,
+            model_runner_output=model_runner_output,
+            num_drafts=ngram_dsc_num_drafts,
+            num_draft_tokens=ngram_dsc_total_draft_tokens,
+            num_accepted_tokens=ngram_dsc_total_accepted_tokens,
+        )
+
         return engine_core_outputs
 
     @staticmethod
@@ -1707,7 +1904,7 @@ class Scheduler(SchedulerInterface):
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
 
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
-        use_ngram_spec = self._should_use_ngram_spec()
+        effective_num_spec_tokens = self._ngram_dsc_pending_effective_num_spec_tokens
         for req_id, spec_token_ids in zip(
             draft_token_ids.req_ids,
             draft_token_ids.draft_token_ids,
@@ -1723,12 +1920,13 @@ class Scheduler(SchedulerInterface):
                     request.spec_token_ids = []
                 continue
 
-            if not use_ngram_spec:
+            if effective_num_spec_tokens <= 0:
                 if request.spec_token_ids:
                     request.spec_token_ids = []
                 continue
 
             # Add newly generated spec token ids to the request.
+            spec_token_ids = spec_token_ids[:effective_num_spec_tokens]
             if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request
                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
@@ -1741,19 +1939,95 @@ class Scheduler(SchedulerInterface):
             if request.num_computed_tokens >= request.num_prompt_tokens
         )
 
-    def _should_use_ngram_spec(self) -> bool:
+    def _get_scheduled_decode_batch_stats(
+        self,
+        scheduled_requests: list[Request],
+        num_scheduled_tokens: dict[str, int],
+    ) -> tuple[int, int]:
+        decode_batch_reqs = 0
+        decode_batch_tokens = 0
+        for request in scheduled_requests:
+            scheduled_tokens = num_scheduled_tokens.get(request.request_id, 0)
+            if scheduled_tokens <= 0:
+                continue
+            if request.num_computed_tokens < request.num_prompt_tokens:
+                continue
+            decode_batch_reqs += 1
+            decode_batch_tokens += scheduled_tokens
+        return decode_batch_reqs, decode_batch_tokens
+
+    def _get_effective_ngram_spec_tokens(
+        self, decode_batch_tokens: int | None = None
+    ) -> int:
         if not self._ngram_dsc_enabled:
-            return True
+            self._ngram_dsc_effective_num_spec_tokens = self.num_spec_tokens
+            return self._ngram_dsc_effective_num_spec_tokens
 
         decode_token_load = self._get_running_decode_token_load()
+        self._ngram_dsc_decode_token_load = decode_token_load
         now = time.monotonic()
+        estimated_decode_batch_tokens = (
+            decode_batch_tokens
+            if decode_batch_tokens is not None
+            else max(1, decode_token_load)
+        )
+        assert self._ngram_dsc_controller is not None
 
-        if self._ngram_dsc_spec_enabled:
-            if decode_token_load >= self._ngram_dsc_disable_decode_tokens:
-                self._ngram_dsc_spec_enabled = False
-                self._ngram_dsc_last_switch_time = now
+        prev_effective_num_spec_tokens = self._ngram_dsc_effective_num_spec_tokens
+        prev_spec_enabled = self._ngram_dsc_spec_enabled
+        prev_switch_time = self._ngram_dsc_controller.last_switch_time
+
+        state = self._ngram_dsc_controller.decide(
+            decode_token_load=decode_token_load,
+            total_num_scheduled_tokens=estimated_decode_batch_tokens,
+            now=now,
+        )
+        self._ngram_dsc_effective_num_spec_tokens = state.effective_num_spec_tokens
+        self._ngram_dsc_spec_enabled = state.spec_enabled
+        self._ngram_dsc_acceptance_rate_ema = state.acceptance_rate_ema
+        self._ngram_dsc_load_regime = state.load_regime
+        self._ngram_dsc_smoothed_total_num_scheduled_tokens = (
+            state.smoothed_total_num_scheduled_tokens
+        )
+        self._ngram_dsc_proposal_coverage_ema = state.proposal_coverage_ema
+        self._ngram_dsc_current_goodput = state.current_goodput
+        self._ngram_dsc_selected_goodput = state.selected_goodput
+        self._ngram_dsc_current_latency_s = state.current_latency_s
+        self._ngram_dsc_selected_latency_s = state.selected_latency_s
+        self._ngram_dsc_selected_expected_tokens = state.selected_expected_tokens
+        self._ngram_dsc_baseline_k = state.baseline_k
+        self._ngram_dsc_baseline_goodput = state.baseline_goodput
+        self._ngram_dsc_baseline_latency_s = state.baseline_latency_s
+        self._ngram_dsc_baseline_source = state.baseline_source
+        self._ngram_dsc_best_candidate_k = state.best_candidate_k
+        self._ngram_dsc_candidate_goodputs = state.candidate_goodputs
+        self._ngram_dsc_candidate_latencies_s = state.candidate_latencies_s
+        self._ngram_dsc_position_acceptance_rates = state.position_acceptance_rates
+        self._ngram_dsc_conservative_position_acceptance_rates = (
+            state.conservative_position_acceptance_rates
+        )
+        self._ngram_dsc_realized_goodputs_by_k = state.realized_goodputs_by_k
+        self._ngram_dsc_realized_expected_tokens_by_k = (
+            state.realized_expected_tokens_by_k
+        )
+        self._ngram_dsc_realized_speedups_vs_k0_by_k = (
+            state.realized_speedups_vs_k0_by_k
+        )
+        self._ngram_dsc_realized_speedups_vs_predicted_k0_by_k = (
+            state.realized_speedups_vs_predicted_k0_by_k
+        )
+        self._ngram_dsc_realized_speedups_vs_realized_k0_by_k = (
+            state.realized_speedups_vs_realized_k0_by_k
+        )
+        self._ngram_dsc_realized_latencies_by_k = state.realized_latencies_by_k
+        self._ngram_dsc_realized_samples_by_k = state.realized_samples_by_k
+        self._ngram_dsc_latency_model = state.latency_model
+        self._ngram_dsc_last_switch_time = self._ngram_dsc_controller.last_switch_time
+
+        if self._ngram_dsc_strategy == "threshold":
+            if prev_spec_enabled and not self._ngram_dsc_spec_enabled:
                 logger.info(
-                    "NGRAM_DSC_SWITCH to=normal_decode "
+                    "NGRAM_DSC_SWITCH to=normal_decode strategy=threshold "
                     "decode_token_load=%d disable_threshold=%d "
                     "enable_threshold=%d cooldown_sec=%.2f",
                     decode_token_load,
@@ -1761,58 +2035,284 @@ class Scheduler(SchedulerInterface):
                     self._ngram_dsc_enable_decode_tokens,
                     self._ngram_dsc_switch_cooldown_sec,
                 )
-            decision = self._ngram_dsc_spec_enabled
-            self._log_ngram_dsc_state(now, decode_token_load, decision)
-            return decision
-
-        if (
-            now - self._ngram_dsc_last_switch_time
-            < self._ngram_dsc_switch_cooldown_sec
-        ):
-            decision = False
-            self._log_ngram_dsc_state(now, decode_token_load, decision)
-            return decision
-
-        if decode_token_load <= self._ngram_dsc_enable_decode_tokens:
-            self._ngram_dsc_spec_enabled = True
-            self._ngram_dsc_last_switch_time = now
-            logger.info(
-                "NGRAM_DSC_SWITCH to=ngram_spec "
-                "decode_token_load=%d disable_threshold=%d "
-                "enable_threshold=%d cooldown_sec=%.2f",
-                decode_token_load,
-                self._ngram_dsc_disable_decode_tokens,
-                self._ngram_dsc_enable_decode_tokens,
-                self._ngram_dsc_switch_cooldown_sec,
+            elif (not prev_spec_enabled) and self._ngram_dsc_spec_enabled:
+                logger.info(
+                    "NGRAM_DSC_SWITCH to=ngram_spec strategy=threshold "
+                    "decode_token_load=%d disable_threshold=%d "
+                    "enable_threshold=%d cooldown_sec=%.2f",
+                    decode_token_load,
+                    self._ngram_dsc_disable_decode_tokens,
+                    self._ngram_dsc_enable_decode_tokens,
+                    self._ngram_dsc_switch_cooldown_sec,
+                )
+        elif prev_effective_num_spec_tokens != self._ngram_dsc_effective_num_spec_tokens:
+            candidate_goodputs = ",".join(
+                f"{k}:{goodput:.4f}"
+                for k, goodput in enumerate(self._ngram_dsc_candidate_goodputs)
             )
-        decision = self._ngram_dsc_spec_enabled
-        self._log_ngram_dsc_state(now, decode_token_load, decision)
-        return decision
+            candidate_latencies_s = ",".join(
+                f"{k}:{latency_s:.6f}"
+                for k, latency_s in enumerate(self._ngram_dsc_candidate_latencies_s)
+            )
+            logger.info(
+                "NGRAM_DSC_SWITCH strategy=goodput effective_num_spec_tokens=%d "
+                "prev_effective_num_spec_tokens=%d decode_token_load=%d "
+                "acceptance_rate_ema=%.3f "
+                "proposal_coverage_ema=%.3f decode_batch_tokens=%d "
+                "smoothed_total_num_scheduled_tokens=%.2f current_goodput=%.4f "
+                "selected_goodput=%.4f current_latency_s=%.6f "
+                "selected_latency_s=%.6f selected_expected_tokens=%.3f "
+                "baseline_k=%d baseline_source=%s baseline_goodput=%.4f "
+                "baseline_latency_s=%.6f selected_ratio_vs_baseline=%.3f "
+                "best_candidate_k=%d candidate_goodputs=[%s] "
+                "candidate_latencies_s=[%s]",
+                self._ngram_dsc_effective_num_spec_tokens,
+                prev_effective_num_spec_tokens,
+                decode_token_load,
+                self._ngram_dsc_acceptance_rate_ema,
+                self._ngram_dsc_proposal_coverage_ema,
+                estimated_decode_batch_tokens,
+                self._ngram_dsc_smoothed_total_num_scheduled_tokens,
+                self._ngram_dsc_current_goodput,
+                self._ngram_dsc_selected_goodput,
+                self._ngram_dsc_current_latency_s,
+                self._ngram_dsc_selected_latency_s,
+                self._ngram_dsc_selected_expected_tokens,
+                self._ngram_dsc_baseline_k,
+                self._ngram_dsc_baseline_source,
+                self._ngram_dsc_baseline_goodput,
+                self._ngram_dsc_baseline_latency_s,
+                self._ngram_dsc_selected_goodput
+                / max(1e-6, self._ngram_dsc_baseline_goodput),
+                self._ngram_dsc_best_candidate_k,
+                candidate_goodputs,
+                candidate_latencies_s,
+            )
+
+        self._log_ngram_dsc_state(
+            now,
+            decode_token_load,
+            estimated_decode_batch_tokens,
+        )
+        return self._ngram_dsc_effective_num_spec_tokens
+
+    def _should_use_ngram_spec(self) -> bool:
+        return self._get_effective_ngram_spec_tokens() > 0
 
     def _log_ngram_dsc_state(
-        self, now: float, decode_token_load: int, decision_use_ngram_spec: bool
+        self, now: float, decode_token_load: int, decode_batch_tokens: int
     ) -> None:
         if (
-            now - self._ngram_dsc_last_status_log_time
-            < self._ngram_dsc_status_log_interval_sec
+            now - self._ngram_dsc_last_summary_log_time
+            < self._ngram_dsc_summary_log_interval_sec
         ):
             return
-        cooldown_remaining_sec = max(
-            0.0,
-            self._ngram_dsc_switch_cooldown_sec
-            - (now - self._ngram_dsc_last_switch_time),
-        )
         logger.info(
-            "NGRAM_DSC_STATE use_ngram_spec=%s decode_token_load=%d "
-            "disable_threshold=%d enable_threshold=%d "
-            "cooldown_remaining_sec=%.2f",
-            decision_use_ngram_spec,
+            "NGRAM_DSC_SUMMARY strategy=%s use_ngram_spec=%s "
+            "effective_num_spec_tokens=%d decode_token_load=%d "
+            "decode_batch_tokens=%d "
+            "baseline_k=%d best_candidate_k=%d "
+            "acceptance_rate_ema=%.3f proposal_coverage_ema=%.3f "
+            "smoothed_total_num_scheduled_tokens=%.2f "
+            "candidate_goodputs=[%s] candidate_latencies_s=[%s] "
+            "realized_goodputs_by_k=[%s] "
+            "realized_expected_tokens_by_k=[%s] "
+            "realized_samples_by_k=[%s]",
+            self._ngram_dsc_strategy,
+            self._ngram_dsc_effective_num_spec_tokens > 0,
+            self._ngram_dsc_effective_num_spec_tokens,
             decode_token_load,
-            self._ngram_dsc_disable_decode_tokens,
-            self._ngram_dsc_enable_decode_tokens,
-            cooldown_remaining_sec,
+            decode_batch_tokens,
+            self._ngram_dsc_baseline_k,
+            self._ngram_dsc_best_candidate_k,
+            self._ngram_dsc_acceptance_rate_ema,
+            self._ngram_dsc_proposal_coverage_ema,
+            self._ngram_dsc_smoothed_total_num_scheduled_tokens,
+            ",".join(
+                f"{k}:{goodput:.4f}"
+                for k, goodput in enumerate(self._ngram_dsc_candidate_goodputs)
+            ),
+            ",".join(
+                f"{k}:{latency_s:.6f}"
+                for k, latency_s in enumerate(self._ngram_dsc_candidate_latencies_s)
+            ),
+            ",".join(
+                f"{k}:{goodput:.3f}"
+                for k, goodput in enumerate(self._ngram_dsc_realized_goodputs_by_k)
+            ),
+            ",".join(
+                f"{k}:{tokens:.3f}"
+                for k, tokens in enumerate(
+                    self._ngram_dsc_realized_expected_tokens_by_k
+                )
+            ),
+            ",".join(
+                f"{k}:{count}"
+                for k, count in enumerate(self._ngram_dsc_realized_samples_by_k)
+            ),
         )
-        self._ngram_dsc_last_status_log_time = now
+        self._ngram_dsc_last_summary_log_time = now
+
+    def _get_adjusted_ngram_dsc_draft_tokens(
+        self,
+        *,
+        num_draft_tokens: int,
+        num_invalid_spec_tokens: dict[str, int] | None,
+        request_id: str,
+    ) -> int:
+        adjusted_num_draft_tokens = num_draft_tokens
+        if num_invalid_spec_tokens:
+            adjusted_num_draft_tokens -= num_invalid_spec_tokens.get(request_id, 0)
+        return max(0, adjusted_num_draft_tokens)
+
+    def _observe_ngram_dsc_batch(
+        self,
+        *,
+        num_draft_tokens: int,
+        num_accepted_tokens: int,
+        speculation_attempted: bool = False,
+        num_eligible_decode_reqs: int = 0,
+        num_draft_reqs: int = 0,
+        position_draft_counts: tuple[int, ...] | None = None,
+        position_accept_counts: tuple[int, ...] | None = None,
+    ) -> None:
+        if not self._ngram_dsc_enabled or self._ngram_dsc_controller is None:
+            return
+
+        if num_draft_tokens <= 0 and num_eligible_decode_reqs <= 0:
+            return
+
+        self._ngram_dsc_controller.observe_draft(
+            num_draft_tokens=num_draft_tokens,
+            num_accepted_tokens=num_accepted_tokens,
+            speculation_attempted=speculation_attempted,
+            num_eligible_decode_reqs=num_eligible_decode_reqs,
+            num_draft_reqs=num_draft_reqs,
+            position_draft_counts=position_draft_counts,
+            position_accept_counts=position_accept_counts,
+        )
+        self._ngram_dsc_acceptance_rate_ema = (
+            self._ngram_dsc_controller.acceptance_rate_ema
+        )
+
+    def _log_ngram_dsc_realized_batch(
+        self,
+        *,
+        scheduler_output: SchedulerOutput,
+        model_runner_output: ModelRunnerOutput,
+        num_drafts: int,
+        num_draft_tokens: int,
+        num_accepted_tokens: int,
+    ) -> None:
+        predicted_goodput = scheduler_output.ngram_dsc_predicted_goodput
+        predicted_latency_s = scheduler_output.ngram_dsc_predicted_latency_s
+        predicted_generated_tokens = (
+            scheduler_output.ngram_dsc_predicted_generated_tokens
+        )
+        predicted_k0_goodput = scheduler_output.ngram_dsc_predicted_k0_goodput
+        baseline_k = scheduler_output.ngram_dsc_baseline_k
+        baseline_goodput = scheduler_output.ngram_dsc_baseline_goodput
+        baseline_source = scheduler_output.ngram_dsc_baseline_source
+        if (
+            predicted_goodput is None
+            or predicted_latency_s is None
+            or predicted_generated_tokens is None
+            or predicted_k0_goodput is None
+            or baseline_k is None
+            or baseline_goodput is None
+            or model_runner_output.model_execute_time_s is None
+        ):
+            return
+
+        actual_latency_s = max(1e-6, model_runner_output.model_execute_time_s)
+        if num_drafts > 0:
+            realized_generated_tokens = float(
+                num_accepted_tokens + num_drafts
+            ) / max(1, num_drafts)
+        elif scheduler_output.effective_num_spec_tokens <= 0:
+            realized_generated_tokens = 1.0
+        else:
+            return
+        realized_goodput = realized_generated_tokens / actual_latency_s
+
+        self._ngram_dsc_last_predicted_goodput = predicted_goodput
+        self._ngram_dsc_last_predicted_latency_s = predicted_latency_s
+        self._ngram_dsc_last_predicted_generated_tokens = predicted_generated_tokens
+        self._ngram_dsc_last_realized_goodput = realized_goodput
+        self._ngram_dsc_last_realized_latency_s = actual_latency_s
+        self._ngram_dsc_last_realized_generated_tokens = realized_generated_tokens
+        fit_update = None
+        sample_observed = True
+        if self._ngram_dsc_controller is not None:
+            decode_token_load = (
+                scheduler_output.ngram_dsc_decode_token_load
+                if scheduler_output.ngram_dsc_decode_token_load is not None
+                else 0
+            )
+            smoothed_total_num_scheduled_tokens = (
+                scheduler_output.ngram_dsc_smoothed_total_num_scheduled_tokens
+                or 0.0
+            )
+            sample_observed = (
+                self._ngram_dsc_controller.should_observe_realized_sample(
+                    decode_token_load=decode_token_load,
+                    smoothed_total_num_scheduled_tokens=(
+                        smoothed_total_num_scheduled_tokens
+                    ),
+                    effective_num_spec_tokens=(
+                        scheduler_output.effective_num_spec_tokens
+                    ),
+                    realized_latency_s=actual_latency_s,
+                )
+            )
+            if sample_observed:
+                fit_update = self._ngram_dsc_controller.observe_realized_latency(
+                    decode_token_load=decode_token_load,
+                    smoothed_total_num_scheduled_tokens=(
+                        smoothed_total_num_scheduled_tokens
+                    ),
+                    effective_num_spec_tokens=(
+                        scheduler_output.effective_num_spec_tokens
+                    ),
+                    realized_latency_s=actual_latency_s,
+                    realized_generated_tokens=realized_generated_tokens,
+                    predicted_k0_goodput=predicted_k0_goodput,
+                    baseline_goodput=baseline_goodput,
+                )
+        if fit_update is not None:
+            should_log_refit = not self._ngram_dsc_logged_first_latency_refit
+            if (
+                self._ngram_dsc_controller is not None
+                and not self._ngram_dsc_logged_full_latency_refit
+                and fit_update.num_valid_samples
+                >= self._ngram_dsc_controller.online_latency_fit_max_samples
+            ):
+                should_log_refit = True
+                self._ngram_dsc_logged_full_latency_refit = True
+            if should_log_refit:
+                self._ngram_dsc_logged_first_latency_refit = True
+            else:
+                return
+            logger.info(
+                "NGRAM_DSC_LATENCY_REFIT strategy=%s latency_model=%s "
+                "num_total_samples=%d num_valid_samples=%d num_dropped_samples=%d "
+                "profiled_latency_coeffs=(intercept=%.6f,decode_load=%.6f,"
+                "scheduled_tokens=%.6f,spec_tokens=%.6f,"
+                "spec_x_scheduled_tokens=%.6f) active_coefficients=[%s] "
+                "frozen_coefficients=[%s]",
+                self._ngram_dsc_strategy,
+                self._ngram_dsc_latency_model,
+                fit_update.num_total_samples,
+                fit_update.num_valid_samples,
+                fit_update.num_dropped_samples,
+                fit_update.intercept_s,
+                fit_update.decode_token_load_coeff_s,
+                fit_update.scheduled_tokens_coeff_s,
+                fit_update.spec_tokens_coeff_s,
+                fit_update.spec_scheduled_tokens_interaction_coeff_s,
+                ",".join(fit_update.active_coefficients),
+                ",".join(fit_update.frozen_coefficients),
+            )
 
     def update_draft_token_ids_in_output(
         self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput

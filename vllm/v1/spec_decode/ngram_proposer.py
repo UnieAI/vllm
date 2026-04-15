@@ -66,6 +66,7 @@ class NgramProposer:
         valid_ngram_requests: list,
         num_tokens_no_spec: np.ndarray,
         token_ids_cpu: np.ndarray,
+        k: int,
     ) -> list[list[int]]:
         """Batch version of ngram proposer using numba for acceleration.
 
@@ -110,7 +111,7 @@ class NgramProposer:
                 self.min_n,
                 self.max_n,
                 self.max_model_len,
-                self.k,
+                k,
                 self.valid_ngram_draft,
                 self.valid_ngram_num_drafts,
             )
@@ -133,10 +134,16 @@ class NgramProposer:
         sampled_token_ids: list[list[int]],
         num_tokens_no_spec: np.ndarray,
         token_ids_cpu: np.ndarray,
+        effective_num_spec_tokens: int | None = None,
         slot_mappings: dict[str, torch.Tensor]
         | list[dict[str, torch.Tensor]]
         | None = None,  # unused
     ) -> list[list[int]]:
+        k = self.k if effective_num_spec_tokens is None else effective_num_spec_tokens
+        k = max(0, min(self.k, k))
+        if k <= 0:
+            return [[] for _ in sampled_token_ids]
+
         # find which requests need ngram proposals
         valid_ngram_requests = []
         for i, sampled_ids in enumerate(sampled_token_ids):
@@ -157,6 +164,7 @@ class NgramProposer:
             valid_ngram_requests,
             num_tokens_no_spec,
             token_ids_cpu,
+            k,
         )
 
         return draft_token_ids

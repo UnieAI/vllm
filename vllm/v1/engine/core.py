@@ -184,7 +184,10 @@ class EngineCore:
         # to eliminate pipeline bubbles.
         self.batch_queue_size = self.model_executor.max_concurrent_batches
         self.batch_queue: (
-            deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
+            deque[
+                tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any], float]
+            ]
+            | None
         ) = None
         if self.batch_queue_size > 1:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
@@ -389,6 +392,7 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
+        execute_start_time = time.perf_counter()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -398,6 +402,7 @@ class EngineCore:
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+        model_output.model_execute_time_s = time.perf_counter() - execute_start_time
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -447,6 +452,7 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
+            execute_start_time = time.perf_counter()
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -474,7 +480,9 @@ class EngineCore:
 
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
-                batch_queue.appendleft((future, scheduler_output, exec_future))
+                batch_queue.appendleft(
+                    (future, scheduler_output, exec_future, execute_start_time)
+                )
                 if (
                     model_executed
                     and len(batch_queue) < self.batch_queue_size
@@ -491,7 +499,7 @@ class EngineCore:
             return None, False
 
         # Block until the next result is available.
-        future, scheduler_output, exec_model_fut = batch_queue.pop()
+        future, scheduler_output, exec_model_fut, execute_start_time = batch_queue.pop()
         with (
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
@@ -502,6 +510,7 @@ class EngineCore:
                 # call failed - raise that exception.
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
+        model_output.model_execute_time_s = time.perf_counter() - execute_start_time
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -532,7 +541,9 @@ class EngineCore:
                 deferred_scheduler_output
             )
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
-            batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
+            batch_queue.appendleft(
+                (future, deferred_scheduler_output, exec_future, execute_start_time)
+            )
 
         return engine_core_outputs, model_executed
 

@@ -253,6 +253,10 @@ class ModelRunnerOutput:
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 
+    # Total wall-clock execution time for the scheduler step that produced
+    # this output, measured in the engine core before scheduler bookkeeping.
+    model_execute_time_s: float | None = None
+
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):
