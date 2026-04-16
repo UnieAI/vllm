@@ -1,0 +1,46 @@
+# =============================================================================
+# UnieInfra / vLLM Blackwell Dev Image
+# Universal Blackwell support 
+# CUDA 12.9 - v0.1.3
+# =============================================================================
+FROM nvidia/cuda:12.9.0-devel-ubuntu22.04
+
+LABEL org.opencontainers.image.title="UnieInfra vLLM Blackwell Dev"
+LABEL org.opencontainers.image.vendor="UnieInfra / NCTU6"
+LABEL uniinfra.arch="blackwell"
+LABEL uniinfra.cuda.version="12.9"
+LABEL uniinfra.version="cuda-12.9-v0.1.3"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=${CUDA_HOME}/bin:${PATH}
+ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
+
+# Core system tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git curl sudo python3-pip python3-dev ninja-build build-essential \
+    gcc-12 g++-12 libibverbs-dev libnuma-dev libffi-dev wget \
+    software-properties-common lsb-release \
+    vim nano htop \
+    && rm -rf /var/lib/apt/lists/*
+
+# Newer CMake
+RUN wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc | gpg --dearmor -o /usr/share/keyrings/kitware-archive-keyring.gpg && \
+    echo 'deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ jammy main' > /etc/apt/sources.list.d/kitware.list && \
+    apt-get update && apt-get install -y --no-install-recommends cmake && \
+    rm -rf /var/lib/apt/lists/*
+
+# GCC-12 for Blackwell
+RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 120 \
+    --slave /usr/bin/g++ g++ /usr/bin/g++-12
+
+WORKDIR /workspace
+
+# Copy source + your new build script
+COPY . .
+COPY ./scripts/install-blackwell.sh /usr/local/bin/build-vllm.sh
+RUN chmod +x /usr/local/bin/build-vllm.sh
+
+RUN git config --global --add safe.directory /workspace
+
+CMD ["/bin/bash"]
