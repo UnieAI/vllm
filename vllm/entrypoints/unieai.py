@@ -398,7 +398,7 @@ def main():
             # remove --easy
             unknown_args = [arg for arg in unknown_args if arg != "--easy"]
         else:
-            unknown_args += ["--async-scheduling", "--speculative-config", '{"method":"ngram_dsc","num_speculative_tokens":4,"draft_tensor_parallel_size":1,"prompt_lookup_min":3,"prompt_lookup_max":8}']
+            unknown_args += ["--async-scheduling", "--speculative-config", '{"method":"ngram_gpu","unieai_dsc":true,"num_speculative_tokens":4,"draft_tensor_parallel_size":1,"prompt_lookup_min":3,"prompt_lookup_max":8}']
         cmd = ["vllm", "serve", args.model_name] + unknown_args
         # logger.info("Running UnieConfig with command: %s", " ".join(cmd))
         subprocess.run(cmd, check=True, shell=False, text=True)
