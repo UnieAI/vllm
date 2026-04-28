@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ---------------------------------------------------------------------------------------
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. All rights reserved.
+# Confidential and Proprietary - Qualcomm Technologies, Inc. and/or its subsidiaries.
+#
+# Not a contribution.
+# ---------------------------------------------------------------------------------------
 
 import enum
 import json
@@ -26,6 +32,7 @@ from transformers.models.auto.tokenization_auto import get_tokenizer_config
 from transformers.utils import CONFIG_NAME as HF_CONFIG_NAME
 
 from vllm import envs
+from vllm.platforms import current_platform
 from vllm.logger import init_logger
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -37,7 +44,8 @@ from vllm.transformers_utils.configs import (ChatGLMConfig, DeepseekVLV2Config,
                                              NemotronConfig, OvisConfig,
                                              RWConfig, SpeculatorsConfig,
                                              Step3TextConfig, Step3VLConfig,
-                                             UltravoxConfig)
+                                             TurboConfig,
+                                             UltravoxConfig,LlamaSwiftKVConfig)
 # yapf: enable
 from vllm.transformers_utils.configs.mistral import adapt_config_dict
 from vllm.transformers_utils.utils import check_gguf_file
@@ -50,7 +58,6 @@ else:
 MISTRAL_CONFIG_NAME = "params.json"
 
 logger = init_logger(__name__)
-
 
 def _get_hf_token() -> Optional[str]:
     """
@@ -81,7 +88,9 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     "speculators": SpeculatorsConfig,
     "nemotron": NemotronConfig,
     "ovis": OvisConfig,
+    "turbo": TurboConfig,
     "ultravox": UltravoxConfig,
+    "llama_swiftkv": LlamaSwiftKVConfig,
     "step3_vl": Step3VLConfig,
     "step3_text": Step3TextConfig,
 }
@@ -97,7 +106,7 @@ _AUTO_CONFIG_KWARGS_OVERRIDES: dict[str, dict[str, Any]] = {
     # transformers regards mllama as is_encoder_decoder=False
     # vllm needs is_encoder_decoder=True to enable cross-attention
     "mllama": {
-        "is_encoder_decoder": True
+        "is_encoder_decoder": True if not current_platform.is_qaic() else False
     },
     "NVLM_D": {
         "has_no_defaults_at_init": True

@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ---------------------------------------------------------------------------------------
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. All rights reserved.
+# Confidential and Proprietary - Qualcomm Technologies, Inc. and/or its subsidiaries.
+#
+# Not a contribution.
+# ---------------------------------------------------------------------------------------
 
 # yapf: disable
 import argparse
@@ -33,6 +39,8 @@ from vllm.config import (BlockSize, CacheConfig, CacheDType, CompilationConfig,
                          RunnerOption, SchedulerConfig, SchedulerPolicy,
                          SpeculativeConfig, TaskOption, TokenizerMode,
                          VllmConfig, get_attr_docs, get_field)
+
+from vllm.entrypoints.openai.serving_models import LoRAModulePath
 from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.plugins import load_general_plugins
@@ -446,6 +454,12 @@ class EngineArgs:
 
     kv_sharing_fast_prefill: bool = \
         CacheConfig.kv_sharing_fast_prefill
+
+    # Qaic arguments
+    override_qaic_config: Optional[dict[str, Any]] = \
+        get_field(ModelConfig, "override_qaic_config")
+    device_group: Optional[Union[List[int], int]] = None
+    lora_modules: Optional[List[LoRAModulePath]] = None
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -863,6 +877,46 @@ class EngineArgs:
                             'removed. Setting this flag to True or False'
                             ' has no effect on vLLM behavior.')
 
+        import re
+        parser.add_argument(
+            '--override-qaic-config',
+            type=lambda configs: {
+                str(value[0]): value[1] if len(value) > 1 else True
+                for value in
+                (re.split(r'[:=]', config.strip()) for config in re.split(r'[ ]+', configs.strip()))
+            },
+            default=None,
+            help="override or set qaic device configuration.")
+
+        parser.add_argument(
+            '--device-group',
+            type=lambda device_ids: [int(x) for x in device_ids.split(",")],
+            default=None,
+            help=
+            'Define qaic device ids in csv format (e.g., --device-id 0,1,2).')
+
+        # To avoid duplicate add_argument with vllm.entrypoints.openai.api_server
+        lora_modules_added = False
+        for action in parser._actions:
+            if action.dest == 'lora_modules':
+                lora_modules_added = True
+                break
+
+        if not lora_modules_added:
+            from vllm.entrypoints.openai.cli_args import LoRAParserAction
+            parser.add_argument(
+                "--lora-modules",
+                type=optional_type(str),
+                default=None,
+                nargs='+',
+                action=LoRAParserAction,
+                help="LoRA module configurations in either 'name=path' format"
+                "or JSON format. "
+                "Example (old format): ``'name=path'`` "
+                "Example (new format): "
+                "``{\"name\": \"name\", \"path\": \"lora_path\", "
+                "\"base_model_name\": \"id\"}``")
+
         return parser
 
     @classmethod
@@ -948,6 +1002,7 @@ class EngineArgs:
             model_impl=self.model_impl,
             override_attention_dtype=self.override_attention_dtype,
             logits_processors=self.logits_processors,
+            override_qaic_config=self.override_qaic_config,
         )
 
     def validate_tensorizer_args(self):
@@ -1053,7 +1108,7 @@ class EngineArgs:
         current_platform.pre_register_and_update()
 
         device_config = DeviceConfig(
-            device=cast(Device, current_platform.device_type))
+            device=cast(Device, current_platform.device_type), device_group=self.device_group)
         model_config = self.create_model_config()
 
         # * If VLLM_USE_V1 is unset, we enable V1 for "supported features"
@@ -1107,7 +1162,7 @@ class EngineArgs:
             sliding_window = model_config.get_sliding_window()
 
         cache_config = CacheConfig(
-            block_size=self.block_size,
+            block_size=self.block_size if current_platform.is_qaic() else self.max_model_len,  # qaic needs block_size = max_model_len
             gpu_memory_utilization=self.gpu_memory_utilization,
             swap_space=self.swap_space,
             cache_dtype=self.kv_cache_dtype,
@@ -1315,6 +1370,7 @@ class EngineArgs:
             fully_sharded_loras=self.fully_sharded_loras,
             lora_extra_vocab_size=self.lora_extra_vocab_size,
             lora_dtype=self.lora_dtype,
+            lora_modules=self.lora_modules,
             max_cpu_loras=self.max_cpu_loras if self.max_cpu_loras
             and self.max_cpu_loras > 0 else None) if self.enable_lora else None
 
@@ -1446,7 +1502,7 @@ class EngineArgs:
             return False
 
         # V1 supports N-gram, Medusa, and Eagle speculative decoding.
-        if (self.speculative_config is not None
+        if (not current_platform.is_qaic() and self.speculative_config is not None
                 and self.speculative_config.get("method") == "draft_model"):
             raise NotImplementedError(
                 "Speculative decoding with draft model is not supported yet. "
@@ -1565,7 +1621,8 @@ class EngineArgs:
         # if using prefix caching, we must set a hash algo
         if self.enable_prefix_caching:
             # Disable prefix caching for multimodal models for VLLM_V0.
-            if model_config.is_multimodal_model:
+            from vllm.platforms import current_platform
+            if model_config.is_multimodal_model and not current_platform.is_qaic():
                 logger.warning(
                     "--enable-prefix-caching is not supported for multimodal "
                     "models in V0 and has been disabled.")
@@ -1681,6 +1738,15 @@ class EngineArgs:
             default_max_num_seqs = {
                 UsageContext.LLM_CLASS: 256 * world_size,
                 UsageContext.OPENAI_API_SERVER: 128 * world_size,
+            }
+
+        # qaic specific default values.
+        if current_platform.is_qaic():
+            max_num_seqs = self.max_num_seqs if self.max_num_seqs else default_max_num_seqs[UsageContext.LLM_CLASS]
+            max_model_len = self.max_model_len if self.max_model_len else 2048
+            default_max_num_batched_tokens = {
+                UsageContext.LLM_CLASS: max_model_len * max_num_seqs,
+                UsageContext.OPENAI_API_SERVER: max_model_len * max_num_seqs,
             }
 
         use_context_value = usage_context.value if usage_context else None

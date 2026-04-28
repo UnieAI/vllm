@@ -1,5 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ---------------------------------------------------------------------------------------
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. All rights reserved.
+# Confidential and Proprietary - Qualcomm Technologies, Inc. and/or its subsidiaries.
+#
+# Not a contribution.
+# ---------------------------------------------------------------------------------------
+# Temporarily reverting PR #21152 [V0 Deprecation] Remove V0 Spec Decode workers
+# for backward compatibility with v0.
 
 import hashlib
 from dataclasses import field
@@ -302,3 +310,10 @@ class SchedulerConfig:
                 f"max_num_partial_prefills ({self.max_num_partial_prefills}).")
 
         return self
+
+    # MODIFIED: below method was added to always return `False` to support v0 SpD since it was 
+    # depricated in version 0.10.1.1. Qaic never supported multi-step scheduler so it always 
+    # returns `False`
+    @property
+    def is_multi_step(self) -> bool:
+        return False

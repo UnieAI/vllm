@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ---------------------------------------------------------------------------------------
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. All rights reserved.
+# Confidential and Proprietary - Qualcomm Technologies, Inc. and/or its subsidiaries.
+#
+# Not a contribution.
+# ---------------------------------------------------------------------------------------
 
 import contextlib
 from typing import TYPE_CHECKING, Optional, Union
@@ -13,7 +19,7 @@ from vllm.scalar_type import ScalarType
 
 logger = init_logger(__name__)
 
-if not current_platform.is_tpu() and not current_platform.is_xpu():
+if not current_platform.is_tpu() and not current_platform.is_xpu() and not current_platform.is_qaic():
     try:
         import vllm._C
     except ImportError as e:

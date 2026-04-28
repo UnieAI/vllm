@@ -1,8 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ---------------------------------------------------------------------------------------
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. All rights reserved.
+# Confidential and Proprietary - Qualcomm Technologies, Inc. and/or its subsidiaries.
+#
+# Not a contribution.
+# ---------------------------------------------------------------------------------------
+# Temporarily reverting PR #21152 [V0 Deprecation] Remove V0 Spec Decode workers
+# for backward compatibility with v0.
 """Sequence and its related classes."""
 import copy
 import enum
+import os
 from abc import ABC, abstractmethod
 from array import array
 from collections import defaultdict
@@ -100,6 +109,8 @@ class SequenceStage(enum.Enum):
 
 @dataclass
 class RequestMetrics:
+    # RESTORED: below `spec_token_acceptance_counts` was restored from https://github.com/vllm-project/vllm/pull/21152/files#diff-9d1cd5050a7ec1e588cae646f3f95ca134cffbd8b41d6655c6a14de70117b869
+    # to provide v0 spd backward compatability
     """Metrics associated with a request.
 
     Attributes:
@@ -115,6 +126,13 @@ class RequestMetrics:
         model_execute_time: The time spent in the model execute function. This
                             will include model forward, block/sync across
                             workers, cpu-gpu sync time and sampling time.
+        spec_token_acceptance_counts: number of accepted speculative tokens at
+                                      each position; the first token is from
+                                      the target model and is always accepted;
+                                      e.g., when it's [10, 8, 4, 2] for a req,
+                                      it means there were 10 forward passes in
+                                      total, and there were 8, 4, 2 accepted
+                                      tokens at 1st, 2nd, 3rd speculation step.
     """
     arrival_time: float
     last_token_time: float
@@ -125,6 +143,8 @@ class RequestMetrics:
     scheduler_time: Optional[float] = None
     model_forward_time: Optional[float] = None
     model_execute_time: Optional[float] = None
+    spec_token_acceptance_counts: Optional[list[int]] = None
+    prefill_batch_size: Optional[int] = 1
 
 
 class SequenceDataDelta(
@@ -733,7 +753,9 @@ class SequenceGroup:
                                       last_token_time=arrival_time,
                                       first_scheduled_time=None,
                                       first_token_time=None,
-                                      time_in_queue=None)
+                                      time_in_queue=None,
+                                      spec_token_acceptance_counts=[0] * # RESTORED: input value to argument `spec_token_acceptance_counts` was restored to https://github.com/vllm-project/vllm/pull/21152/files#diff-9d1cd5050a7ec1e588cae646f3f95ca134cffbd8b41d6655c6a14de70117b869 
+                                      draft_size)                        # for v0 spd backward compatability
         self.last_token_latency = 0.0
         self.lora_request = lora_request
         self.prompt_logprobs: Optional[PromptLogprobs] = None
@@ -819,6 +841,13 @@ class SequenceGroup:
         if (self.metrics.first_token_time is None
                 and self.first_seq.get_output_len() == 1):
             self.metrics.first_token_time = time
+
+    def maybe_set_prefill_batch_size(self, prefill_batch_size: int) -> None:
+        if self.first_seq.get_output_len() == 1 and os.environ.get(
+            "VLLM_DISAGG_USE_AGGREGATED_USAGE_STATS", "false").lower() in [
+            "true", "1"
+        ]:
+            self.metrics.prefill_batch_size = prefill_batch_size
 
     def maybe_set_first_scheduled_time(self, time: float) -> None:
         """Sets the first scheduled time and time in queue for Request
@@ -975,6 +1004,7 @@ class SequenceGroupMetadata(
     pooling_params: Optional[PoolingParams] = None
     lora_request: Optional[LoRARequest] = None
     computed_block_nums: Optional[list[int]] = None
+    is_precode: Optional[bool] = False
     state: Optional[SequenceGroupState] = msgspec.field(
         default_factory=lambda: SequenceGroupState())
     token_type_ids: Optional[list[int]] = None
@@ -1331,6 +1361,10 @@ class ExecuteModelRequest(
     previous_hidden_states: Optional[HiddenStates] = None
     # The number of forward steps to run.
     num_steps: int = 1
+    # Temporarily reverting PR #21152 [V0 Deprecation] Remove V0 Spec Decode workers
+    # for backward compatibility with v0.
+    # The step index for spec model input.
+    spec_step_idx: Optional[int] = None
     # Finished request ids since last step.
     finished_requests_ids: list[str] = msgspec.field(default_factory=list)
     # The last sampled token ids for multi step decoding.

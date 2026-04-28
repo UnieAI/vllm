@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ---------------------------------------------------------------------------------------
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. All rights reserved.
+# Confidential and Proprietary - Qualcomm Technologies, Inc. and/or its subsidiaries.
+#
+# Not a contribution.
+# ---------------------------------------------------------------------------------------
 
 from typing import Dict, FrozenSet, List, Optional, Tuple
 
@@ -7,6 +13,8 @@ from vllm.core.block.interfaces import (Block, BlockAllocator, BlockId,
                                         DeviceAwareBlockAllocator)
 from vllm.core.block.naive_block import NaiveBlock, NaiveBlockAllocator
 from vllm.core.block.prefix_caching_block import PrefixCachingBlockAllocator
+from vllm.core.block.qaic_prefix_caching_block import QaicPrefixCachingBlockAllocator
+from vllm.platforms import current_platform
 from vllm.utils import Device
 
 
@@ -77,17 +85,33 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
                 block_ids=cpu_block_ids,
             )
         elif allocator_type == "prefix_caching":
-            gpu_allocator = PrefixCachingBlockAllocator(
-                num_blocks=num_gpu_blocks,
-                block_size=block_size,
-                block_ids=gpu_block_ids,
-            )
+            if current_platform.is_qaic():
+                # This just a hack to pass number pf physical block ids
+                # with current class interface.
+                gpu_allocator = QaicPrefixCachingBlockAllocator(
+                    num_blocks=num_gpu_blocks,
+                    num_phy_blocks=num_cpu_blocks,
+                    block_size=block_size,
+                    block_ids=gpu_block_ids,
+                )
 
-            cpu_allocator = PrefixCachingBlockAllocator(
-                num_blocks=num_cpu_blocks,
-                block_size=block_size,
-                block_ids=cpu_block_ids,
-            )
+                cpu_allocator = BlockAllocator = NaiveBlockAllocator(
+                    create_block=NaiveBlock,  # type: ignore
+                    num_blocks=0,
+                    block_size=block_size,
+                    block_ids=[])
+            else:
+                gpu_allocator = PrefixCachingBlockAllocator(
+                    num_blocks=num_gpu_blocks,
+                    block_size=block_size,
+                    block_ids=gpu_block_ids,
+                )
+
+                cpu_allocator = PrefixCachingBlockAllocator(
+                    num_blocks=num_cpu_blocks,
+                    block_size=block_size,
+                    block_ids=cpu_block_ids,
+                )
         else:
             raise ValueError(f"Unknown allocator type {allocator_type=}")
 

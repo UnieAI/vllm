@@ -1,12 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ---------------------------------------------------------------------------------------
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. All rights reserved.
+# Confidential and Proprietary - Qualcomm Technologies, Inc. and/or its subsidiaries.
+#
+# Not a contribution.
+# ---------------------------------------------------------------------------------------
 from typing import Callable, Optional
 
 import torch
 
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.utils import direct_register_custom_op, is_torch_equal_or_newer
+from vllm.utils import direct_register_custom_op, is_torch_equal_or_newer, supports_custom_op
 
 logger = init_logger(__name__)
 
@@ -119,7 +125,12 @@ try:
     )
     dequant_mxfp4 = torch.ops.vllm.dequant_mxfp4
 except AttributeError as error:
-    raise error
+    # If custom ops are not supported on the current platform,
+    # fall back to the default implementation.
+    if not supports_custom_op():
+        dequant_mxfp4 = _dequant_mxfp4
+    else:
+        raise error
 
 try:
     direct_register_custom_op(
@@ -130,4 +141,9 @@ try:
     )
     quant_dequant_mxfp4 = torch.ops.vllm.quant_dequant_mxfp4
 except AttributeError as error:
-    raise error
+    # If custom ops are not supported on the current platform,
+    # fall back to the default implementation.
+    if not supports_custom_op():
+        quant_dequant_mxfp4 = _quant_dequant_mxfp4
+    else:
+        raise error

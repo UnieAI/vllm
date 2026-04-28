@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ---------------------------------------------------------------------------------------
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. All rights reserved.
+# Confidential and Proprietary - Qualcomm Technologies, Inc. and/or its subsidiaries.
+#
+# Not a contribution.
+# ---------------------------------------------------------------------------------------
 """Benchmark offline inference throughput."""
 
 import argparse
@@ -74,7 +80,7 @@ def run_vllm(
         sampling_params.append(
             SamplingParams(
                 n=n,
-                temperature=1.0,
+                temperature=args.temperature,
                 top_p=1.0,
                 ignore_eos=True,
                 max_tokens=request.expected_output_len,
@@ -199,7 +205,7 @@ async def run_vllm_async(
             sampling_params.append(
                 SamplingParams(
                     n=n,
-                    temperature=1.0,
+                    temperature=args.temperature,
                     top_p=1.0,
                     ignore_eos=True,
                     max_tokens=request.expected_output_len,
@@ -348,6 +354,7 @@ def get_requests(args, tokenizer):
         dataset_cls = ShareGPTDataset
         if args.backend == "vllm-chat":
             sample_kwargs["enable_multimodal_chat"] = True
+        sample_kwargs["max_total_len"] = args.max_model_len
     elif args.dataset_name == "sonnet":
         assert tokenizer.chat_template or tokenizer.default_chat_template, (
             "Tokenizer/model must have chat template for sonnet dataset."
@@ -726,6 +733,14 @@ def create_argument_parser():
     )
     parser.add_argument(
         "--hf-split", type=str, default=None, help="Split of the HF dataset."
+    )
+    parser.add_argument(
+        '--temperature',
+        type=float,
+        default=1.0,
+        help="temperature controls the randomness of the sampling. Lower"
+        "values make the model more deterministic, while higher values make"
+        "the model more random. Zero means greedy sampling.",
     )
 
     parser = AsyncEngineArgs.add_cli_args(parser)

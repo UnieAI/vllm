@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ---------------------------------------------------------------------------------------
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. All rights reserved.
+# Confidential and Proprietary - Qualcomm Technologies, Inc. and/or its subsidiaries.
+#
+# Not a contribution.
+# ---------------------------------------------------------------------------------------
 r"""Benchmark online serving throughput.
 
 On the server side, run one of the following commands:
@@ -106,7 +112,10 @@ class BenchmarkMetrics:
     median_e2el_ms: float
     std_e2el_ms: float
     percentiles_e2el_ms: list[tuple[float, float]]
-
+    mean_qwait_ms: float
+    median_qwait_ms: float
+    std_qwait_ms: float
+    percentiles_qwait_ms: list[tuple[float, float]]
 
 def calculate_metrics(
     input_requests: list[SampleRequest],
@@ -126,6 +135,7 @@ def calculate_metrics(
     all_tpots: list[float] = []
     ttfts: list[float] = []
     e2els: list[float] = []
+    _wait: list[float] = []
     for i in range(len(outputs)):
         if outputs[i].success:
             output_len = outputs[i].output_tokens
@@ -142,7 +152,8 @@ def calculate_metrics(
                     ).input_ids
                 )
             actual_output_lens.append(output_len)
-            total_input += input_requests[i].prompt_len
+            #total_input += input_requests[i].prompt_len
+            total_input += outputs[i].prompt_len
             tpot = 0
             if output_len > 1:
                 latency_minus_ttft = outputs[i].latency - outputs[i].ttft
@@ -154,6 +165,8 @@ def calculate_metrics(
             ttfts.append(outputs[i].ttft)
             e2els.append(outputs[i].latency)
             completed += 1
+            if outputs[i].queue_wait_time != None:
+                _wait.append(outputs[i].queue_wait_time)
         else:
             actual_output_lens.append(0)
 
@@ -221,6 +234,11 @@ def calculate_metrics(
         percentiles_e2el_ms=[
             (p, np.percentile(e2els or 0, p) * 1000) for p in selected_percentiles
         ],
+        mean_qwait_ms=np.mean(_wait or 0),
+        std_qwait_ms=np.std(_wait or 0),
+        median_qwait_ms=np.median(_wait or 0),
+        percentiles_qwait_ms=[(p, np.percentile(_wait or 0, p))
+                             for p in selected_percentiles],
     )
 
     return metrics, actual_output_lens
@@ -511,6 +529,7 @@ async def benchmark(
     process_one_metric("tpot", "TPOT", "Time per Output Token (excl. 1st token)")
     process_one_metric("itl", "ITL", "Inter-token Latency")
     process_one_metric("e2el", "E2EL", "End-to-end Latency")
+    process_one_metric("qwait", "QWAIT", "Queue Wait Latency")
 
     print("=" * 50)
 
@@ -762,6 +781,8 @@ def main(args: argparse.Namespace):
                 tokenizer=tokenizer,
                 num_requests=args.num_prompts,
                 output_len=args.sharegpt_output_len,
+                max_prompt_len=args.sharegpt_max_input_len,
+                max_total_len=args.sharegpt_max_model_len,
             ),
             "burstgpt": lambda: BurstGPTDataset(
                 random_seed=args.seed, dataset_path=args.dataset_path
@@ -1161,6 +1182,17 @@ def create_argument_parser():
         help="Output length for each request. Overrides the output length "
         "from the ShareGPT dataset.",
     )
+    sharegpt_group.add_argument(
+        "--sharegpt-max-input-len",
+        type=int,
+        default=1024,
+        help="Maximum input prompt length for each request for sharegpt dataset")
+    sharegpt_group.add_argument(
+        '--sharegpt-max-model-len',
+        type=int,
+        default=2048,
+        help='Maximum length of a sequence (including prompt and output) for'
+        ' sharegpt dataset')
 
     random_group = parser.add_argument_group("random dataset options")
     random_group.add_argument(

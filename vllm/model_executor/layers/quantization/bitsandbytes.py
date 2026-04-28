@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ---------------------------------------------------------------------------------------
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. All rights reserved.
+# Confidential and Proprietary - Qualcomm Technologies, Inc. and/or its subsidiaries.
+#
+# Not a contribution.
+# ---------------------------------------------------------------------------------------
 
 from typing import Any, Callable, Optional, Union
 
@@ -399,7 +405,9 @@ try:
                               mutates_args=["out"],
                               fake_impl=_apply_bnb_4bit_fake,
                               dispatch_key=current_platform.dispatch_key)
-    apply_bnb_4bit = torch.ops.vllm.apply_bnb_4bit
+    from vllm.platforms import current_platform
+    if not current_platform.is_qaic:
+        apply_bnb_4bit = torch.ops.vllm.apply_bnb_4bit
 
 except AttributeError as error:
     raise error

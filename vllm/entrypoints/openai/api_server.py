@@ -65,6 +65,7 @@ from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
                                               EmbeddingResponse, ErrorInfo,
                                               ErrorResponse,
                                               LoadLoRAAdapterRequest,
+                                              PoolingBytesResponse,
                                               PoolingRequest, PoolingResponse,
                                               RerankRequest, RerankResponse,
                                               ResponsesRequest,
@@ -777,6 +778,14 @@ async def create_pooling(request: PoolingRequest, raw_request: Request):
                             status_code=generator.error.code)
     elif isinstance(generator, PoolingResponse):
         return JSONResponse(content=generator.model_dump())
+    # Added changes from https://github.com/vllm-project/vllm/pull/27066
+    # [Frontend][3/N] Improve all pooling task | Support binary embedding response #27066
+    elif isinstance(generator, PoolingBytesResponse):
+        return StreamingResponse(
+            content=generator.body,
+            headers={"metadata": generator.metadata},
+            media_type=generator.media_type,
+        )
 
     assert_never(generator)
 

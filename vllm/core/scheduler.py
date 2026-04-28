@@ -1,5 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ---------------------------------------------------------------------------------------
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. All rights reserved.
+# Confidential and Proprietary - Qualcomm Technologies, Inc. and/or its subsidiaries.
+#
+# Not a contribution.
+# ---------------------------------------------------------------------------------------
+# Temporarily reverting PR #22138 [V0 Deprecation] Remove multi-step scheduling (https://github.com/vllm-project/vllm/pull/22138)
+# for backward compatibility with v0.
 
 import enum
 import os
@@ -20,6 +28,7 @@ from vllm.sequence import (Sequence, SequenceData, SequenceGroup,
                            SequenceGroupMetadataDelta, SequenceStage,
                            SequenceStatus)
 from vllm.utils import Device, PyObjectCache
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -1486,6 +1495,16 @@ class Scheduler:
         num_lookahead_slots = self._get_num_lookahead_slots(
             is_prefill, enable_chunking)
 
+
+        if current_platform.is_qaic():
+            """As max_num_seqs is set as per max KVCache available in HW
+            thus there seems no need to preempt any request plus
+            best_of >1 is also not supported in current version.
+            The way system is design it seems that if all max_num_seq
+            blocks are allocated, the scheduler, start doing preemption
+            of last allocated block, which is not required."""
+            return True
+
         return self.block_manager.can_append_slots(
             seq_group=seq_group, num_lookahead_slots=num_lookahead_slots)
 
@@ -1858,7 +1877,23 @@ class Scheduler:
         token ids. Speculative decoding uses these slots to store KV activations
         of tokens which may or may not be accepted.
         """
-        return 0
+        # RESTORED: below logic was restored from https://github.com/vllm-project/vllm/pull/22138/files#diff-0e64e07127ff20fc01be18cc95c0f58e0ff818e0dbabd5e8d2e07ca27943a7e4
+        # to provide v0 spd backward compatability
+        if is_prefill:
+            if self.scheduler_config.is_multi_step and enable_chunking:
+                # num_lookahead_slots was introduced in the context of decodes,
+                # in Speculative Decoding.
+                # When the num_scheduler_steps is 8, say, then the
+                # num_lookahead_slots is 7. Meaning, we are doing a 1-step of
+                # decode anyways and we wish to do 7 more.
+                #
+                # "lookaheads" for prefills, is introduced in support for
+                # Chunked-Prefill in Multi-Step.
+                return self.scheduler_config.num_lookahead_slots + 1
+            else:
+                return 0
+
+        return self.scheduler_config.num_lookahead_slots
 
     def _get_num_new_uncached_and_cached_tokens(
         self,

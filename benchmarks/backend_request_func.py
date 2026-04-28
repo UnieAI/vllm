@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ---------------------------------------------------------------------------------------
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. All rights reserved.
+# Confidential and Proprietary - Qualcomm Technologies, Inc. and/or its subsidiaries.
+#
+# Not a contribution.
+# ---------------------------------------------------------------------------------------
 
 import io
 import json
@@ -18,7 +24,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizer
 # NOTE(simon): do not import vLLM here so the benchmark script
 # can run without vLLM installed.
 
-AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
+AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=10 * 60 * 60)
 
 
 @dataclass
@@ -47,6 +53,7 @@ class RequestFuncOutput:
     tpot: float = 0.0  # avg next-token latencies
     prompt_len: int = 0
     error: str = ""
+    queue_wait_time: Optional[float] = None
 
 
 async def async_request_tgi(
@@ -456,6 +463,97 @@ async def async_request_openai_chat_completions(
         pbar.update(1)
     return output
 
+async def async_request_openai_chat_completions_non_streaming(
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm] = None,
+) -> RequestFuncOutput:
+    api_url = request_func_input.api_url
+    assert api_url.endswith(
+        ("chat/completions", "profile")
+    ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
+
+    async with aiohttp.ClientSession(trust_env=True,
+                                     timeout=AIOHTTP_TIMEOUT) as session:
+        content = [{"type": "text", "text": request_func_input.prompt}]
+        if request_func_input.multi_modal_content:
+            mm_content = request_func_input.multi_modal_content
+            if isinstance(mm_content, list):
+                content.extend(mm_content)
+            elif isinstance(mm_content, dict):
+                content.append(mm_content)
+            else:
+                raise TypeError(
+                    "multi_modal_content must be a dict or list[dict] for openai-chat"
+                )
+        payload = {
+            "model": request_func_input.model_name \
+                if request_func_input.model_name else request_func_input.model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": content
+                },
+            ],
+            "temperature": 0.0,
+            "max_completion_tokens": request_func_input.output_len,
+            "stream": False,
+        }
+        if request_func_input.ignore_eos:
+            payload["ignore_eos"] = request_func_input.ignore_eos
+        if request_func_input.extra_body:
+            payload.update(request_func_input.extra_body)
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+        }
+
+        output = RequestFuncOutput()
+        output.prompt_len = request_func_input.prompt_len
+
+        st = time.perf_counter()
+        try:
+            async with session.post(url=api_url, json=payload,
+                                    headers=headers) as response:
+                if response.status == 200:
+                    async for chunk_bytes in response.content:
+                        chunk_bytes = chunk_bytes.strip()
+                        if not chunk_bytes:
+                            continue
+
+                        chunk = chunk_bytes.decode("utf-8").removeprefix(
+                            "data: ")
+                        data = json.loads(chunk)
+                        output.generated_text = data["choices"][0]["message"]["content"]
+                        if 'usage' in data:
+                            usage = data['usage']
+                        else:
+                            usage = {}
+
+                        try:
+                            output.ttft = usage['ttft_in_ms']/1000
+                            output.latency = usage['e2e_inference_in_ms']/1000
+                            output.queue_wait_time = usage['queue_wait_time_in_ms']
+                            output.output_tokens = usage['completion_tokens']
+                            output.prompt_len = usage['prompt_tokens']
+                        except:
+                            output.ttft = time.perf_counter() - st
+                            output.latency = time.perf_counter() - st
+                            output.output_tokens = request_func_input.output_len
+
+                        output.itl.append((output.latency - output.ttft) / output.output_tokens)
+
+                    output.success = True
+                else:
+                    output.error = response.reason or ""
+                    output.success = False
+        except Exception:
+            output.success = False
+            exc_info = sys.exc_info()
+            output.error = "".join(traceback.format_exception(*exc_info))
+
+    if pbar:
+        pbar.update(1)
+    return output
 
 async def async_request_openai_audio(
     request_func_input: RequestFuncInput,
@@ -630,10 +728,12 @@ ASYNC_REQUEST_FUNCS = {
     "scalellm": async_request_openai_completions,
     "sglang": async_request_openai_completions,
     "llama.cpp": async_request_openai_completions,
+    "openai_non_streaming": async_request_openai_chat_completions_non_streaming,
 }
 
 OPENAI_COMPATIBLE_BACKENDS = [
     k
     for k, v in ASYNC_REQUEST_FUNCS.items()
-    if v in (async_request_openai_completions, async_request_openai_chat_completions)
+    if v in (async_request_openai_completions, async_request_openai_chat_completions,
+             async_request_openai_chat_completions_non_streaming)
 ]

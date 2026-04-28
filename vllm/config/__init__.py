@@ -1,6 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
+# ---------------------------------------------------------------------------------------
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. All rights reserved.
+# Confidential and Proprietary - Qualcomm Technologies, Inc. and/or its subsidiaries.
+#
+# Not a contribution.
+# ---------------------------------------------------------------------------------------
+# Temporarily reverting PR #21152 [V0 Deprecation] Remove V0 Spec Decode workers
+# for backward compatibility with v0.
 # ruff: noqa: F401
 import ast
 import copy
@@ -57,6 +64,7 @@ if TYPE_CHECKING:
 
     import vllm.model_executor.layers.quantization as me_quant
     import vllm.model_executor.models as me_models
+    from vllm.entrypoints.openai.serving_models import LoRAModulePath
     from vllm.model_executor.layers.quantization import QuantizationMethods
     from vllm.model_executor.layers.quantization.base_config import (
         QuantizationConfig)
@@ -68,6 +76,7 @@ if TYPE_CHECKING:
 else:
     DataclassInstance = Any
     PretrainedConfig = Any
+    LoRAModulePath = Any
     QuantizationConfig = Any
     QuantizationMethods = Any
     BaseModelLoader = Any
@@ -470,6 +479,11 @@ class ModelConfig:
     logits_processors: Optional[list[Union[str, type[LogitsProcessor]]]] = None
     """One or more logits processors' fully-qualified class names or class
     definitions"""
+    override_qaic_config: Optional[dict[str, Any]] = None
+    """Initialize non default qaic config or override default qaic config
+    that are specific to Qaic devices, this argument will be used to
+    configure the qaic config that can not be fully gathered from the vllm
+    arguments."""
 
     def compute_hash(self) -> str:
         """
@@ -751,6 +765,10 @@ class ModelConfig:
         if (not current_platform.is_neuron() and self.override_neuron_config):
             raise ValueError(
                 "`override_neuron_config` is only supported on Neuron.")
+
+        if (not current_platform.is_qaic() and self.override_qaic_config):
+            raise ValueError(
+                "`override_qaic_config` is only supported on Qaic.")
 
         # Avoid running try_verify_and_update_config multiple times
         self.config_updated = False
@@ -1088,7 +1106,7 @@ class ModelConfig:
         optimized_quantization_methods = [
             "fp8", "marlin", "modelopt", "gptq_marlin_24", "gptq_marlin",
             "awq_marlin", "fbgemm_fp8", "compressed-tensors", "experts_int8",
-            "quark", "modelopt_fp4", "bitblas", "gptq_bitblas", "inc"
+            "quark", "modelopt_fp4", "bitblas", "gptq_bitblas", "inc", "mxfp6"
         ]
         if self.quantization is not None:
             self.quantization = cast(me_quant.QuantizationMethods,
@@ -1111,6 +1129,7 @@ class ModelConfig:
             # `override_quantization_method` method) must be checked in order
             # of preference (this is particularly important for GPTQ).
             overrides = [
+                "mxfp6",
                 "marlin",
                 "bitblas",
                 "gptq_marlin_24",
@@ -1835,7 +1854,7 @@ class LoadConfig:
             self.ignore_patterns = ["original/**/*"]
 
 
-Device = Literal["auto", "cuda", "neuron", "cpu", "tpu", "xpu"]
+Device = Literal["auto", "cuda", "neuron", "cpu", "tpu", "xpu", "qaic"]
 
 
 @config
@@ -1851,6 +1870,9 @@ class DeviceConfig:
     on the current platform."""
     device_type: str = field(init=False)
     """Device type from the current platform. This is set in
+    `__post_init__`."""
+    device_group: Optional[Union[int, list[int]]] = None
+    """Device group for qaic platform. This is set in
     `__post_init__`."""
 
     def compute_hash(self) -> str:
@@ -1890,8 +1912,15 @@ class DeviceConfig:
             elif isinstance(self.device, torch.device):
                 self.device_type = self.device.type
 
+        # Device group is only applicable to qaic devices
+        if self.device_type == "qaic":
+            if isinstance(self.device_group, int):
+                self.device_group = [self.device_group]
+            else:
+                self.device_group = self.device_group
+
         # Some device types require processing inputs on CPU
-        if self.device_type in ["neuron"]:
+        if self.device_type in ["neuron", "qaic"]:
             self.device = torch.device("cpu")
         elif self.device_type in ["tpu"]:
             self.device = None
@@ -1901,7 +1930,9 @@ class DeviceConfig:
 
 
 SpeculativeMethod = Literal["ngram", "eagle", "eagle3", "medusa",
-                            "mlp_speculator", "draft_model", "deepseek_mtp"]
+                            "mlp_speculator", "draft_model", "deepseek_mtp", "turbo"]
+SpeculativeAcceptanceMethod = Literal["rejection_sampler",
+                                      "typical_acceptance_sampler"]
 
 
 @config
@@ -1924,6 +1955,13 @@ class SpeculativeConfig:
 
     If using `ngram` method, the related configuration `prompt_lookup_max` and
     `prompt_lookup_min` should be considered."""
+    acceptance_method: SpeculativeAcceptanceMethod = "rejection_sampler"
+    """The method to use for accepting draft tokens:\n
+    - "rejection_sampler" maps to `RejectionSampler`.\n
+    - "typical_acceptance_sampler" maps to `TypicalAcceptanceSampler`.
+
+    If using `typical_acceptance_sampler`, the related configuration
+    `posterior_threshold` and `posterior_alpha` should be considered."""
     draft_tensor_parallel_size: Optional[int] = None
     """The degree of the tensor parallelism for the draft model. Can only be 1
     or the same as the target model's tensor parallel size."""
@@ -1950,6 +1988,9 @@ class SpeculativeConfig:
     will use the default version."""
 
     # Advanced control
+    disable_mqa_scorer: bool = False
+    """Disable the MQA scorer and fall back to batch expansion for scoring
+    proposals."""
     disable_by_batch_size: Optional[int] = None
     """Disable speculative decoding for new incoming requests when the number
     of enqueued requests is larger than this value, if provided."""
@@ -1961,6 +2002,16 @@ class SpeculativeConfig:
     prompt_lookup_min: Optional[int] = None
     """Minimum size of ngram token window when using Ngram proposer, if
     provided. Defaults to 1."""
+
+    # Typical acceptance sampler configuration
+    posterior_threshold: Optional[float] = None
+    """A threshold value that sets a lower bound on the posterior probability
+    of a token in the target model for it to be accepted. This threshold is
+    used only when we use the `TypicalAcceptanceSampler` for token acceptance.
+    """
+    posterior_alpha: Optional[float] = None
+    """Scaling factor for entropy-based threshold, applied when using
+    `TypicalAcceptanceSampler`."""
 
     speculative_token_tree: Optional[str] = None
     """Specifies the tree structure for speculative token generation.
@@ -1984,6 +2035,8 @@ class SpeculativeConfig:
     draft_parallel_config: SkipValidation[
         ParallelConfig] = None  # type: ignore
     """The parallel configuration for the draft model initialized internal."""
+    draft_override_qaic_config: Optional[dict[str,Any]]= None
+    """The configuration for the draft model for QAIC backend."""
 
     def compute_hash(self) -> str:
         """
@@ -2058,6 +2111,8 @@ class SpeculativeConfig:
                 self.model = self.target_model_config.model
             elif self.method in ("ngram", "[ngram]"):
                 self.model = "ngram"
+            elif self.method == "turbo":
+                self.model = "turbo"
             else:
                 raise ValueError("num_speculative_tokens was provided without "
                                  "speculative model.")
@@ -2101,6 +2156,23 @@ class SpeculativeConfig:
             # draft related config as None here.
             self.draft_model_config = self.target_model_config
             self.draft_parallel_config = self.target_parallel_config
+        elif self.method == "turbo":
+            self.prompt_lookup_max = 0
+            self.prompt_lookup_min = 0
+
+            self.draft_model_config = copy.deepcopy(self.target_model_config)
+            self.draft_parallel_config = self.target_parallel_config
+            from vllm.transformers_utils.configs.turbo import (
+                TurboConfig)
+            turbo_config = TurboConfig.from_pretrained(self.target_model_config.model)
+            self.draft_model_config.hf_config = turbo_config
+            n_predict = turbo_config.n_predict
+            if self.num_speculative_tokens is None:
+                self.num_speculative_tokens = n_predict
+            elif self.num_speculative_tokens > n_predict:
+                raise ValueError(
+                    f"num_speculative_tokens ({self.num_speculative_tokens}) is greater than "
+                    f"the number of speculative heads available ({n_predict}).")
         else:
             self.prompt_lookup_max = 0
             self.prompt_lookup_min = 0
@@ -2129,6 +2201,7 @@ class SpeculativeConfig:
                     max_seq_len_to_capture,
                     max_logprobs=self.target_model_config.max_logprobs,
                     hf_overrides=SpeculativeConfig.hf_config_override,
+                    override_qaic_config=self.draft_override_qaic_config
                 )
 
                 # Automatically detect the method
@@ -2153,11 +2226,13 @@ class SpeculativeConfig:
                             )
                 else:
                     self.method = "draft_model"
-                    raise NotImplementedError(
-                        "Speculative decoding with draft model is not "
-                        "supported yet. Please consider using other "
-                        "speculative decoding methods such as ngram, medusa, "
-                        "eagle, or deepseek_mtp.")
+                    from vllm.platforms import current_platform
+                    if not current_platform.is_qaic():
+                        raise NotImplementedError(
+                            "Speculative decoding with draft model is not "
+                            "supported yet. Please consider using other "
+                            "speculative decoding methods such as ngram, medusa, "
+                            "eagle, or deepseek_mtp.")
 
                 # Replace hf_config for EAGLE draft_model
                 if self.method in ("eagle", "eagle3"):
@@ -2231,6 +2306,11 @@ class SpeculativeConfig:
                     SpeculativeConfig.create_draft_parallel_config(
                         self.target_parallel_config,
                         self.draft_tensor_parallel_size))
+        if self.acceptance_method == "typical_acceptance_sampler":
+            if self.posterior_threshold is None:
+                self.posterior_threshold = 0.09
+            if self.posterior_alpha is None:
+                self.posterior_alpha = 0.3
 
     @staticmethod
     def _maybe_override_draft_max_model_len(
@@ -2337,6 +2417,30 @@ class SpeculativeConfig:
         if self.draft_model_config:
             self.draft_model_config.verify_with_parallel_config(
                 self.draft_parallel_config)
+            # Validate and set draft token acceptance related settings.
+
+        if self.acceptance_method is None:
+            raise ValueError("acceptance_method is not set. "
+                             "Expected values are rejection_sampler or "
+                             "typical_acceptance_sampler.")
+
+        if (self.acceptance_method != 'rejection_sampler'
+                and self.acceptance_method != 'typical_acceptance_sampler'):
+            raise ValueError(
+                "Expected acceptance_method to be either "
+                "rejection_sampler or typical_acceptance_sampler. Instead it "
+                f"is {self.acceptance_method}")
+
+        if self.acceptance_method == "typical_acceptance_sampler" and (
+            (self.posterior_threshold is not None
+             and self.posterior_threshold < 0) or
+            (self.posterior_alpha is not None and self.posterior_alpha < 0)):
+            raise ValueError(
+                "Expected the posterior_threshold and posterior_alpha of "
+                "typical_acceptance_sampler to be > 0. "
+                "Instead found posterior_threshold = "
+                f"{self.posterior_threshold} and posterior_alpha = "
+                f"{self.posterior_alpha}")
 
         if (self.disable_by_batch_size is not None
                 and self.disable_by_batch_size < 2):
@@ -2415,6 +2519,8 @@ class LoRAConfig:
     in alphabetic order."""
     bias_enabled: bool = False
     """Enable bias for LoRA adapters."""
+    lora_modules: Optional[list["LoRAModulePath"]] = None
+    """A list of LoRA modules, used by QAIC backend"""
 
     def compute_hash(self) -> str:
         """

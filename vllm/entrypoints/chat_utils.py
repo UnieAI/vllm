@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+# Temporarily adding PR #22386 [gpt-oss] tool parser supports for /chat/completions [1/n]
+# for compatibility with function calling support from vLLM r0.10.2
+
 import asyncio
 import json
 from abc import ABC, abstractmethod
@@ -1347,3 +1350,17 @@ def apply_mistral_chat_template(
 
 def random_tool_call_id() -> str:
     return f"chatcmpl-tool-{random_uuid()}"
+
+def get_history_tool_calls_cnt(conversation: list[ConversationMessage]):
+    idx = 0
+    for msg in conversation:
+        if msg["role"] == "assistant":
+            tool_calls = msg.get("tool_calls")
+    return idx
+
+def make_tool_call_id(id_type: str = "random", func_name=None, idx=None):
+    if id_type == "kimi_k2":
+        return f"functions.{func_name}:{idx}"
+    else:
+        # by default return random
+        return f"chatcmpl-tool-{random_uuid()}"

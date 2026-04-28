@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ---------------------------------------------------------------------------------------
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. All rights reserved.
+# Confidential and Proprietary - Qualcomm Technologies, Inc. and/or its subsidiaries.
+#
+# Not a contribution.
+# ---------------------------------------------------------------------------------------
 """Benchmark the latency of processing a single batch of requests."""
 
 import argparse
@@ -56,7 +62,7 @@ def main(args: argparse.Namespace):
 
     sampling_params = SamplingParams(
         n=args.n,
-        temperature=1.0,
+        temperature=args.temperature,
         top_p=1.0,
         ignore_eos=True,
         max_tokens=args.output_len,
@@ -172,6 +178,12 @@ def create_argument_parser():
         ),
     )
 
+    parser.add_argument('--temperature',
+                    type=float,
+                    default=1.0,
+                    help="temperature controls the randomness of the sampling. Lower"
+                "values make the model more deterministic, while higher values make"
+                "the model more random. Zero means greedy sampling."),
     parser = EngineArgs.add_cli_args(parser)
     # V1 enables prefix caching by default which skews the latency
     # numbers. We need to disable prefix caching by default.

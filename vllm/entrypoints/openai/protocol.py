@@ -1,8 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ---------------------------------------------------------------------------------------
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. All rights reserved.
+# Confidential and Proprietary - Qualcomm Technologies, Inc. and/or its subsidiaries.
+#
+# Not a contribution.
+# ---------------------------------------------------------------------------------------
 
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
+
+
+# Temporarily adding PR #22587 Add return_token_ids parameter to OpenAI API endpoints
 import json
 import time
 from http import HTTPStatus
@@ -47,6 +56,7 @@ from vllm.sampling_params import (BeamSearchParams, GuidedDecodingParams,
                                   RequestOutputKind, SamplingParams)
 from vllm.sequence import Logprob
 from vllm.utils import random_uuid, resolve_obj_by_qualname
+from vllm.utils.serial_utils import EmbedDType, EncodingFormat, Endianness
 
 logger = init_logger(__name__)
 
@@ -136,6 +146,10 @@ class UsageInfo(OpenAIBaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: Optional[int] = 0
+    ttft_excluding_queue_wait_time_in_ms:  Optional[float] = None
+    e2e_inference_in_ms: Optional[float] = None
+    queue_wait_time_in_ms: Optional[float] = None
+    ttft_in_ms: Optional[float] = None
     prompt_tokens_details: Optional[PromptTokenUsageInfo] = None
 
 
@@ -576,6 +590,16 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "If specified with 'logprobs', tokens are represented "
             " as strings of the form 'token_id:{token_id}' so that tokens "
             "that are not JSON-encodable can be identified."))
+    return_token_ids: bool | None = Field(
+        default=None,
+        description=(
+            "If specified, the result will include token IDs alongside the "
+            "generated text. In streaming mode, prompt_token_ids is included "
+            "only in the first chunk, and token_ids contains the delta tokens "
+            "for each chunk. This is useful for debugging or when you "
+            "need to map generated text back to input tokens."
+        ),
+    )
     cache_salt: Optional[str] = Field(
         default=None,
         description=(
@@ -1269,7 +1293,9 @@ class EmbeddingCompletionRequest(OpenAIBaseModel):
     # https://platform.openai.com/docs/api-reference/embeddings
     model: Optional[str] = None
     input: Union[list[int], list[list[int]], str, list[str]]
-    encoding_format: Literal["float", "base64"] = "float"
+    # Added changes from https://github.com/vllm-project/vllm/pull/27066
+    # [Frontend][3/N] Improve all pooling task | Support binary embedding response #27066
+    encoding_format: EncodingFormat = "float"
     dimensions: Optional[int] = None
     user: Optional[str] = None
     truncate_prompt_tokens: Optional[Annotated[int, Field(ge=-1)]] = None
@@ -1296,6 +1322,22 @@ class EmbeddingCompletionRequest(OpenAIBaseModel):
             "through out the inference process and return in response."),
     )
     normalize: Optional[bool] = None
+    # Added changes from https://github.com/vllm-project/vllm/pull/27066
+    # [Frontend][3/N] Improve all pooling task | Support binary embedding response #27066
+    embed_dtype: EmbedDType = Field(
+        default="float32",
+        description=
+        ("What dtype to use for encoding. Default to using float32 for base64 "
+         "encoding to match the OpenAI python client behavior. "
+         "This parameter will affect base64 and binary_response."),
+    )
+    endianness: Endianness = Field(
+        default="native",
+        description=(
+            "What endianness to use for encoding. Default to using native for "
+            "base64 encoding to match the OpenAI python client behavior."
+            "This parameter will affect base64 and binary_response."),
+    )
 
     # --8<-- [end:embedding-extra-params]
 
@@ -1308,7 +1350,9 @@ class EmbeddingChatRequest(OpenAIBaseModel):
     model: Optional[str] = None
     messages: list[ChatCompletionMessageParam]
 
-    encoding_format: Literal["float", "base64"] = "float"
+    # Added changes from https://github.com/vllm-project/vllm/pull/27066
+    # [Frontend][3/N] Improve all pooling task | Support binary embedding response #27066
+    encoding_format: EncodingFormat = "float"
     dimensions: Optional[int] = None
     user: Optional[str] = None
     truncate_prompt_tokens: Optional[Annotated[int, Field(ge=-1)]] = None
@@ -1356,6 +1400,22 @@ class EmbeddingChatRequest(OpenAIBaseModel):
             "through out the inference process and return in response."),
     )
     normalize: Optional[bool] = None
+    # Added changes from https://github.com/vllm-project/vllm/pull/27066
+    # [Frontend][3/N] Improve all pooling task | Support binary embedding response #27066
+    embed_dtype: EmbedDType = Field(
+        default="float32",
+        description=
+        ("What dtype to use for encoding. Default to using float32 for base64 "
+         "encoding to match the OpenAI python client behavior. "
+         "This parameter will affect base64 and binary_response."),
+    )
+    endianness: Endianness = Field(
+        default="native",
+        description=(
+            "What endianness to use for encoding. Default to using native for "
+            "base64 encoding to match the OpenAI python client behavior."
+            "This parameter will affect base64 and binary_response."),
+    )
     # --8<-- [end:chat-embedding-extra-params]
 
     @model_validator(mode="before")
@@ -1550,6 +1610,14 @@ class PoolingResponse(OpenAIBaseModel):
     model: str
     data: list[PoolingResponseData]
     usage: UsageInfo
+
+
+# Added changes from https://github.com/vllm-project/vllm/pull/27066
+# [Frontend][3/N] Improve all pooling task | Support binary embedding response #27066
+class PoolingBytesResponse(OpenAIBaseModel):
+    body: list[bytes]
+    metadata: str
+    media_type: str = "application/octet-stream"
 
 
 class ScoreResponseData(OpenAIBaseModel):

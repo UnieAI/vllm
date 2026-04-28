@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ---------------------------------------------------------------------------------------
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. All rights reserved.
+# Confidential and Proprietary - Qualcomm Technologies, Inc. and/or its subsidiaries.
+#
+# Not a contribution.
+# ---------------------------------------------------------------------------------------
 import logging
 import traceback
 from itertools import chain
@@ -67,7 +73,7 @@ def cuda_platform_plugin() -> Optional[str]:
             # Otherwise, vllm will always activate cuda plugin
             # on a GPU machine, even if in a cpu build.
             is_cuda = (pynvml.nvmlDeviceGetCount() > 0
-                       and not vllm_version_matches_substr("cpu"))
+                       and not vllm_version_matches_substr("cpu") and not vllm_version_matches_substr("qaic") )
             if pynvml.nvmlDeviceGetCount() <= 0:
                 logger.debug(
                     "CUDA platform is not available because no GPU is found.")
@@ -193,6 +199,30 @@ def neuron_platform_plugin() -> Optional[str]:
     return "vllm.platforms.neuron.NeuronPlatform" if is_neuron else None
 
 
+def qaic_platform_plugin() -> Optional[str]:
+    is_qaic = False
+    try:
+        try:
+            import qaicrt
+        except ImportError:
+            import platform
+            import sys
+            sys.path.append(f"/opt/qti-aic/dev/lib/{platform.machine()}")
+            import qaicrt
+        try:
+            from QAicApi_pb2 import aicapi
+        except ImportError:
+            import sys
+            sys.path.append("/opt/qti-aic/dev/python")
+            import QAicApi_pb2 as aicapi
+        from importlib.metadata import version
+        is_qaic = "qaic" in version("vllm")
+    except ImportError:
+        pass
+
+    return "vllm.platforms.qaic.QaicPlatform" if is_qaic else None
+
+
 builtin_platform_plugins = {
     'tpu': tpu_platform_plugin,
     'cuda': cuda_platform_plugin,
@@ -200,6 +230,7 @@ builtin_platform_plugins = {
     'xpu': xpu_platform_plugin,
     'cpu': cpu_platform_plugin,
     'neuron': neuron_platform_plugin,
+    'qaic': qaic_platform_plugin,
 }
 
 

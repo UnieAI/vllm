@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ---------------------------------------------------------------------------------------
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. All rights reserved.
+# Confidential and Proprietary - Qualcomm Technologies, Inc. and/or its subsidiaries.
+#
+# Not a contribution.
+# ---------------------------------------------------------------------------------------
 import enum
 import os
 import platform
@@ -73,6 +79,7 @@ class PlatformEnum(enum.Enum):
     XPU = enum.auto()
     CPU = enum.auto()
     NEURON = enum.auto()
+    QAIC = enum.auto()
     OOT = enum.auto()
     UNSPECIFIED = enum.auto()
 
@@ -164,6 +171,9 @@ class Platform:
 
     def is_neuron(self) -> bool:
         return self._enum == PlatformEnum.NEURON
+
+    def is_qaic(self) -> bool:
+        return self._enum == PlatformEnum.QAIC
 
     def is_out_of_tree(self) -> bool:
         return self._enum == PlatformEnum.OOT

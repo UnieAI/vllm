@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ---------------------------------------------------------------------------------------
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. All rights reserved.
+# Confidential and Proprietary - Qualcomm Technologies, Inc. and/or its subsidiaries.
+#
+# Not a contribution.
+# ---------------------------------------------------------------------------------------
 
 import ctypes
 import importlib.util
@@ -414,7 +420,7 @@ def _no_device() -> bool:
 def _is_cuda() -> bool:
     has_cuda = torch.version.cuda is not None
     return (VLLM_TARGET_DEVICE == "cuda" and has_cuda
-            and not (_is_neuron() or _is_tpu()))
+            and not (_is_neuron() or _is_tpu() or _is_qaic()))
 
 
 def _is_hip() -> bool:
@@ -424,6 +430,15 @@ def _is_hip() -> bool:
 
 def _is_neuron() -> bool:
     return VLLM_TARGET_DEVICE == "neuron"
+
+
+def _is_qaic() -> bool:
+    qaic_sdk_installed = True
+    try:
+       subprocess.run(["/opt/qti-aic/tools/qaic-util", "-q"], capture_output=True, check=True)
+    except (FileNotFoundError, PermissionError, subprocess.CalledProcessError):
+       qaic_sdk_installed = False
+    return qaic_sdk_installed or VLLM_TARGET_DEVICE == "qaic"
 
 
 def _is_tpu() -> bool:
@@ -518,6 +533,23 @@ def get_gaudi_sw_version():
             " ", "").split(":")[1][:-1].split("-")[0]
     return "0.0.0"  # when hl-smi is not available
 
+def get_qaic_sdk_version():
+    """
+    Get the QAIC sdk version from qaicrt.
+    """
+    try:
+        try:
+            from qaicrt import Util as qaic_util
+        except ImportError:
+            import platform
+            import sys
+            sys.path.append(f"/opt/qti-aic/dev/lib/{platform.machine()}")
+            from qaicrt import Util as qaic_util
+        _, _, _, patch, _ = qaic_util().getAicVersion()
+        short_version = ".".join(patch.split(".")[:2])
+        return short_version
+    except Exception:
+        return "1.21"
 
 def get_vllm_version() -> str:
     version = get_version(write_to="vllm/_version.py")
@@ -549,6 +581,10 @@ def get_vllm_version() -> str:
             version += f"{sep}neuron{neuron_version_str}"
     elif _is_tpu():
         version += f"{sep}tpu"
+    elif _is_qaic():
+        # Get the qaic sdk version
+        qaic_version_str = get_qaic_sdk_version()
+        version = f"0.10.1.1+qaic{qaic_version_str}"
     elif _is_cpu():
         if envs.VLLM_TARGET_DEVICE == "cpu":
             version += f"{sep}cpu"
@@ -597,6 +633,8 @@ def get_requirements() -> list[str]:
         requirements = _read_requirements("tpu.txt")
     elif _is_cpu():
         requirements = _read_requirements("cpu.txt")
+    elif _is_qaic():
+        requirements = _read_requirements("qaic.txt")
     elif _is_xpu():
         requirements = _read_requirements("xpu.txt")
     else:

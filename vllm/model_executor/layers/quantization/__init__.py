@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ---------------------------------------------------------------------------------------
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. All rights reserved.
+# Confidential and Proprietary - Qualcomm Technologies, Inc. and/or its subsidiaries.
+#
+# Not a contribution.
+# ---------------------------------------------------------------------------------------
 
 from typing import Literal, get_args
 
@@ -37,6 +43,7 @@ QuantizationMethods = Literal[
     "rtn",
     "inc",
     "mxfp4",
+    "mxfp6"
 ]
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
@@ -112,6 +119,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .mxfp4 import Mxfp4Config
     from .neuron_quant import NeuronQuantConfig
     from .ptpc_fp8 import PTPCFp8Config
+    from .qaic_quant import QaicQuantConfig
     from .qqq import QQQConfig
     from .rtn import RTNConfig
     from .torchao import TorchAOConfig
@@ -148,6 +156,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "rtn": RTNConfig,
         "inc": INCConfig,
         "mxfp4": Mxfp4Config,
+        "mxfp6": QaicQuantConfig
     }
     # Update the `method_to_config` with customized quantization methods.
     method_to_config.update(_CUSTOMIZED_METHOD_TO_QUANT_CONFIG)

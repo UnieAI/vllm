@@ -1,0 +1,17 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: QAIC Offline (vllm-aic)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "python": "${workspaceFolder}/vllm-aic/bin/python", // 強制指定使用 vllm-aic 
+            "env": {
+                "TORCH_COMPILE_DISABLE": "1"
+            },
+            "justMyCode": false
+        }
+    ]
+}

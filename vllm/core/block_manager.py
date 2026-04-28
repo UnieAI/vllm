@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ---------------------------------------------------------------------------------------
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. All rights reserved.
+# Confidential and Proprietary - Qualcomm Technologies, Inc. and/or its subsidiaries.
+#
+# Not a contribution.
+# ---------------------------------------------------------------------------------------
 """A block manager that manages token blocks."""
 from typing import Dict, List, Optional
 from typing import Sequence as GenericSequence
@@ -14,6 +20,8 @@ from vllm.core.block.utils import check_no_caching_or_swa_for_blockmgr_encdec
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
 from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
 from vllm.utils import Device
+from vllm.platforms import current_platform
+from vllm.core.block.qaic_prefix_caching_block import QaicComputedBlocksTracker
 
 SeqId = int
 EncoderSeqId = str
@@ -102,8 +110,13 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         self.block_tables: Dict[SeqId, BlockTable] = {}
         self.cross_block_tables: Dict[EncoderSeqId, BlockTable] = {}
 
-        self._computed_blocks_tracker = ComputedBlocksTracker(
-            self.block_allocator, self.block_size, self.enable_caching)
+        if current_platform.is_qaic():
+            self._computed_blocks_tracker = QaicComputedBlocksTracker(
+                self.block_allocator, self.block_size, self.enable_caching, self.block_tables)
+        else:
+            self._computed_blocks_tracker = ComputedBlocksTracker(
+                self.block_allocator, self.block_size, self.enable_caching)
+
         self._last_access_blocks_tracker = LastAccessBlocksTracker(
             self.block_allocator)
 

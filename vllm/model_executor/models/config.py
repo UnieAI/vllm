@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+# Temporarily adding PR #22386 [gpt-oss] tool parser supports for /chat/completions [1/n]
+# for compatibility with function calling support from vLLM r0.10.2
+
 from copy import deepcopy
 from typing import TYPE_CHECKING
 
@@ -253,7 +257,7 @@ class GptOssForCausalLMConfig(VerifyAndUpdateConfig):
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
         decoding_config = vllm_config.decoding_config
         if decoding_config.reasoning_backend == "":
-            decoding_config.reasoning_backend = "GptOss"
+            decoding_config.reasoning_backend = "openai_gptoss"
 
         # Increase the max capture size from 512 to 1024 for performance.
         # NOTE(woosuk): This will increase the number of CUDA graphs

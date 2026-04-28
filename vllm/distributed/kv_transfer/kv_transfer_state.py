@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Temporarily reverting PR #21785 [V0 deprecation][P/D] Deprecate v0 KVConnectorBase code (1/2)
+# for backward compatibility with v0.
 from typing import TYPE_CHECKING, Optional
 
 from vllm import envs
@@ -8,6 +10,7 @@ from vllm.distributed.kv_transfer.kv_connector.factory import (
     KVConnectorFactory)
 from vllm.distributed.kv_transfer.kv_connector.v1 import (KVConnectorBase_V1,
                                                           KVConnectorRole)
+from vllm.distributed.parallel_state import get_world_group
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -63,4 +66,8 @@ def ensure_kv_transfer_initialized(vllm_config: "VllmConfig") -> None:
             _KV_CONNECTOR_AGENT = KVConnectorFactory.create_connector(
                 config=vllm_config, role=KVConnectorRole.WORKER)
         else:
-            raise ValueError("V0 is no longer supported")
+            _KV_CONNECTOR_AGENT = KVConnectorFactory.create_connector_v0(
+                rank=get_world_group().rank,
+                local_rank=get_world_group().local_rank,
+                config=vllm_config,
+            )

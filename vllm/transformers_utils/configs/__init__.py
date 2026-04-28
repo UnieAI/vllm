@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ---------------------------------------------------------------------------------------
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. All rights reserved.
+# Confidential and Proprietary - Qualcomm Technologies, Inc. and/or its subsidiaries.
+#
+# Not a contribution.
+# ---------------------------------------------------------------------------------------
 """
 Model configs may be defined in this directory for the following reasons:
 
@@ -27,7 +33,9 @@ from vllm.transformers_utils.configs.speculators.base import SpeculatorsConfig
 from vllm.transformers_utils.configs.step3_vl import (Step3TextConfig,
                                                       Step3VisionEncoderConfig,
                                                       Step3VLConfig)
+from vllm.transformers_utils.configs.turbo import TurboConfig
 from vllm.transformers_utils.configs.ultravox import UltravoxConfig
+from vllm.transformers_utils.configs.llama_swiftkv import LlamaSwiftKVConfig
 
 __all__ = [
     "ChatGLMConfig",
@@ -44,8 +52,10 @@ __all__ = [
     "Nemotron_Nano_VL_Config",
     "OvisConfig",
     "SpeculatorsConfig",
+    "TurboConfig",
     "UltravoxConfig",
     "Step3VLConfig",
     "Step3VisionEncoderConfig",
     "Step3TextConfig",
+    "LlamaSwiftKVConfig",
 ]

@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ---------------------------------------------------------------------------------------
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. All rights reserved.
+# Confidential and Proprietary - Qualcomm Technologies, Inc. and/or its subsidiaries.
+#
+# Not a contribution.
+# ---------------------------------------------------------------------------------------
 
 from typing import Any, Callable, Optional
 
@@ -20,7 +26,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding)
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.utils import direct_register_custom_op
+from vllm.utils import direct_register_custom_op, supports_custom_op
 
 logger = init_logger(__name__)
 
@@ -157,7 +163,12 @@ try:
     fused_mul_mat_gguf = torch.ops.vllm._fused_mul_mat_gguf
 
 except AttributeError as error:
-    raise error
+    # If custom ops are not supported on the current platform,
+    # fall back to the default implementation.
+    if not supports_custom_op():
+        fused_mul_mat_gguf = _fused_mul_mat_gguf
+    else:
+        raise error
 
 
 def _fused_moe_gguf(
@@ -269,7 +280,12 @@ try:
     fused_moe_gguf = torch.ops.vllm._fused_moe_gguf
 
 except AttributeError as error:
-    raise error
+    # If custom ops are not supported on the current platform,
+    # fall back to the default implementation.
+    if not supports_custom_op():
+        fused_moe_gguf = _fused_moe_gguf
+    else:
+        raise error
 
 
 def _apply_gguf_embedding(
@@ -315,7 +331,12 @@ try:
     apply_gguf_embedding = torch.ops.vllm._apply_gguf_embedding
 
 except AttributeError as error:
-    raise error
+    # If custom ops are not supported on the current platform,
+    # fall back to the default implementation.
+    if not supports_custom_op():
+        apply_gguf_embedding = _apply_gguf_embedding
+    else:
+        raise error
 
 
 class GGUFLinearMethod(LinearMethodBase):

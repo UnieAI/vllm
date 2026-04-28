@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ---------------------------------------------------------------------------------------
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. All rights reserved.
+# Confidential and Proprietary - Qualcomm Technologies, Inc. and/or its subsidiaries.
+#
+# Not a contribution.
+# ---------------------------------------------------------------------------------------
 """
 This module defines a framework for sampling benchmark requests from various
 datasets. Each dataset subclass of BenchmarkDataset must implement sample
@@ -17,6 +23,7 @@ import io
 import json
 import logging
 import random
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -333,15 +340,12 @@ class RandomDataset(BenchmarkDataset):
         logger.info("Sampling input_len from [%s, %s]", input_low, input_high)
         logger.info("Sampling output_len from [%s, %s]", output_low, output_high)
 
-        input_lens = np.random.randint(input_low, input_high + 1, size=num_requests)
-        output_lens = np.random.randint(output_low, output_high + 1, size=num_requests)
-        offsets = np.random.randint(0, vocab_size, size=num_requests)
-
         requests = []
-        for i in range(num_requests):
-            inner_seq = (
-                (offsets[i] + i + np.arange(input_lens[i])) % vocab_size
-            ).tolist()
+        while len(requests) < num_requests:
+            input_lens = np.random.randint(input_low, input_high + 1, size=1)
+            output_lens = np.random.randint(output_low, output_high + 1, size=1)
+            offsets = np.random.randint(0, vocab_size, size=1)
+            inner_seq = ((offsets[0] + np.arange(input_lens[0])) % vocab_size).tolist()
             token_sequence = prefix_token_ids + inner_seq
             prompt = tokenizer.decode(token_sequence)
             # After decoding the prompt we have to encode and decode it again.
@@ -352,17 +356,27 @@ class RandomDataset(BenchmarkDataset):
             # [1650, 939, 486] -> ['Ġcall', 'sh', 'ere']
             # To avoid uncontrolled change of the prompt length,
             # the encoded sequence is truncated before being decode again.
-            total_input_len = prefix_len + int(input_lens[i])
+            total_input_len = prefix_len + int(input_lens[0])
             re_encoded_sequence = tokenizer.encode(prompt, add_special_tokens=False)[
                 :total_input_len
             ]
             prompt = tokenizer.decode(re_encoded_sequence)
             total_input_len = len(re_encoded_sequence)
+
+            if not is_valid_sequence(
+                prompt_len=total_input_len,
+                output_len=int(os.environ.get("VLLM_RANDOM_DATASET_FIXED_OUTPUT_LEN", output_lens[0])),
+                max_prompt_len=prefix_len + real_input_len,
+                max_total_len=prefix_len + real_input_len + output_len,
+                skip_min_output_len_check= True if os.environ.get("VLLM_RANDOM_DATASET_FIXED_OUTPUT_LEN", None) else False
+            ):
+                continue
+
             requests.append(
                 SampleRequest(
                     prompt=prompt,
                     prompt_len=total_input_len,
-                    expected_output_len=int(output_lens[i]),
+                    expected_output_len=int(os.environ.get("VLLM_RANDOM_DATASET_FIXED_OUTPUT_LEN", output_lens[0])),
                 )
             )
         return requests
@@ -398,16 +412,16 @@ class ShareGPTDataset(BenchmarkDataset):
         random.seed(self.random_seed)
         random.shuffle(self.data)
 
-    def sample(
-        self,
-        tokenizer: PreTrainedTokenizerBase,
-        num_requests: int,
-        lora_path: Optional[str] = None,
-        max_loras: Optional[int] = None,
-        output_len: Optional[int] = None,
-        enable_multimodal_chat: bool = False,
-        **kwargs,
-    ) -> list:
+    def sample(self,
+               tokenizer: PreTrainedTokenizerBase,
+               num_requests: int,
+               lora_path: Optional[str] = None,
+               max_loras: Optional[int] = None,
+               output_len: Optional[int] = None,
+               enable_multimodal_chat: bool = False,
+               max_prompt_len: int = 1024,
+               max_total_len: int = 2048,
+               **kwargs) -> list:
         samples: list = []
         for entry in self.data:
             if len(samples) >= num_requests:
@@ -425,8 +439,10 @@ class ShareGPTDataset(BenchmarkDataset):
             prompt_len = len(prompt_ids)
             new_output_len = len(completion_ids) if output_len is None else output_len
             if not is_valid_sequence(
-                prompt_len,
-                new_output_len,
+                prompt_len=prompt_len,
+                output_len=new_output_len,
+                max_prompt_len=max_prompt_len,
+                max_total_len=max_total_len,
                 skip_min_output_len_check=output_len is not None,
             ):
                 continue

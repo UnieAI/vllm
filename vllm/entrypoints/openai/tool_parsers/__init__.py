@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+# Temporarily adding PR #22386 [gpt-oss] tool parser supports for /chat/completions [1/n]
+# for compatibility with function calling support from vLLM r0.10.2
+
 from .abstract_tool_parser import ToolParser, ToolParserManager
 from .deepseekv3_tool_parser import DeepSeekV3ToolParser
 from .glm4_moe_tool_parser import Glm4MoeModelToolParser
@@ -15,6 +18,7 @@ from .llama4_pythonic_tool_parser import Llama4PythonicToolParser
 from .llama_tool_parser import Llama3JsonToolParser
 from .minimax_tool_parser import MinimaxToolParser
 from .mistral_tool_parser import MistralToolParser
+from .openai_tool_parser import OpenAIToolParser
 from .phi4mini_tool_parser import Phi4MiniJsonToolParser
 from .pythonic_tool_parser import PythonicToolParser
 from .qwen3coder_tool_parser import Qwen3CoderToolParser
@@ -42,4 +46,5 @@ __all__ = [
     "Glm4MoeModelToolParser",
     "Qwen3CoderToolParser",
     "Step3ToolParser",
+    "OpenAIToolParser"
 ]

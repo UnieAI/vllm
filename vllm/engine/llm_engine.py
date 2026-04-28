@@ -1,6 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
+# ---------------------------------------------------------------------------------------
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. All rights reserved.
+# Confidential and Proprietary - Qualcomm Technologies, Inc. and/or its subsidiaries.
+#
+# Not a contribution.
+# ---------------------------------------------------------------------------------------
+# Temporarily reverting PR #21152 [V0 Deprecation] Remove V0 Spec Decode workers & 
+# PR #22138 [V0 Deprecation] Remove multi-step scheduling (https://github.com/vllm-project/vllm/pull/22138)
+# for backward compatibility with v0.
 import time
 from collections import Counter as collectionsCounter
 from collections import deque
@@ -25,6 +33,7 @@ from vllm.engine.metrics_types import StatLoggerBase, Stats
 from vllm.engine.output_processor.interfaces import (
     SequenceGroupOutputProcessor)
 from vllm.engine.output_processor.stop_checker import StopChecker
+from vllm.engine.output_processor.util import create_output_by_sequence_group # RESTORED: import was restored from https://github.com/vllm-project/vllm/pull/22138/files#diff-c89ac25bd066e936e80260d21be63c7d2379cfedc371a9ff288fb5ba02ae1350 to provide v0 backward compatability
 from vllm.entrypoints.openai.logits_processors import (
     get_logits_processors as get_openai_logits_processors)
 from vllm.executor.executor_base import ExecutorBase
@@ -39,6 +48,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.processing import EncDecMultiModalProcessor
 from vllm.outputs import (PoolingRequestOutput, RequestOutput,
                           RequestOutputFactory)
+from vllm.platforms import current_platform
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.sequence import (ExecuteModelRequest, ParallelSampleSequenceGroup,
@@ -895,8 +905,35 @@ class LLMEngine:
 
         has_multiple_outputs: bool = len(outputs) > 1
         outputs_by_sequence_group: List[List[SequenceGroupOutput]]
-        assert not has_multiple_outputs
-        outputs_by_sequence_group = outputs
+        # RESTORED: below `if-else` logic was restored from https://github.com/vllm-project/vllm/pull/22138/files#diff-0e64e07127ff20fc01be18cc95c0f58e0ff818e0dbabd5e8d2e07ca27943a7e4
+        # to provide v0 spd backward compatability
+        if has_multiple_outputs:
+            assert self.scheduler_config.is_multi_step or \
+                     self.speculative_config
+            # Organize outputs by [step][sequence group] instead of
+            # [sequence group][step].
+            if self.scheduler_config.is_multi_step:
+                outputs_by_sequence_group = create_output_by_sequence_group(
+                    outputs, len(seq_group_metadata_list))
+            elif self.speculative_config:
+                # Decodes are multi-steps while prefills are not, outputting at
+                # most 1 token. Separate them so that we can trigger chunk
+                # processing without having to pad or copy over prompts K times
+                # to match decodes structure (costly with prompt_logprobs).
+                num_prefills = sum(sg.is_prompt
+                                   for sg in seq_group_metadata_list)
+                prefills, decodes = outputs[:num_prefills], outputs[
+                    num_prefills:]
+                outputs_by_sequence_group = create_output_by_sequence_group(
+                    decodes,
+                    num_seq_groups=len(seq_group_metadata_list) - num_prefills)
+                outputs_by_sequence_group = [p.outputs for p in prefills
+                                             ] + outputs_by_sequence_group
+            # We have outputs for multiple steps submitted in a single burst,
+            # so invalidate is_first_step_output.
+            is_first_step_output = None
+        else:
+            outputs_by_sequence_group = outputs
 
         # Determine the requests we need to operate on
         if request_id:
@@ -976,6 +1013,9 @@ class LLMEngine:
             seq_group.maybe_set_first_token_time(now)
             if not seq_group.is_prefill():
                 seq_group.set_last_token_time(now)
+            if current_platform.is_qaic() and self.vllm_config.kv_transfer_config \
+                and self.vllm_config.kv_transfer_config.kv_role == "kv_producer":
+                seq_group.maybe_set_prefill_batch_size(len(seq_group_metadata_list))
             request_output = RequestOutputFactory.create(
                 seq_group,
                 self.seq_id_to_seq_group,
@@ -1609,6 +1649,13 @@ class LLMEngine:
                 num_generation_tokens_from_prefill_groups)
             num_tokens_iter = (num_generation_tokens_iter +
                                num_prompt_tokens_iter)
+        # Spec decode, if enabled, emits specialized metrics from the worker in
+        # sampler output.
+        if model_output and isinstance(model_output[0], SamplerOutput) and (
+                model_output[0].spec_decode_worker_metrics is not None):
+            spec_decode_metrics = model_output[0].spec_decode_worker_metrics
+        else:
+            spec_decode_metrics = None
 
         return Stats(
             now=now,
@@ -1630,6 +1677,7 @@ class LLMEngine:
             num_tokens_iter=num_tokens_iter,
             time_to_first_tokens_iter=time_to_first_tokens_iter,
             time_per_output_tokens_iter=time_per_output_tokens_iter,
+            spec_decode_metrics=spec_decode_metrics,
             num_preemption_iter=num_preemption_iter,
 
             # Request stats
