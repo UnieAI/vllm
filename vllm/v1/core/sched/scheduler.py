@@ -215,6 +215,8 @@ class Scheduler(SchedulerInterface):
         self.use_eagle = False
         self.num_spec_tokens = self.num_lookahead_tokens = 0
         self._unieai_dsc_enabled = False
+        self._unieai_dsc_dflash_request_context_gate = False
+        self._unieai_dsc_context_gate_logged_req_ids: set[str] = set()
         self._unieai_dsc_spec_enabled = True
         self._unieai_dsc_disable_decode_tokens = 0
         self._unieai_dsc_enable_decode_tokens = 0
@@ -234,6 +236,9 @@ class Scheduler(SchedulerInterface):
                 and speculative_config.unieai_dsc
             ):
                 self._unieai_dsc_enabled = True
+                self._unieai_dsc_dflash_request_context_gate = (
+                    speculative_config.use_dflash()
+                )
                 decode_capacity = max(
                     1, min(self.max_num_running_reqs, self.max_num_scheduled_tokens)
                 )
@@ -438,6 +443,29 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+            request_use_spec_decode = (
+                use_spec_decode
+                and self._request_allows_unieai_dsc_spec_decode(request)
+            )
+            request_num_lookahead_tokens = (
+                self.num_lookahead_tokens if request_use_spec_decode else 0
+            )
+            if (
+                not request_use_spec_decode
+                and self._unieai_dsc_dflash_request_context_gate
+                and request.request_id
+                not in self._unieai_dsc_context_gate_logged_req_ids
+            ):
+                logger.info(
+                    "UNIEAI_DSC_CONTEXT_GATE_ENTER request_id=%s "
+                    "context_len=%d threshold=%d",
+                    request.request_id,
+                    request.num_tokens,
+                    4096,
+                )
+                self._unieai_dsc_context_gate_logged_req_ids.add(request.request_id)
+            if not request_use_spec_decode and request.spec_token_ids:
+                request.spec_token_ids = []
 
             if (
                 request.num_output_placeholders > 0
@@ -517,7 +545,7 @@ class Scheduler(SchedulerInterface):
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
-                        num_lookahead_tokens=step_num_lookahead_tokens,
+                        num_lookahead_tokens=request_num_lookahead_tokens,
                     )
 
                     if new_blocks is not None:
@@ -770,6 +798,9 @@ class Scheduler(SchedulerInterface):
                     if num_new_tokens == 0:
                         break
 
+                if not self._request_allows_unieai_dsc_spec_decode(request):
+                    request.spec_token_ids = []
+
                 # Handles an edge case when P/D Disaggregation
                 # is used with Spec Decoding where an
                 # extra block gets allocated which
@@ -778,7 +809,11 @@ class Scheduler(SchedulerInterface):
                 effective_lookahead_tokens = (
                     0
                     if request.num_computed_tokens == 0
-                    else step_num_lookahead_tokens
+                    else (
+                        step_num_lookahead_tokens
+                        if self._request_allows_unieai_dsc_spec_decode(request)
+                        else 0
+                    )
                 )
 
                 # Determine if we need to allocate cross-attention blocks.
@@ -1744,7 +1779,10 @@ class Scheduler(SchedulerInterface):
                     request.spec_token_ids = []
                 continue
 
-            if not use_spec_decode:
+            if (
+                not use_spec_decode
+                or not self._request_allows_unieai_dsc_spec_decode(request)
+            ):
                 if request.spec_token_ids:
                     request.spec_token_ids = []
                 continue
@@ -1768,7 +1806,18 @@ class Scheduler(SchedulerInterface):
         return self.max_num_batched_tokens
 
     def _has_pending_spec_decode_tokens(self) -> bool:
-        return any(request.spec_token_ids for request in self.running)
+        return any(
+            request.spec_token_ids
+            and self._request_allows_unieai_dsc_spec_decode(request)
+            for request in self.running
+        )
+
+    def _request_allows_unieai_dsc_spec_decode(self, request: Request) -> bool:
+        return not (
+            self._unieai_dsc_enabled
+            and self._unieai_dsc_dflash_request_context_gate
+            and request.num_tokens >= 4096
+        )
 
     def _should_use_spec_decode(self) -> bool:
         if not self._unieai_dsc_enabled:
@@ -1979,6 +2028,7 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
+        self._unieai_dsc_context_gate_logged_req_ids.discard(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
 
