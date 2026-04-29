@@ -103,6 +103,7 @@ class Scheduler(SchedulerInterface):
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
+        self.max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
         self.max_num_scheduled_tokens = (
             self.scheduler_config.max_num_scheduled_tokens
             if self.scheduler_config.max_num_scheduled_tokens
@@ -213,14 +214,16 @@ class Scheduler(SchedulerInterface):
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
         self.num_spec_tokens = self.num_lookahead_tokens = 0
-        self._ngram_dsc_enabled = False
-        self._ngram_dsc_spec_enabled = True
-        self._ngram_dsc_disable_decode_tokens = 0
-        self._ngram_dsc_enable_decode_tokens = 0
-        self._ngram_dsc_switch_cooldown_sec = 0.0
-        self._ngram_dsc_last_switch_time = 0.0
-        self._ngram_dsc_last_status_log_time = 0.0
-        self._ngram_dsc_status_log_interval_sec = 5.0
+        self._unieai_dsc_enabled = False
+        self._unieai_dsc_dflash_request_context_gate = False
+        self._unieai_dsc_context_gate_logged_req_ids: set[str] = set()
+        self._unieai_dsc_spec_enabled = True
+        self._unieai_dsc_disable_decode_tokens = 0
+        self._unieai_dsc_enable_decode_tokens = 0
+        self._unieai_dsc_switch_cooldown_sec = 0.0
+        self._unieai_dsc_last_switch_time = 0.0
+        self._unieai_dsc_last_status_log_time = 0.0
+        self._unieai_dsc_status_log_interval_sec = 5.0
         if speculative_config:
             self.num_spec_tokens = speculative_config.num_speculative_tokens
             if speculative_config.use_eagle():
@@ -229,10 +232,13 @@ class Scheduler(SchedulerInterface):
             if speculative_config.uses_draft_model():
                 self.num_lookahead_tokens = self.num_spec_tokens
             if (
-                speculative_config.method in ("ngram", "ngram_gpu")
-                and speculative_config.ngram_dsc
+                speculative_config.method in ("ngram", "ngram_gpu", "dflash")
+                and speculative_config.unieai_dsc
             ):
-                self._ngram_dsc_enabled = True
+                self._unieai_dsc_enabled = True
+                self._unieai_dsc_dflash_request_context_gate = (
+                    speculative_config.use_dflash()
+                )
                 decode_capacity = max(
                     1, min(self.max_num_running_reqs, self.max_num_scheduled_tokens)
                 )
@@ -240,31 +246,33 @@ class Scheduler(SchedulerInterface):
                 # a cap keeps switching responsive on large-capacity servers.
                 auto_disable = max(1, min(128, decode_capacity // 2))
                 disable_decode_tokens = (
-                    speculative_config.ngram_dsc_disable_decode_tokens
+                    speculative_config.unieai_dsc_disable_decode_tokens
                     or auto_disable
                 )
                 enable_decode_tokens = (
-                    speculative_config.ngram_dsc_enable_decode_tokens
+                    speculative_config.unieai_dsc_enable_decode_tokens
                 )
                 if enable_decode_tokens is None:
                     enable_decode_tokens = max(1, int(disable_decode_tokens * 0.8))
-                self._ngram_dsc_disable_decode_tokens = disable_decode_tokens
-                self._ngram_dsc_enable_decode_tokens = min(
+                self._unieai_dsc_disable_decode_tokens = disable_decode_tokens
+                self._unieai_dsc_enable_decode_tokens = min(
                     enable_decode_tokens, disable_decode_tokens
                 )
-                self._ngram_dsc_switch_cooldown_sec = (
-                    speculative_config.ngram_dsc_switch_cooldown_sec
+                self._unieai_dsc_switch_cooldown_sec = (
+                    speculative_config.unieai_dsc_switch_cooldown_sec
                 )
                 logger.info(
-                    "NGRAM_DSC_INIT disable_decode_tokens=%d "
+                    "UNIEAI_DSC_INIT disable_decode_tokens=%d "
                     "enable_decode_tokens=%d switch_cooldown_sec=%.2f "
-                    "method=%s max_num_seqs=%d max_num_scheduled_tokens=%d",
-                    self._ngram_dsc_disable_decode_tokens,
-                    self._ngram_dsc_enable_decode_tokens,
-                    self._ngram_dsc_switch_cooldown_sec,
+                    "method=%s max_num_seqs=%d max_num_scheduled_tokens=%d "
+                    "max_num_batched_tokens=%d",
+                    self._unieai_dsc_disable_decode_tokens,
+                    self._unieai_dsc_enable_decode_tokens,
+                    self._unieai_dsc_switch_cooldown_sec,
                     speculative_config.method,
                     self.max_num_running_reqs,
                     self.max_num_scheduled_tokens,
+                    self.max_num_batched_tokens,
                 )
 
         # Create the KV cache manager.
@@ -410,7 +418,13 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
-        token_budget = self.max_num_scheduled_tokens
+        # For logging.
+        scheduled_timestamp = time.monotonic()
+        use_spec_decode = self._should_use_spec_decode()
+        step_max_num_scheduled_tokens = self._get_step_max_num_scheduled_tokens(
+            use_spec_decode
+        )
+        token_budget = step_max_num_scheduled_tokens
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
@@ -421,8 +435,7 @@ class Scheduler(SchedulerInterface):
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
 
-        # For logging.
-        scheduled_timestamp = time.monotonic()
+        step_num_lookahead_tokens = self.num_lookahead_tokens if use_spec_decode else 0
 
         self.kv_cache_manager.new_step_starts()
 
@@ -430,6 +443,29 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+            request_use_spec_decode = (
+                use_spec_decode
+                and self._request_allows_unieai_dsc_spec_decode(request)
+            )
+            request_num_lookahead_tokens = (
+                self.num_lookahead_tokens if request_use_spec_decode else 0
+            )
+            if (
+                not request_use_spec_decode
+                and self._unieai_dsc_dflash_request_context_gate
+                and request.request_id
+                not in self._unieai_dsc_context_gate_logged_req_ids
+            ):
+                logger.info(
+                    "UNIEAI_DSC_CONTEXT_GATE_ENTER request_id=%s "
+                    "context_len=%d threshold=%d",
+                    request.request_id,
+                    request.num_tokens,
+                    4096,
+                )
+                self._unieai_dsc_context_gate_logged_req_ids.add(request.request_id)
+            if not request_use_spec_decode and request.spec_token_ids:
+                request.spec_token_ids = []
 
             if (
                 request.num_output_placeholders > 0
@@ -509,7 +545,7 @@ class Scheduler(SchedulerInterface):
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens,
+                        num_lookahead_tokens=request_num_lookahead_tokens,
                     )
 
                     if new_blocks is not None:
@@ -762,13 +798,22 @@ class Scheduler(SchedulerInterface):
                     if num_new_tokens == 0:
                         break
 
+                if not self._request_allows_unieai_dsc_spec_decode(request):
+                    request.spec_token_ids = []
+
                 # Handles an edge case when P/D Disaggregation
                 # is used with Spec Decoding where an
                 # extra block gets allocated which
                 # creates a mismatch between the number
                 # of local and remote blocks.
                 effective_lookahead_tokens = (
-                    0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
+                    0
+                    if request.num_computed_tokens == 0
+                    else (
+                        step_num_lookahead_tokens
+                        if self._request_allows_unieai_dsc_spec_decode(request)
+                        else 0
+                    )
                 )
 
                 # Determine if we need to allocate cross-attention blocks.
@@ -902,7 +947,7 @@ class Scheduler(SchedulerInterface):
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
-        assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
+        assert total_num_scheduled_tokens <= step_max_num_scheduled_tokens
 
         assert token_budget >= 0
         assert len(self.running) <= self.max_num_running_reqs
@@ -978,7 +1023,7 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
-            enable_spec_decode=self._should_use_ngram_spec(),
+            enable_spec_decode=use_spec_decode,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1718,7 +1763,7 @@ class Scheduler(SchedulerInterface):
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
 
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
-        use_ngram_spec = self._should_use_ngram_spec()
+        use_spec_decode = self._should_use_spec_decode()
         for req_id, spec_token_ids in zip(
             draft_token_ids.req_ids,
             draft_token_ids.draft_token_ids,
@@ -1734,7 +1779,10 @@ class Scheduler(SchedulerInterface):
                     request.spec_token_ids = []
                 continue
 
-            if not use_ngram_spec:
+            if (
+                not use_spec_decode
+                or not self._request_allows_unieai_dsc_spec_decode(request)
+            ):
                 if request.spec_token_ids:
                     request.spec_token_ids = []
                 continue
@@ -1752,78 +1800,97 @@ class Scheduler(SchedulerInterface):
             if request.num_computed_tokens >= request.num_prompt_tokens
         )
 
-    def _should_use_ngram_spec(self) -> bool:
-        if not self._ngram_dsc_enabled:
+    def _get_step_max_num_scheduled_tokens(self, use_spec_decode: bool) -> int:
+        if use_spec_decode or self._has_pending_spec_decode_tokens():
+            return self.max_num_scheduled_tokens
+        return self.max_num_batched_tokens
+
+    def _has_pending_spec_decode_tokens(self) -> bool:
+        return any(
+            request.spec_token_ids
+            and self._request_allows_unieai_dsc_spec_decode(request)
+            for request in self.running
+        )
+
+    def _request_allows_unieai_dsc_spec_decode(self, request: Request) -> bool:
+        return not (
+            self._unieai_dsc_enabled
+            and self._unieai_dsc_dflash_request_context_gate
+            and request.num_tokens >= 4096
+        )
+
+    def _should_use_spec_decode(self) -> bool:
+        if not self._unieai_dsc_enabled:
             return True
 
         decode_token_load = self._get_running_decode_token_load()
         now = time.monotonic()
 
-        if self._ngram_dsc_spec_enabled:
-            if decode_token_load >= self._ngram_dsc_disable_decode_tokens:
-                self._ngram_dsc_spec_enabled = False
-                self._ngram_dsc_last_switch_time = now
+        if self._unieai_dsc_spec_enabled:
+            if decode_token_load >= self._unieai_dsc_disable_decode_tokens:
+                self._unieai_dsc_spec_enabled = False
+                self._unieai_dsc_last_switch_time = now
                 logger.info(
-                    "NGRAM_DSC_SWITCH to=normal_decode "
+                    "UNIEAI_DSC_SWITCH to=normal_decode "
                     "decode_token_load=%d disable_threshold=%d "
                     "enable_threshold=%d cooldown_sec=%.2f",
                     decode_token_load,
-                    self._ngram_dsc_disable_decode_tokens,
-                    self._ngram_dsc_enable_decode_tokens,
-                    self._ngram_dsc_switch_cooldown_sec,
+                    self._unieai_dsc_disable_decode_tokens,
+                    self._unieai_dsc_enable_decode_tokens,
+                    self._unieai_dsc_switch_cooldown_sec,
                 )
-            decision = self._ngram_dsc_spec_enabled
-            self._log_ngram_dsc_state(now, decode_token_load, decision)
+            decision = self._unieai_dsc_spec_enabled
+            self._log_unieai_dsc_state(now, decode_token_load, decision)
             return decision
 
         if (
-            now - self._ngram_dsc_last_switch_time
-            < self._ngram_dsc_switch_cooldown_sec
+            now - self._unieai_dsc_last_switch_time
+            < self._unieai_dsc_switch_cooldown_sec
         ):
             decision = False
-            self._log_ngram_dsc_state(now, decode_token_load, decision)
+            self._log_unieai_dsc_state(now, decode_token_load, decision)
             return decision
 
-        if decode_token_load <= self._ngram_dsc_enable_decode_tokens:
-            self._ngram_dsc_spec_enabled = True
-            self._ngram_dsc_last_switch_time = now
+        if decode_token_load <= self._unieai_dsc_enable_decode_tokens:
+            self._unieai_dsc_spec_enabled = True
+            self._unieai_dsc_last_switch_time = now
             logger.info(
-                "NGRAM_DSC_SWITCH to=ngram_spec "
+                "UNIEAI_DSC_SWITCH to=spec_decode "
                 "decode_token_load=%d disable_threshold=%d "
                 "enable_threshold=%d cooldown_sec=%.2f",
                 decode_token_load,
-                self._ngram_dsc_disable_decode_tokens,
-                self._ngram_dsc_enable_decode_tokens,
-                self._ngram_dsc_switch_cooldown_sec,
+                self._unieai_dsc_disable_decode_tokens,
+                self._unieai_dsc_enable_decode_tokens,
+                self._unieai_dsc_switch_cooldown_sec,
             )
-        decision = self._ngram_dsc_spec_enabled
-        self._log_ngram_dsc_state(now, decode_token_load, decision)
+        decision = self._unieai_dsc_spec_enabled
+        self._log_unieai_dsc_state(now, decode_token_load, decision)
         return decision
 
-    def _log_ngram_dsc_state(
-        self, now: float, decode_token_load: int, decision_use_ngram_spec: bool
+    def _log_unieai_dsc_state(
+        self, now: float, decode_token_load: int, decision_use_spec_decode: bool
     ) -> None:
         if (
-            now - self._ngram_dsc_last_status_log_time
-            < self._ngram_dsc_status_log_interval_sec
+            now - self._unieai_dsc_last_status_log_time
+            < self._unieai_dsc_status_log_interval_sec
         ):
             return
         cooldown_remaining_sec = max(
             0.0,
-            self._ngram_dsc_switch_cooldown_sec
-            - (now - self._ngram_dsc_last_switch_time),
+            self._unieai_dsc_switch_cooldown_sec
+            - (now - self._unieai_dsc_last_switch_time),
         )
         logger.info(
-            "NGRAM_DSC_STATE use_ngram_spec=%s decode_token_load=%d "
+            "UNIEAI_DSC_STATE use_spec_decode=%s decode_token_load=%d "
             "disable_threshold=%d enable_threshold=%d "
             "cooldown_remaining_sec=%.2f",
-            decision_use_ngram_spec,
+            decision_use_spec_decode,
             decode_token_load,
-            self._ngram_dsc_disable_decode_tokens,
-            self._ngram_dsc_enable_decode_tokens,
+            self._unieai_dsc_disable_decode_tokens,
+            self._unieai_dsc_enable_decode_tokens,
             cooldown_remaining_sec,
         )
-        self._ngram_dsc_last_status_log_time = now
+        self._unieai_dsc_last_status_log_time = now
 
     def update_draft_token_ids_in_output(
         self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput
@@ -1961,6 +2028,7 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
+        self._unieai_dsc_context_gate_logged_req_ids.discard(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
 

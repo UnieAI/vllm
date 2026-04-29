@@ -554,7 +554,9 @@ class GPUModelRunner(
                 )
             elif self.speculative_config.use_dflash():
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
-                self.use_aux_hidden_state_outputs = True
+                self.use_aux_hidden_state_outputs = (
+                    self.drafter.eagle3_use_aux_hidden_state
+                )
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
             elif self.speculative_config.use_eagle():
@@ -3408,8 +3410,30 @@ class GPUModelRunner(
             # when preparing inputs.
             # With spec decoding, this is done in propose_draft_token_ids().
             if self.input_batch.prev_sampled_token_ids is None:
-                assert sampled_token_ids.shape[-1] == 1
-                self.input_batch.prev_sampled_token_ids = sampled_token_ids
+                if sampled_token_ids.shape[-1] == 1:
+                    self.input_batch.prev_sampled_token_ids = sampled_token_ids
+                else:
+                    # DSC can disable new speculative drafting while the current
+                    # step is still verifying draft tokens from the previous
+                    # iteration. In that case, the rejection sampler may return
+                    # multiple valid output tokens, but the next normal-decode
+                    # step only needs the final accepted token as input.
+                    valid_sampled_token_ids, _ = RejectionSampler.parse_output(
+                        sampled_token_ids,
+                        self.input_batch.vocab_size,
+                        discard_sampled_tokens_req_indices,
+                    )
+                    next_token_ids = torch.empty(
+                        (num_sampled_tokens, 1),
+                        device=sampled_token_ids.device,
+                        dtype=sampled_token_ids.dtype,
+                    )
+                    for req_idx, token_ids in enumerate(valid_sampled_token_ids):
+                        if token_ids:
+                            next_token_ids[req_idx, 0] = token_ids[-1]
+                        else:
+                            next_token_ids[req_idx, 0] = sampled_token_ids[req_idx, 0]
+                    self.input_batch.prev_sampled_token_ids = next_token_ids
             self.input_batch.prev_req_id_to_index = {
                 req_id: i
                 for i, req_id in enumerate(self.input_batch.req_ids)
@@ -4276,7 +4300,7 @@ class GPUModelRunner(
                 ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
                 self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
         elif spec_config is not None and self.num_spec_tokens > 0:
-            # Spec decode is disabled by scheduler policy (e.g., ngram_dsc),
+            # Spec decode is disabled by scheduler policy (e.g., unieai_dsc),
             # but some downstream paths still expect draft token payload shape.
             # In async ngram_gpu mode, if this step is still verifying draft
             # tokens generated in the prior step, keep valid token counts

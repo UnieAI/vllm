@@ -5,7 +5,7 @@ import ast
 import copy
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
-from pydantic import Field, SkipValidation, model_validator
+from pydantic import ConfigDict, Field, SkipValidation, model_validator
 from typing_extensions import Self
 
 from vllm.config import LoadConfig
@@ -55,7 +55,6 @@ EagleModelTypes = Literal[
 ]
 SpeculativeMethod = Literal[
     "ngram",
-    "ngram_dsc",
     "medusa",
     "mlp_speculator",
     "draft_model",
@@ -66,7 +65,7 @@ SpeculativeMethod = Literal[
 RejectionSampleMethod = Literal["strict", "probabilistic", "synthetic"]
 
 
-@config
+@config(config=ConfigDict(populate_by_name=True))
 class SpeculativeConfig:
     """Configuration for speculative decoding."""
 
@@ -135,19 +134,19 @@ class SpeculativeConfig:
     prompt_lookup_min: int | None = Field(default=None, ge=1)
     """Minimum size of ngram token window when using Ngram proposer, if
     provided. Defaults to 1."""
-    ngram_dsc: bool = False
-    """Enable dynamic switching control (DSC) for ngram speculation. When
-    enabled, the scheduler disables ngram speculative tokens under heavy decode
-    load and re-enables them after load drops and cooldown elapses."""
-    ngram_dsc_disable_decode_tokens: int | None = Field(default=None, ge=1)
-    """Disable ngram speculation when the current number of running decode
+    unieai_dsc: bool = False
+    """Enable dynamic switching control (DSC) for supported speculative
+    methods. When enabled, the scheduler disables speculative decoding under
+    heavy decode load and re-enables it after load drops and cooldown elapses."""
+    unieai_dsc_disable_decode_tokens: int | None = Field(default=201, ge=1)
+    """Disable speculative decoding when the current number of running decode
     tokens reaches this threshold. If None, the scheduler picks an automatic
     threshold based on runtime capacity."""
-    ngram_dsc_enable_decode_tokens: int | None = Field(default=None, ge=1)
-    """Re-enable ngram speculation when running decode tokens fall to this
+    unieai_dsc_enable_decode_tokens: int | None = Field(default=200, ge=1)
+    """Re-enable speculative decoding when running decode tokens fall to this
     threshold or below. If None, the scheduler derives it from the disable
     threshold to provide hysteresis."""
-    ngram_dsc_switch_cooldown_sec: float = Field(default=30.0, ge=0.0)
+    unieai_dsc_switch_cooldown_sec: float = Field(default=30.0, ge=0.0)
     """Minimum time in seconds between DSC mode switches, used to avoid
     oscillation under fluctuating load."""
 
@@ -391,11 +390,15 @@ class SpeculativeConfig:
         # can not be detected, it will be considered as the "draft_model" by
         # default.
 
+        if self.model == "ngram_dsc":
+            raise ValueError(
+                "`model=\"ngram_dsc\"` is no longer supported. "
+                "Use `method=\"ngram\"` with `unieai_dsc=True` instead."
+            )
+
         # infer method from user args
         if self.method is None:
-            if self.model in ("ngram", "[ngram]", "ngram_dsc"):
-                if self.model == "ngram_dsc":
-                    self.ngram_dsc = True
+            if self.model in ("ngram", "[ngram]"):
                 self.method = "ngram"
             else:
                 self.method = "draft_model"
@@ -420,9 +423,7 @@ class SpeculativeConfig:
                 # --quantization fp8 with a bf16 checkpoint.
                 if not self.quantization:
                     self.quantization = self.target_model_config.quantization
-            elif self.method in ("ngram", "[ngram]", "ngram_dsc"):
-                if self.method == "ngram_dsc":
-                    self.ngram_dsc = True
+            elif self.method in ("ngram", "[ngram]"):
                 self.model = "ngram"
             elif self.method == "ngram_gpu":
                 self.model = "ngram_gpu"
@@ -435,9 +436,7 @@ class SpeculativeConfig:
                     "num_speculative_tokens was provided but without speculative model."
                 )
 
-        if self.method in ("ngram", "[ngram]", "ngram_dsc"):
-            if self.method == "ngram_dsc":
-                self.ngram_dsc = True
+        if self.method in ("ngram", "[ngram]"):
             self.method = "ngram"
 
         if self.method in ("ngram", "ngram_gpu"):
@@ -833,14 +832,14 @@ class SpeculativeConfig:
             )
 
         if (
-            self.ngram_dsc_enable_decode_tokens is not None
-            and self.ngram_dsc_disable_decode_tokens is not None
-            and self.ngram_dsc_enable_decode_tokens
-            > self.ngram_dsc_disable_decode_tokens
+            self.unieai_dsc_enable_decode_tokens is not None
+            and self.unieai_dsc_disable_decode_tokens is not None
+            and self.unieai_dsc_enable_decode_tokens
+            > self.unieai_dsc_disable_decode_tokens
         ):
             raise ValueError(
-                "ngram_dsc_enable_decode_tokens must be <= "
-                "ngram_dsc_disable_decode_tokens."
+                "unieai_dsc_enable_decode_tokens must be <= "
+                "unieai_dsc_disable_decode_tokens."
             )
 
         if self.draft_model_config:

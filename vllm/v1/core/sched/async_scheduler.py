@@ -18,7 +18,7 @@ class AsyncScheduler(Scheduler):
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         super()._update_after_schedule(scheduler_output)
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
-        use_ngram_spec = scheduler_output.enable_spec_decode
+        use_spec_decode = scheduler_output.enable_spec_decode
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests[req_id]
             if request.is_prefill_chunk:
@@ -28,7 +28,7 @@ class AsyncScheduler(Scheduler):
                 request.use_structured_output and request.num_output_placeholders > 0
             )
             # The request will generate a new token plus currently scheduled
-            # draft tokens in this step. For ngram_dsc switching, keep current
+            # draft tokens in this step. For UnieAI DSC switching, keep current
             # step draft verification intact and only disable drafting for the
             # next step via request.spec_token_ids below.
             cur_num_spec_tokens = len(spec_decode_tokens.get(req_id, ()))
@@ -36,7 +36,7 @@ class AsyncScheduler(Scheduler):
             # Add placeholders for the new draft/spec tokens.
             # We will update the actual spec token ids in the worker process.
             request.spec_token_ids = (
-                self._spec_token_placeholders if use_ngram_spec else []
+                self._spec_token_placeholders if use_spec_decode else []
             )
 
     def _update_request_with_output(
