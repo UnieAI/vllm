@@ -9,7 +9,6 @@ import json
 import hashlib
 import asyncio
 import pathlib
-import psutil
 import subprocess
 import urllib.request
 import urllib.error
@@ -331,44 +330,6 @@ def check_license_validity(license_data: dict, online_ok: bool) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# KV offload
-# ---------------------------------------------------------------------------
-
-def maybe_add_kv_offload_args(args: list[str]) -> list[str]:
-    """Add default KV offload args when CPU available memory is large enough.
-
-    Rule:
-      - If user already specifies KV offload params, do nothing.
-      - If available CPU memory >= 32 GB:
-          kv_gb = 32
-          add:
-            --kv-offloading-backend native
-            --kv-offloading-size <kv_gb>
-    """
-    user_specified_kv_offload = any(
-        arg == "--kv-offloading-backend"
-        or arg.startswith("--kv-offloading-backend=")
-        or arg == "--kv-offloading-size"
-        or arg.startswith("--kv-offloading-size=")
-        for arg in args
-    )
-
-    if user_specified_kv_offload:
-        return args
-
-    memory = psutil.virtual_memory()
-    available_gb = memory.available / (1024**3)
-
-    if available_gb < 32:
-        return args
-
-    kv_gb = 32
-    return args + [
-        "--kv-offloading-backend", "native",
-        "--kv-offloading-size", f"{kv_gb}",
-    ]
-
-# ---------------------------------------------------------------------------
 # Main entry-point
 # ---------------------------------------------------------------------------
 
@@ -438,7 +399,6 @@ def main():
             unknown_args = [arg for arg in unknown_args if arg != "--easy"]
         else:
             unknown_args += ["--async-scheduling", "--speculative-config", '{"method":"ngram_gpu","unieai_dsc":true,"num_speculative_tokens":4,"draft_tensor_parallel_size":1,"prompt_lookup_min":3,"prompt_lookup_max":8}']
-        unknown_args = maybe_add_kv_offload_args(unknown_args)
         cmd = ["vllm", "serve", args.model_name] + unknown_args
         # logger.info("Running UnieConfig with command: %s", " ".join(cmd))
         subprocess.run(cmd, check=True, shell=False, text=True)
