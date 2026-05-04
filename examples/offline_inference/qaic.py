@@ -8,9 +8,9 @@ import time
 
 # Sample prompts.
 prompts = [
-    'My name is',
+    "repeat apple ten times",
     # Add more prompts here
-] * 100
+] * 25
 
 random.shuffle(prompts)
 # Create a sampling params object.
@@ -39,7 +39,9 @@ llm = LLM(
     gpu_memory_utilization=1.0,
     speculative_config={
             "model": "ngram",
-            "num_speculative_tokens": 5
+            "num_speculative_tokens": 3, # 降低預測長度
+            "prompt_lookup_max": 4,      # 限制 ngram 尋找的最大長度
+            "prompt_lookup_min": 1, 
         }
     )
 
@@ -52,8 +54,14 @@ end_time = time.perf_counter()
 
 total_output_tokens = 0
 total_input_tokens = 0
+total_accepted_spec_tokens = 0
+total_draft_tokens = 0
 ttfts = []
 tpots = []
+
+# Get speculative config
+spec_config = llm.llm_engine.vllm_config.speculative_config
+num_spec_tokens = spec_config.num_speculative_tokens if spec_config else 0
 
 # Print the outputs.
 for output in outputs:
@@ -68,6 +76,10 @@ for output in outputs:
     
     metrics = output.metrics
     if metrics:
+        if metrics.spec_token_acceptance_counts and num_spec_tokens > 0:
+            total_accepted_spec_tokens += sum(metrics.spec_token_acceptance_counts[1:])
+            total_draft_tokens += metrics.spec_token_acceptance_counts[0] * num_spec_tokens
+
         if metrics.first_token_time is not None:
             ttft = metrics.first_token_time - metrics.arrival_time
             ttfts.append(ttft)
@@ -75,7 +87,7 @@ for output in outputs:
                 tpot = (metrics.finished_time - metrics.first_token_time) / (num_generated_tokens - 1)
                 tpots.append(tpot)
 
-    # print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}, Num generated tokens: {num_generated_tokens!r}")
+    print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}, Num generated tokens: {num_generated_tokens!r}")
 
 total_time = end_time - start_time
 print("\n" + "="*40)
@@ -92,4 +104,6 @@ if ttfts:
     print(f"Average TTFT:            {sum(ttfts) / len(ttfts) * 1000:.2f} ms")
 if tpots:
     print(f"Average TPOT:            {sum(tpots) / len(tpots) * 1000:.2f} ms")
+if total_draft_tokens > 0:
+    print(f"Speculative Acceptance Rate: {total_accepted_spec_tokens / total_draft_tokens * 100:.2f} %")
 print("="*40)
