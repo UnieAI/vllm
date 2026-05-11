@@ -1,0 +1,15 @@
+MODEL_NAME=Qwen/Qwen2.5-7B-Instruct
+PROMPT=svuyj hijgqcm bpwtbbr jrhg bdqlbezb dvtj hshffggq iezkhkm dblxmp orti slrcg pha sjnqeli xasj gsm uvfp vhdku vmfgiqh ojvfcn hbluehp oamp mtspr gzbwh ubtkpxr
+PROMPT_TOKENS=77
+ALIGNED_OUTPUT_LEN=51
+PREFILL_SEQ_LEN=32
+CTX_LEN=128
+FULL_BATCH_SIZE=1
+PREFILL_BSZ=1
+NUM_SPECULATIVE_TOKENS=3
+MAX_NGRAM_SIZE=3
+PROMPT_LOOKUP_MIN=1
+NUM_CORES=16
+DEVICE_GROUP=0
+NUM_PROMPTS=1
+MAX_CONCURRENCY=1

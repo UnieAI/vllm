@@ -18,6 +18,7 @@ from vllm.model_executor.model_loader.qaic_v1 import load_qaic_model
 from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
+from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.worker.gpu_input_batch import InputBatch
@@ -38,9 +39,13 @@ class QaicModelRunner(GPUModelRunner):
         super().__init__(vllm_config, device)
 
         assert device == torch.device("cpu")
-        if self.speculative_config:
-            raise ValueError("Speculative decoding is not yet suppoerted "
-                             "on qaic backend when using vllm v1.")
+        if self.speculative_config is not None:
+            if self.speculative_config.method != "ngram":
+                raise ValueError(
+                    "Only ngram speculative decoding is supported on qaic "
+                    "backend when using vllm v1.")
+            if speculative_model_type in (None, "default"):
+                speculative_model_type = "target"
         assert not self.uses_mrope, "mrope is not supported."
         assert not self.supports_mm_inputs, "multimodal inputs are not suported ."
 
@@ -236,17 +241,47 @@ class QaicModelRunner(GPUModelRunner):
 
         # decode arrays
         input_ids = self.input_ids_cpu.numpy()
-        decode_input_ids: np.ndarray = input_ids[:self.num_decodes]
-        decode_positions: np.ndarray = self.positions_np[:self.num_decodes]
         decode_block_ids: np.ndarray = self.batch_indices[:self.num_decodes]
         decode_lora_ids: Optional[np.ndarray] = None
+        decode_lengths: Optional[np.ndarray] = None
+        decode_token_count = self.num_decodes
+
+        if self.speculative_config is not None and self.num_decodes > 0:
+            max_decode_tokens = self.speculative_config.num_speculative_tokens + 1
+            decode_lengths = np.diff(
+                np.concatenate((
+                    np.array([0], dtype=self.cu_num_tokens.dtype),
+                    self.cu_num_tokens[:self.num_decodes],
+                ))).astype(np.int32)
+
+            decode_input_ids = np.full(
+                (self.num_decodes, max_decode_tokens), -1, dtype=input_ids.dtype)
+            decode_positions = np.full(
+                (self.num_decodes, max_decode_tokens), -1,
+                dtype=self.positions_np.dtype)
+
+            cursor = 0
+            for i, num_tokens in enumerate(decode_lengths):
+                assert num_tokens <= max_decode_tokens
+                next_cursor = cursor + int(num_tokens)
+                decode_input_ids[i, :num_tokens] = input_ids[cursor:next_cursor]
+                decode_positions[i, :num_tokens] = self.positions_np[
+                    cursor:next_cursor]
+                cursor = next_cursor
+            decode_token_count = cursor
+        else:
+            decode_input_ids = input_ids[:self.num_decodes]
+            decode_positions = self.positions_np[:self.num_decodes]
 
         # prefill arrays
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        prefill_input_ids: np.ndarray = input_ids[self.num_decodes:total_num_scheduled_tokens]
-        prefill_positions: np.ndarray = self.positions_np[self.num_decodes:total_num_scheduled_tokens]
+        prefill_input_ids: np.ndarray = input_ids[
+            decode_token_count:total_num_scheduled_tokens]
+        prefill_positions: np.ndarray = self.positions_np[
+            decode_token_count:total_num_scheduled_tokens]
         prefill_block_ids: np.ndarray = self.batch_indices[self.num_decodes:total_num_scheduled_tokens]
-        prefill_cum_sum = self.cu_num_tokens[self.num_decodes:] - self.num_decodes
+        prefill_cum_sum = self.cu_num_tokens[
+            self.num_decodes:] - decode_token_count
         prefill_lora_ids: Optional[np.ndarray] = None
 
         if self.lora_config:
@@ -262,6 +297,7 @@ class QaicModelRunner(GPUModelRunner):
                 batch_indices=decode_block_ids,
                 is_prompt=False,
                 lora_ids=decode_lora_ids,
+                decode_lengths=decode_lengths,
             )
             if decode_input_ids.size>0
             else None
@@ -333,9 +369,8 @@ class QaicModelRunner(GPUModelRunner):
             # separate storage from the original `logits` tensor. Therefore,
             # it is safe to update `target_logits` in place.
             target_logits = logits[spec_decode_metadata.target_logits_indices]
-            output_token_ids = self.rejection_sampler(
+            output_token_ids = self._qaic_rejection_sample(
                 spec_decode_metadata,
-                None,  # draft_probs
                 target_logits,
                 bonus_token_ids,
                 sampling_metadata,
@@ -417,7 +452,7 @@ class QaicModelRunner(GPUModelRunner):
             req_state = self.requests[req_id]
             req_state.output_token_ids.extend(sampled_ids)
 
-        if not self.speculative_config:
+        if self.speculative_config is None:
             # Speculative decoding is not enabled.
             spec_token_ids = None
         else:
@@ -437,6 +472,171 @@ class QaicModelRunner(GPUModelRunner):
             kv_connector_output=None,
             num_nans_in_logits=num_nans_in_logits,
         )
+
+    def _qaic_rejection_sample(
+        self,
+        metadata: SpecDecodeMetadata,
+        target_logits: torch.Tensor,
+        bonus_token_ids: torch.Tensor,
+        sampling_metadata: Any,
+    ) -> torch.Tensor:
+        """CPU fallback for ngram speculative decoding on QAIC.
+
+        V1's default rejection sampler launches Triton kernels. QAIC runs this
+        path on CPU and can have no active Triton driver, so use a small
+        PyTorch/CPU implementation for ngram, where draft_probs is None.
+        """
+        batch_size = len(metadata.num_draft_tokens)
+        output_token_ids = torch.full(
+            (batch_size, metadata.max_spec_len + 1),
+            PLACEHOLDER_TOKEN_ID,
+            dtype=torch.int32,
+            device=target_logits.device,
+        )
+        target_argmax = target_logits.argmax(dim=-1)
+
+        for req_idx, num_draft_tokens in enumerate(metadata.num_draft_tokens):
+            start_idx = 0 if req_idx == 0 else int(
+                metadata.cu_num_draft_tokens[req_idx - 1].item())
+            end_idx = int(metadata.cu_num_draft_tokens[req_idx].item())
+            assert end_idx - start_idx == num_draft_tokens
+
+            if self._qaic_is_greedy_request(sampling_metadata, req_idx):
+                self._qaic_rejection_sample_greedy_req(
+                    output_token_ids, metadata.draft_token_ids, target_argmax,
+                    bonus_token_ids, req_idx, start_idx, num_draft_tokens)
+            else:
+                self._qaic_rejection_sample_random_req(
+                    output_token_ids, metadata.draft_token_ids, target_logits,
+                    bonus_token_ids, sampling_metadata, req_idx, start_idx,
+                    num_draft_tokens)
+
+        return output_token_ids
+
+    @staticmethod
+    def _qaic_is_greedy_request(sampling_metadata: Any, req_idx: int) -> bool:
+        if sampling_metadata.all_greedy:
+            return True
+        if sampling_metadata.all_random:
+            return False
+        assert sampling_metadata.temperature is not None
+        return float(sampling_metadata.temperature[req_idx].item()) == -1.0
+
+    @staticmethod
+    def _qaic_rejection_sample_greedy_req(
+        output_token_ids: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        target_argmax: torch.Tensor,
+        bonus_token_ids: torch.Tensor,
+        req_idx: int,
+        start_idx: int,
+        num_draft_tokens: int,
+    ) -> None:
+        rejected = False
+        for pos in range(num_draft_tokens):
+            if rejected:
+                break
+            token_idx = start_idx + pos
+            target_token_id = int(target_argmax[token_idx].item())
+            output_token_ids[req_idx, pos] = target_token_id
+            if int(draft_token_ids[token_idx].item()) != target_token_id:
+                rejected = True
+
+        if not rejected:
+            output_token_ids[req_idx, num_draft_tokens] = bonus_token_ids[
+                req_idx, 0]
+
+    def _qaic_rejection_sample_random_req(
+        self,
+        output_token_ids: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        target_logits: torch.Tensor,
+        bonus_token_ids: torch.Tensor,
+        sampling_metadata: Any,
+        req_idx: int,
+        start_idx: int,
+        num_draft_tokens: int,
+    ) -> None:
+        rejected = False
+        generator = sampling_metadata.generators.get(req_idx)
+        for pos in range(num_draft_tokens):
+            if rejected:
+                break
+
+            token_idx = start_idx + pos
+            draft_token_id = int(draft_token_ids[token_idx].item())
+            target_probs = self._qaic_target_probs_for_req(
+                target_logits[token_idx], sampling_metadata, req_idx)
+            uniform = torch.rand((), device=target_logits.device,
+                                 generator=generator)
+
+            if float(target_probs[draft_token_id].item()) >= float(
+                    uniform.item()):
+                output_token_ids[req_idx, pos] = draft_token_id
+            else:
+                rejected = True
+                recovered_probs = target_probs.clone()
+                recovered_probs[draft_token_id] = 0
+                if recovered_probs.sum() <= 0:
+                    recovered_token_id = int(target_probs.argmax().item())
+                else:
+                    recovered_token_id = self._qaic_sample_from_probs(
+                        recovered_probs, generator)
+                output_token_ids[req_idx, pos] = recovered_token_id
+
+        if not rejected:
+            output_token_ids[req_idx, num_draft_tokens] = bonus_token_ids[
+                req_idx, 0]
+
+    def _qaic_target_probs_for_req(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: Any,
+        req_idx: int,
+    ) -> torch.Tensor:
+        logits = logits.float().clone()
+        if sampling_metadata.temperature is not None:
+            temperature = float(sampling_metadata.temperature[req_idx].item())
+            if temperature != -1.0:
+                logits.div_(temperature)
+
+        self._qaic_apply_top_k_top_p(logits, sampling_metadata, req_idx)
+        return logits.softmax(dim=-1, dtype=torch.float32)
+
+    @staticmethod
+    def _qaic_apply_top_k_top_p(
+        logits: torch.Tensor,
+        sampling_metadata: Any,
+        req_idx: int,
+    ) -> None:
+        if sampling_metadata.top_k is not None:
+            top_k = int(sampling_metadata.top_k[req_idx].item())
+            if 0 < top_k < logits.numel():
+                cutoff = logits.topk(top_k).values[-1]
+                logits.masked_fill_(logits < cutoff, -float("inf"))
+
+        if sampling_metadata.top_p is not None:
+            top_p = float(sampling_metadata.top_p[req_idx].item())
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = logits.sort(descending=True)
+                sorted_probs = sorted_logits.softmax(dim=-1)
+                cumulative_probs = sorted_probs.cumsum(dim=-1)
+                remove_mask = cumulative_probs > top_p
+                remove_mask[1:] = remove_mask[:-1].clone()
+                remove_mask[0] = False
+                logits[sorted_indices[remove_mask]] = -float("inf")
+
+    @staticmethod
+    def _qaic_sample_from_probs(
+        probs: torch.Tensor,
+        generator: Optional[torch.Generator],
+    ) -> int:
+        q = torch.empty_like(probs)
+        if generator is None:
+            q.exponential_()
+        else:
+            q.exponential_(generator=generator)
+        return int(probs.div(q).argmax().item())
 
 
     def propose_draft_token_ids(

@@ -100,6 +100,7 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
         multi_modal_kwargs_list: Optional[List[dict]] = None,
         prefill_is_partial: Optional[List[bool]] = None,
         prefill_cum_sum: Optional[np.ndarray] = None,
+        decode_lengths: Optional[np.ndarray] = None,
     ) -> torch.Tensor:
         if is_prompt and (self.disagg_producer_en or self.disagg_serving_en):
             assert kv_caches is not None and logits_mem_buffs is not None
@@ -127,7 +128,8 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
                     )
                 else:
                     logits = self._run_decode(
-                        input_ids, positions, batch_indices, lora_ids
+                        input_ids, positions, batch_indices, lora_ids,
+                        decode_lengths,
                     )
                     # logits is a non-writable array. pytorch needs to have a
                     # writable array to work properyly (else, behavior is undefined)
@@ -238,6 +240,10 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
         self.decode_num_logits_buffer = None
         if self.num_logits_to_keep is not None:
             self.is_spec_decode_target_model = True
+            self.decode_batch_inputs["input_ids"] = np.full(
+                (self.decode_bsz, self.num_logits_to_keep), -1, dtype=np.int64)
+            self.decode_batch_inputs["position_ids"] = np.full(
+                (self.decode_bsz, self.num_logits_to_keep), -1, dtype=np.int64)
             self.decode_logits = dict(
                 logits=np.random.randn(
                     self.decode_bsz, self.num_logits_to_keep, self.vocab_size
@@ -446,10 +452,17 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
         positions: np.ndarray,
         batch_indices: np.ndarray,
         lora_ids: Optional[np.ndarray] = None,
+        decode_lengths: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        num_decodes = input_ids.shape[-1]
-        self.decode_batch_inputs["input_ids"][:num_decodes,0] = input_ids
-        self.decode_batch_inputs["position_ids"][:num_decodes,0] = positions
+        if input_ids.ndim == 1:
+            num_decodes = input_ids.shape[-1]
+            query_len = 1
+            self.decode_batch_inputs["input_ids"][:num_decodes, 0] = input_ids
+            self.decode_batch_inputs["position_ids"][:num_decodes, 0] = positions
+        else:
+            num_decodes, query_len = input_ids.shape
+            self.decode_batch_inputs["input_ids"][:num_decodes, :query_len] = input_ids
+            self.decode_batch_inputs["position_ids"][:num_decodes, :query_len] = positions
         if num_decodes < self.decode_bsz:
             self.decode_batch_inputs["input_ids"][num_decodes:] = -1
             self.decode_batch_inputs["position_ids"][num_decodes:] = -1
@@ -483,6 +496,12 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
 
         outputs = self.session.run(self.decode_batch_inputs)
         logits: np.ndarray = outputs["logits"]
+        if decode_lengths is not None:
+            return np.concatenate(
+                [logits[i, :num_tokens] for i, num_tokens in enumerate(decode_lengths)],
+                axis=0)
+        if self.is_spec_decode_target_model:
+            return logits[:num_decodes, 0]
         return logits[:num_decodes].squeeze(1)
 
     def run_encode(
