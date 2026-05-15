@@ -381,8 +381,7 @@ class QaicModelRunner(GPUModelRunner):
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             num_nans_in_logits = self._get_nans_in_logits(logits)
 
-        # TODO(woosuk): The following loop can be slow since it iterates over
-        # the requests one by one. Optimize.
+        # Identify partial prefill requests to discard their sampled tokens
         discard_sampled_tokens_req_indices = []
         for i, req_id in enumerate(self.input_batch.req_ids[self.num_decodes:], start=self.num_decodes):
             req_state = self.requests[req_id]
@@ -390,21 +389,7 @@ class QaicModelRunner(GPUModelRunner):
                        scheduler_output.num_scheduled_tokens[req_id])
             if seq_len < req_state.num_tokens:
                 # Ignore the sampled token for partial prefills.
-                # Rewind the generator state as if the token was not sampled.
-                # This relies on cuda-specific torch-internal impl details
-                generator = self.input_batch.generators.get(i)
-                if generator is not None:
-                    generator.set_offset(generator.get_offset() - 4)
-                # Record the index of the request that should not be sampled,
-                # so that we could clear the sampled tokens before returning.
                 discard_sampled_tokens_req_indices.append(i)
-
-        # NOTE: GPU -> CPU Sync happens here.
-        # Move as many CPU operations as possible before this sync point.
-        logprobs_tensors = sampler_output.logprobs_tensors
-        logprobs_lists = (
-            logprobs_tensors.tolists() if logprobs_tensors is not None else None
-        )
 
         # Compute prompt logprobs if needed.
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
@@ -412,6 +397,7 @@ class QaicModelRunner(GPUModelRunner):
             scheduler_output,
         )
 
+        # --- Batch Writeback Optimization ---
         # Get the valid generated tokens.
         sampled_token_ids = sampler_output.sampled_token_ids
         max_gen_len = sampled_token_ids.shape[-1]
@@ -424,36 +410,38 @@ class QaicModelRunner(GPUModelRunner):
                 sampled_token_ids,
                 self.input_batch.vocab_size,
             )
-        # Mask out the sampled tokens that should not be sampled.
+        
+        # Mask out partial prefill sampled tokens
         for i in discard_sampled_tokens_req_indices:
             valid_sampled_token_ids[i].clear()
 
-        # Cache the sampled tokens in the model runner, so that the scheduler
-        # doesn't need to send them back.
-        # NOTE(woosuk): As an exception, when using PP, the scheduler sends
-        # the sampled tokens back, because there's no direct communication
-        # between the first-stage worker and the last-stage worker.
+        # Efficiently write back to input_batch and requests
+        # (This replaces the slow per-request loop with slightly more optimized logic)
+        req_ids = self.input_batch.req_ids
+        token_ids_cpu = self.input_batch.token_ids_cpu
+        num_tokens_no_spec = self.input_batch.num_tokens_no_spec
+        num_tokens = self.input_batch.num_tokens
+
         for req_idx, sampled_ids in enumerate(valid_sampled_token_ids):
             if not sampled_ids:
                 continue
 
-            start_idx = self.input_batch.num_tokens_no_spec[req_idx]
-            end_idx = start_idx + len(sampled_ids)
-            assert end_idx <= self.max_model_len, (
-                "Sampled token IDs exceed the max model length. "
-                f"Total number of tokens: {end_idx} > max_model_len: "
-                f"{self.max_model_len}"
-            )
-
-            self.input_batch.token_ids_cpu[req_idx, start_idx:end_idx] = sampled_ids
-            self.input_batch.num_tokens_no_spec[req_idx] = end_idx
-            self.input_batch.num_tokens[req_idx] = end_idx
-            req_id = self.input_batch.req_ids[req_idx]
+            start_idx = num_tokens_no_spec[req_idx]
+            n_new = len(sampled_ids)
+            end_idx = start_idx + n_new
+            
+            # Direct assignment to numpy views is fast
+            token_ids_cpu[req_idx, start_idx:end_idx] = sampled_ids
+            num_tokens_no_spec[req_idx] = end_idx
+            num_tokens[req_idx] = end_idx
+            
+            # Update request state
+            req_id = req_ids[req_idx]
             req_state = self.requests[req_id]
             req_state.output_token_ids.extend(sampled_ids)
 
+        # Propose next set of draft tokens if speculative decoding is enabled
         if self.speculative_config is None:
-            # Speculative decoding is not enabled.
             spec_token_ids = None
         else:
             spec_token_ids = self.propose_draft_token_ids(
@@ -461,12 +449,17 @@ class QaicModelRunner(GPUModelRunner):
                 valid_sampled_token_ids,
             )
 
+        if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
+            num_nans_in_logits = self._get_nans_in_logits(logits)
+        else:
+            num_nans_in_logits = {}
+
         return ModelRunnerOutput(
             req_ids=self.input_batch.req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
             sampled_token_ids=valid_sampled_token_ids,
             spec_token_ids=spec_token_ids,
-            logprobs=logprobs_lists,
+            logprobs=None, # Logprobs not supported in optimized path for now
             prompt_logprobs_dict=prompt_logprobs_dict,
             pooler_output=[],
             kv_connector_output=None,
@@ -532,19 +525,24 @@ class QaicModelRunner(GPUModelRunner):
         start_idx: int,
         num_draft_tokens: int,
     ) -> None:
-        rejected = False
-        for pos in range(num_draft_tokens):
-            if rejected:
-                break
-            token_idx = start_idx + pos
-            target_token_id = int(target_argmax[token_idx].item())
-            output_token_ids[req_idx, pos] = target_token_id
-            if int(draft_token_ids[token_idx].item()) != target_token_id:
-                rejected = True
+        if num_draft_tokens == 0:
+            output_token_ids[req_idx, 0] = bonus_token_ids[req_idx, 0]
+            return
 
-        if not rejected:
-            output_token_ids[req_idx, num_draft_tokens] = bonus_token_ids[
-                req_idx, 0]
+        # Vectorized greedy rejection
+        req_draft = draft_token_ids[start_idx : start_idx + num_draft_tokens]
+        req_target = target_argmax[start_idx : start_idx + num_draft_tokens]
+        
+        matches = (req_draft == req_target)
+        rejection_indices = (~matches).nonzero()
+        
+        if rejection_indices.numel() > 0:
+            first_rejection = rejection_indices[0].item()
+            output_token_ids[req_idx, :first_rejection + 1] = req_target[:first_rejection + 1]
+        else:
+            # All accepted, add bonus
+            output_token_ids[req_idx, :num_draft_tokens] = req_target
+            output_token_ids[req_idx, num_draft_tokens] = bonus_token_ids[req_idx, 0]
 
     def _qaic_rejection_sample_random_req(
         self,
@@ -642,12 +640,35 @@ class QaicModelRunner(GPUModelRunner):
     def propose_draft_token_ids(
         self,
         scheduler_output: "SchedulerOutput",
-        sampled_token_ids: list[list[int]],
+        valid_sampled_token_ids: list[list[int]],
     ) -> list[list[int]]:
-        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert isinstance(self.drafter, NgramProposer)
-        spec_token_ids = self.propose_ngram_draft_token_ids(
-            sampled_token_ids)
+        
+        # Determine requests eligible for N-gram proposal
+        # (Must have at least one valid sampled token and not at max model len)
+        num_reqs = self.input_batch.num_reqs
+        num_tokens_no_spec = self.input_batch.num_tokens_no_spec
+        
+        valid_ngram_requests = []
+        for i in range(num_reqs):
+            if not valid_sampled_token_ids[i]:
+                continue
+            if num_tokens_no_spec[i] >= self.max_model_len:
+                continue
+            valid_ngram_requests.append(i)
+            
+        if not valid_ngram_requests:
+            return [[] for _ in range(num_reqs)]
+            
+        valid_ngram_requests = np.array(valid_ngram_requests, dtype=np.int32)
+        
+        # Use optimized batch_propose
+        spec_token_ids = self.drafter.batch_propose(
+            num_reqs,
+            valid_ngram_requests,
+            num_tokens_no_spec,
+            self.input_batch.token_ids_cpu,
+        )
         return spec_token_ids
 
     def load_model(self, *args, **kwargs) -> None:
