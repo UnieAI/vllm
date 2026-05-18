@@ -266,13 +266,14 @@ class Scheduler(SchedulerInterface):
                 self.num_lookahead_tokens = self.num_spec_tokens
             if (
                 speculative_config.method
-                in ("ngram", "ngram_gpu", "mtp", "dflash")
+                in ("ngram", "ngram_gpu", "mtp", "dflash", "ddtree")
                 and speculative_config.unieai_dsc
             ):
                 self._unieai_dsc_enabled = True
                 self._unieai_dsc_method = speculative_config.method
                 self._unieai_dsc_dflash_request_context_gate = (
                     speculative_config.use_dflash()
+                    or speculative_config.use_ddtree()
                 )
                 decode_capacity = max(
                     1, min(self.max_num_running_reqs, self.max_num_scheduled_tokens)

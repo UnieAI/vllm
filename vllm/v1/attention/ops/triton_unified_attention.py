@@ -202,6 +202,8 @@ def kernel_unified_attention(
     query_stride_1: tl.int64,  # int, should be equal to head_size
     output_stride_0: tl.int64,  # int
     output_stride_1: tl.int64,  # int, should be equal to head_size
+    qq_bias_stride_batch: tl.int64,  # stride(0) for 3-D bias [B, N, N];
+    # 0 broadcasts a shared 2-D bias [N, N] to all requests
     qq_bias_stride_0: tl.int64,  # int
     BLOCK_SIZE: tl.constexpr,  # int
     TILE_SIZE: tl.constexpr,  # int must be power of 2
@@ -235,6 +237,7 @@ def kernel_unified_attention(
     # to ``[segm_idx, segm_idx+1) × tiles_per_segment`` and writes
     # per-segment partials, finalized by ``reduce_segments``.
     IS_3D: tl.constexpr,
+    IS_CAUSAL: tl.constexpr = True,    
     # Parameters below default to None so Triton can skip materialising them
     # on call sites where the corresponding constexpr branch is dead.
     # Credit: @quinnlp identified this as a perf regression source in
@@ -364,7 +367,11 @@ def kernel_unified_attention(
         )
 
     if USE_QQ_BIAS:
-        qq_bias_row_ptrs = qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
+        qq_bias_row_ptrs = (
+            qq_bias_ptr
+            + seq_idx * qq_bias_stride_batch
+            + query_pos[:, None] * qq_bias_stride_0
+        )
 
     loop_lo, loop_hi, max_seq_prefix_len = compute_tile_loop_bounds(
         context_len,
@@ -382,6 +389,7 @@ def kernel_unified_attention(
         IS_3D,
         CHUNK_LOOKBACK,
         CHUNK_SIZE,
+        IS_CAUSAL,
     )
 
     # iterate through tiles (now limited to the sliding window range)
@@ -485,11 +493,13 @@ def kernel_unified_attention(
             seq_offset,
             seq_idx,
             mm_prefix_range_ptr,
+            max_seq_prefix_len,
             SLIDING_WINDOW,
             USE_MM_PREFIX,
             MAX_MM_RANGES,
             CHUNK_LOOKBACK,
             CHUNK_SIZE,
+            IS_CAUSAL,
         )
 
         # S : (BLOCK_M, TILE_SIZE)
@@ -981,7 +991,10 @@ def unified_attention(
         query_stride_1=q.stride(1),
         output_stride_0=out.stride(0),
         output_stride_1=out.stride(1),
-        qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
+        qq_bias_stride_batch=(
+            qq_bias.stride(0) if (use_qq_bias and qq_bias.ndim == 3) else 0
+        ),
+        qq_bias_stride_0=(qq_bias.stride(-2) if use_qq_bias else 0),
         BLOCK_SIZE=block_size,
         TILE_SIZE=tile_size,
         HEAD_SIZE=head_size,
@@ -1016,6 +1029,7 @@ def unified_attention(
         NUM_SEGMENTS_PER_SEQ=num_segments,
         USE_FP8=output_scale is not None,
         IS_3D=use_3d,
+        IS_CAUSAL=causal,
         KV_QUANT_MODE=kv_quant_mode,
         CHUNK_LOOKBACK=chunk_lookback,
         CHUNK_SIZE=chunk_size,

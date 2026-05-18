@@ -170,6 +170,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
+from vllm.v1.spec_decode.ddtree import DDTreeProposer, ddtree_verify
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -527,6 +528,7 @@ class GPUModelRunner(
                 | SuffixDecodingProposer
                 | EagleProposer
                 | DFlashProposer
+                | DDTreeProposer
                 | DraftModelProposer
                 | MedusaProposer
                 | ExtractHiddenStatesProposer
@@ -565,6 +567,9 @@ class GPUModelRunner(
                 )
             elif self.speculative_config.use_gemma4_mtp():
                 self.drafter = Gemma4Proposer(self.vllm_config, self.device, self)
+            elif self.speculative_config.use_ddtree():
+                self.drafter = DDTreeProposer(self.vllm_config, self.device, self)
+                self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.use_dflash():
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = (
@@ -824,6 +829,8 @@ class GPUModelRunner(
             self._num_valid_draft_tokens_copy_stream = torch.cuda.Stream()
 
         self._draft_token_req_ids: list[str] | None = None
+        self._ddtree_step_slot_mappings: list[dict[int, torch.Tensor]] | None = None
+        self._ddtree_accepted_node_indices: list[list[int]] | None = None
         self.transfer_event = torch.Event()
         self.sampled_token_ids_pinned_cpu = torch.empty(
             (self.max_num_reqs, 1),
@@ -2053,6 +2060,79 @@ class GPUModelRunner(
             self.positions[:total_num_scheduled_tokens],
         )
 
+        # DDTree: override tree node positions with depth-based values for RoPE.
+        # Slot mapping above was computed from sequential positions (needed for
+        # unique KV slots per sibling); depth-based positions are only for RoPE
+        # so that siblings at the same depth share a position ID.
+        _ddtree_drafter = getattr(self, "drafter", None)
+        if (
+            scheduler_output.scheduled_spec_decode_tokens
+            and isinstance(_ddtree_drafter, DDTreeProposer)
+            and _ddtree_drafter._node_depths is not None
+        ):
+            if (
+                len(_ddtree_drafter._node_depths) == num_reqs
+                and np.all(num_scheduled_tokens == (_ddtree_drafter._budget + 1))
+            ):
+                self._ddtree_step_slot_mappings = []
+                for req_idx in range(num_reqs):
+                    token_start = 0 if req_idx == 0 else int(cu_num_tokens[req_idx - 1])
+                    token_end = int(cu_num_tokens[req_idx])
+                    per_group_slots = {
+                        gid: self.input_batch.block_table[gid].slot_mapping.gpu[
+                            token_start:token_end
+                        ].clone()
+                        for gid, kv_group in enumerate(
+                            self.kv_cache_config.kv_cache_groups
+                        )
+                        if isinstance(kv_group.kv_cache_spec, AttentionSpec)
+                    }
+                    self._ddtree_step_slot_mappings.append(per_group_slots)
+            else:
+                self._ddtree_step_slot_mappings = None
+            for r_spec_idx, req_id in enumerate(
+                scheduler_output.scheduled_spec_decode_tokens
+            ):
+                # New requests (just finished prefill) are appended to
+                # scheduled_spec_decode_tokens but have no _node_depths entry yet.
+                #   scheduled_spec_decode_tokens = {req-abc: [...], req-xyz: [...],
+                #                                   req-999: [...]}
+                #   _node_depths = [tensor([1,1,2,2,3,...]), tensor([1,2,1,3,...])]
+                #                   req-abc                  req-xyz  (req-999 missing)
+                # Skip them — correct next step when _node_depths rebuilds.
+                if r_spec_idx >= len(_ddtree_drafter._node_depths):
+                    continue
+                # DDTree positions are non-monotonic — unlike DFlash/standard decoding
+                # where positions strictly increase (c+1, c+2, c+3, ...), siblings at
+                # the same tree depth share one position ID so RoPE treats them as
+                # alternatives for the same output slot:
+                #
+                #   tree:          root (c)
+                #                 /    \
+                #             "cat"   "dog"    ← depth 1, both get position c+1
+                #             /   \
+                #          "sat" "ran"         ← depth 2, both get position c+2
+                #           /
+                #         "on"                 ← depth 3, gets position c+3
+                #
+                #   flat node order:  ["cat", "dog", "sat", "ran", "on"]
+                #   depths:           [  1,     1,     2,     2,     3 ]
+                #   positions:        [ c+1,   c+1,   c+2,   c+2,  c+3 ]
+                req_idx = self.input_batch.req_id_to_index[req_id]
+                token_start = int(cu_num_tokens[req_idx]) - int(
+                    num_scheduled_tokens[req_idx]
+                )
+                depths = _ddtree_drafter._node_depths[r_spec_idx]  # [budget] on GPU
+                # Async spec decode corrects num_computed_tokens on GPU using
+                # the previous round's accepted count. The CPU value can still
+                # be optimistic, so use the GPU value for DDTree RoPE positions.
+                context_len = self.num_computed_tokens[req_idx].to(torch.long)
+                self.positions[
+                    token_start + 1 : token_start + 1 + _ddtree_drafter._budget
+                ] = context_len + depths
+        else:
+            self._ddtree_step_slot_mappings = None
+
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
             scheduler_output,
@@ -2349,7 +2429,7 @@ class GPUModelRunner(
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(
-                    self.drafter, (EagleProposer, DFlashProposer, Gemma4Proposer)
+                    self.drafter, (EagleProposer, DFlashProposer, DDTreeProposer, Gemma4Proposer)
                 ):
                     if self.drafter.kv_cache_gid == kv_cache_gid:
                         spec_decode_common_attn_metadata = cm
@@ -3429,13 +3509,360 @@ class GPUModelRunner(
             draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
-        sampler_output = self.rejection_sampler(
-            spec_decode_metadata,
-            None,  # draft_probs
-            logits,
-            sampling_metadata,
-        )
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.use_ddtree()
+            and isinstance(self.drafter, DDTreeProposer)
+            and self.drafter._child_maps is not None
+            # Only use tree-aware verify when every request in the batch is
+            # in spec-decode mode.  When regular-decode requests are mixed in
+            # (e.g. during the first few steps when some prompts are still in
+            # prefill), fall back to the rejection sampler.
+            and len(self.drafter._child_maps)
+            == len(spec_decode_metadata.num_draft_tokens)
+            # All spec-decode requests must have exactly budget draft tokens;
+            # finishing requests may have fewer, which breaks view(batch, budget).
+            and sum(spec_decode_metadata.num_draft_tokens)
+            == self.drafter._budget * len(self.drafter._child_maps)
+        ):
+            assert logits is not None
+            batch_size = len(spec_decode_metadata.num_draft_tokens)
+            posterior_token_ids = self._sample_ddtree_posterior_token_ids(
+                logits=logits,
+                spec_decode_metadata=spec_decode_metadata,
+                sampling_metadata=sampling_metadata,
+                budget=self.drafter._budget,
+                batch_size=batch_size,
+            )
+            verify_output = ddtree_verify(
+                posterior_token_ids=posterior_token_ids,
+                draft_token_ids=spec_decode_metadata.draft_token_ids,
+                child_maps=self.drafter._child_maps,
+                budget=self.drafter._budget,
+                batch_size=batch_size,
+                device=self.device,
+            )
+            self._ddtree_accepted_node_indices = verify_output.accepted_node_indices
+            self._compact_ddtree_kv_cache(verify_output.accepted_node_indices)
+            sampler_output = SamplerOutput(
+                sampled_token_ids=verify_output.output_token_ids,
+                logprobs_tensors=None,
+            )
+        else:
+            self._ddtree_accepted_node_indices = None
+            # Fall back to flat rejection sampler — fires when batch is mixed
+            # (some requests still in prefill) or a request has fewer than
+            # budget tokens (finishing). ddtree_verify needs view(batch, budget)
+            # which requires uniform token counts.
+            #
+            # Won't crash but acceptance collapses to ~1 token: the sampler
+            # treats tree siblings as a sequential chain, so after accepting
+            # the rank-0 depth-1 token it checks its sibling as if it follows:
+            #   actual tree:       root
+            #                     /    \
+            #                  "cat"  "dog"   <- siblings, both depth 1
+            #                  /
+            #                "sat"            <- depth 2
+            #
+            #   sampler sees:  root -> "cat" -> "dog"?  no -> stop (accepted 1)
+            #   ddtree_verify: root -> "cat" -> "sat"?  yes -> (accepted 2+)
+            # Resumes correctly next step when batch is uniform again.
+            sampler_output = self.rejection_sampler(
+                spec_decode_metadata,
+                None,  # draft_probs
+                logits,
+                sampling_metadata,
+            )
         return sampler_output
+
+    def _sample_ddtree_posterior_token_ids(
+        self,
+        logits: torch.Tensor,
+        spec_decode_metadata: SpecDecodeMetadata,
+        sampling_metadata: SamplingMetadata,
+        budget: int,
+        batch_size: int,
+    ) -> torch.Tensor:
+        node_logits = logits[spec_decode_metadata.target_logits_indices].to(
+            torch.float32
+        )
+        bonus_logits = logits[spec_decode_metadata.bonus_logits_indices].to(
+            torch.float32
+        )
+        posterior_logits = torch.cat(
+            [
+                node_logits.view(batch_size, budget, -1),
+                bonus_logits.unsqueeze(1),
+            ],
+            dim=1,
+        ).reshape(batch_size * (budget + 1), -1)
+
+        needs_full_sampler = (
+            sampling_metadata.allowed_token_ids_mask is not None
+            or bool(sampling_metadata.bad_words_token_ids)
+            or not sampling_metadata.no_penalties
+            or (
+                sampling_metadata.thinking_budget_state_holder is not None
+                and sampling_metadata.thinking_budget_state_holder.has_tracked_requests()
+            )
+        )
+        if needs_full_sampler:
+            raise NotImplementedError(
+                "DDTree currently supports sampling without penalties, bad words, "
+                "allowed-token masks, or thinking-budget processors."
+            )
+
+        if sampling_metadata.all_greedy:
+            return self.sampler.greedy_sample(posterior_logits).view(
+                batch_size, budget + 1
+            )
+
+        if sampling_metadata.temperature is None:
+            return self.sampler.greedy_sample(posterior_logits).view(
+                batch_size, budget + 1
+            )
+
+        repeats = budget + 1
+        temperature = sampling_metadata.temperature.repeat_interleave(repeats)
+        top_k = (
+            sampling_metadata.top_k.repeat_interleave(repeats)
+            if sampling_metadata.top_k is not None
+            else None
+        )
+        top_p = (
+            sampling_metadata.top_p.repeat_interleave(repeats)
+            if sampling_metadata.top_p is not None
+            else None
+        )
+        generators = {
+            req_idx * repeats + offset: generator
+            for req_idx, generator in sampling_metadata.generators.items()
+            for offset in range(repeats)
+        }
+
+        greedy_sampled = None
+        if not sampling_metadata.all_random:
+            greedy_sampled = self.sampler.greedy_sample(posterior_logits)
+
+        posterior_logits = self.sampler.apply_temperature(
+            posterior_logits,
+            temperature,
+            sampling_metadata.all_random,
+        )
+        random_sampled, _ = self.sampler.topk_topp_sampler(
+            posterior_logits,
+            generators,
+            top_k,
+            top_p,
+        )
+
+        if greedy_sampled is None:
+            sampled = random_sampled
+        else:
+            sampled = torch.where(
+                temperature < 1e-5,
+                greedy_sampled,
+                random_sampled,
+                out=greedy_sampled,
+            )
+
+        return sampled.view(batch_size, repeats)
+
+    def _compact_ddtree_kv_cache(
+        self, accepted_node_indices: list[list[int]]
+    ) -> None:
+        if not self._ddtree_step_slot_mappings:
+            return
+
+        for req_idx, accepted in enumerate(accepted_node_indices):
+            if req_idx >= len(self._ddtree_step_slot_mappings):
+                break
+            per_group_slots = self._ddtree_step_slot_mappings[req_idx]
+            accepted_tensor = torch.tensor(
+                accepted,
+                dtype=torch.long,
+                device=self.device,
+            )
+            for gid, slot_mapping in per_group_slots.items():
+                keep_count = accepted_tensor.numel()
+                if keep_count == 0 or keep_count >= slot_mapping.numel():
+                    continue
+                keep_slots = slot_mapping.index_select(0, accepted_tensor)
+                dst_slots = slot_mapping[:keep_count]
+                if torch.equal(keep_slots, dst_slots):
+                    continue
+                for kv_cache in self._get_ddtree_group_kv_caches(gid):
+                    self._compact_ddtree_kv_tensor(kv_cache, keep_slots, dst_slots)
+
+        self._ddtree_step_slot_mappings = None
+
+    def _compact_ddtree_verifier_tensors(
+        self,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        query_start_loc_cpu: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        accepted_node_indices = self._ddtree_accepted_node_indices
+        if not accepted_node_indices:
+            return target_token_ids, target_positions, target_hidden_states
+
+        compacted_token_ids = target_token_ids.clone()
+        compacted_positions = target_positions.clone()
+        compacted_hidden_states = target_hidden_states.clone()
+
+        for req_idx, accepted in enumerate(accepted_node_indices):
+            start = int(query_start_loc_cpu[req_idx].item())
+            end = int(query_start_loc_cpu[req_idx + 1].item())
+            req_len = end - start
+            keep_count = len(accepted)
+            if keep_count == 0 or keep_count >= req_len:
+                continue
+
+            accepted_tensor = torch.tensor(
+                accepted,
+                dtype=torch.long,
+                device=self.device,
+            )
+            src_indices = accepted_tensor + start
+            dst_slice = slice(start, start + keep_count)
+
+            compacted_token_ids[dst_slice] = target_token_ids.index_select(
+                0, src_indices
+            )
+            compacted_positions[dst_slice] = target_positions.index_select(
+                0, src_indices
+            )
+            compacted_hidden_states[dst_slice] = target_hidden_states.index_select(
+                0, src_indices
+            )
+
+        return compacted_token_ids, compacted_positions, compacted_hidden_states
+
+    def _prepare_ddtree_drafter_context(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+    ) -> tuple[
+        CommonAttentionMetadata,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        accepted_node_indices = self._ddtree_accepted_node_indices
+        if not accepted_node_indices:
+            return (
+                common_attn_metadata,
+                target_token_ids,
+                target_positions,
+                target_hidden_states,
+            )
+
+        accepted_lens = np.array(
+            [len(indices) for indices in accepted_node_indices],
+            dtype=np.int32,
+        )
+        compact_qsl_cpu_np = np.zeros(len(accepted_lens) + 1, dtype=np.int32)
+        compact_qsl_cpu_np[1:] = np.cumsum(accepted_lens, dtype=np.int32)
+        compact_qsl_cpu = torch.from_numpy(compact_qsl_cpu_np)
+        compact_qsl = compact_qsl_cpu.to(self.device, non_blocking=True)
+        total_num_tokens = int(compact_qsl_cpu_np[-1])
+
+        compacted_token_ids = torch.empty(
+            total_num_tokens,
+            dtype=target_token_ids.dtype,
+            device=self.device,
+        )
+        compacted_positions = torch.empty(
+            total_num_tokens,
+            dtype=target_positions.dtype,
+            device=self.device,
+        )
+        compacted_hidden_states = torch.empty(
+            (total_num_tokens, target_hidden_states.shape[-1]),
+            dtype=target_hidden_states.dtype,
+            device=self.device,
+        )
+
+        old_qsl_cpu = common_attn_metadata.query_start_loc_cpu
+        rejected_counts = torch.empty(
+            len(accepted_node_indices),
+            dtype=common_attn_metadata.seq_lens.dtype,
+            device=self.device,
+        )
+
+        for req_idx, accepted in enumerate(accepted_node_indices):
+            src_start = int(old_qsl_cpu[req_idx].item())
+            dst_start = int(compact_qsl_cpu[req_idx].item())
+            keep_count = len(accepted)
+            accepted_tensor = torch.tensor(
+                accepted,
+                dtype=torch.long,
+                device=self.device,
+            )
+            src_indices = accepted_tensor + src_start
+            dst_slice = slice(dst_start, dst_start + keep_count)
+
+            compacted_token_ids[dst_slice] = target_token_ids.index_select(
+                0, src_indices
+            )
+            compacted_positions[dst_slice] = target_positions.index_select(
+                0, src_indices
+            )
+            compacted_hidden_states[dst_slice] = target_hidden_states.index_select(
+                0, src_indices
+            )
+
+            original_len = int(old_qsl_cpu[req_idx + 1].item()) - src_start
+            rejected_counts[req_idx] = original_len - keep_count
+
+        compact_cad = common_attn_metadata.replace(
+            query_start_loc=compact_qsl,
+            query_start_loc_cpu=compact_qsl_cpu,
+            seq_lens=common_attn_metadata.seq_lens - rejected_counts,
+            num_actual_tokens=total_num_tokens,
+            max_query_len=int(accepted_lens.max(initial=0)),
+            slot_mapping=common_attn_metadata.slot_mapping[:total_num_tokens],
+            _seq_lens_cpu=None,
+            _num_computed_tokens_cpu=None,
+        )
+        return (
+            compact_cad,
+            compacted_token_ids,
+            compacted_positions,
+            compacted_hidden_states,
+        )
+
+    def _get_ddtree_group_kv_caches(self, gid: int) -> list[torch.Tensor]:
+        unique_caches: dict[int, torch.Tensor] = {}
+        for layer_name in self.kv_cache_config.kv_cache_groups[gid].layer_names:
+            kv_cache = self.compilation_config.static_forward_context[layer_name].kv_cache
+            if isinstance(kv_cache, torch.Tensor):
+                unique_caches[kv_cache.data_ptr()] = kv_cache
+        return list(unique_caches.values())
+
+    @staticmethod
+    def _compact_ddtree_kv_tensor(
+        kv_cache: torch.Tensor,
+        keep_slots: torch.Tensor,
+        dst_slots: torch.Tensor,
+    ) -> None:
+        if kv_cache.dim() != 5 or kv_cache.shape[0] != 2:
+            raise NotImplementedError(
+                f"Unsupported DDTree KV cache layout: {tuple(kv_cache.shape)}"
+            )
+
+        num_blocks = kv_cache.shape[1]
+        block_size = kv_cache.shape[2]
+        flat_kv_cache = kv_cache.view(
+            kv_cache.shape[0],
+            num_blocks * block_size,
+            *kv_cache.shape[3:],
+        )
+        kept = flat_kv_cache.index_select(1, keep_slots)
+        flat_kv_cache[:, dst_slots] = kept
 
     def _bookkeeping_sync(
         self,
@@ -4328,16 +4755,20 @@ class GPUModelRunner(
             )
             use_gpu_toks = (
                 spec_config.use_eagle()
+                or spec_config.use_dflash()
+                or spec_config.use_ddtree()
                 or spec_config.uses_draft_model()
                 or spec_config.uses_extract_hidden_states()
             ) and not spec_config.disable_padded_drafter_batch
             if use_gpu_toks:
-                # EAGLE/DraftModel speculative decoding can use the GPU sampled tokens
-                # as inputs, and does not need to wait for bookkeeping to finish.
+                # EAGLE/DFlash/DDTree/DraftModel speculative decoding can use
+                # the GPU sampled tokens as inputs, and does not need to wait
+                # for bookkeeping to finish.
                 assert isinstance(
                     self.drafter,
                     EagleProposer
                     | DFlashProposer
+                    | DDTreeProposer
                     | DraftModelProposer
                     | ExtractHiddenStatesProposer
                     | Gemma4Proposer,
@@ -4423,6 +4854,45 @@ class GPUModelRunner(
                 except Exception:
                     logger.exception(
                         "NGRAM_DSC: failed to update async sampled token counts "
+                        "while spec decode disabled; continuing with zero drafts."
+                    )
+            elif (
+                self.use_async_spec_decode
+                and (
+                    spec_config.use_dflash()
+                    or spec_config.use_ddtree()
+                    or spec_config.use_eagle()
+                    or spec_config.uses_draft_model()
+                    or spec_config.uses_extract_hidden_states()
+                )
+                and scheduler_output.scheduled_spec_decode_tokens
+                and self.valid_sampled_token_count_event is not None
+            ):
+                assert isinstance(
+                    self.drafter,
+                    EagleProposer
+                    | DFlashProposer
+                    | DDTreeProposer
+                    | DraftModelProposer
+                    | ExtractHiddenStatesProposer
+                    | Gemma4Proposer,
+                )
+                sampled_token_ids = sampler_output.sampled_token_ids
+                try:
+                    next_token_ids, valid_sampled_tokens_count = (
+                        self.drafter.prepare_next_token_ids_padded(
+                            sampled_token_ids,
+                            self.requests,
+                            self.input_batch,
+                            self.discard_request_mask.gpu,
+                        )
+                    )
+                    self._copy_valid_sampled_token_count(
+                        next_token_ids, valid_sampled_tokens_count
+                    )
+                except Exception:
+                    logger.exception(
+                        "DSC: failed to update async sampled token counts "
                         "while spec decode disabled; continuing with zero drafts."
                     )
             self._draft_token_ids = torch.zeros(
@@ -4791,11 +5261,12 @@ class GPUModelRunner(
         elif (
             spec_config.use_eagle()
             or spec_config.use_dflash()
+            or spec_config.use_ddtree()
             or spec_config.uses_draft_model()
         ):
             assert isinstance(
                 self.drafter,
-                EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,
+                EagleProposer | DFlashProposer | DDTreeProposer | DraftModelProposer | Gemma4Proposer,
             )
 
             if spec_config.disable_padded_drafter_batch:
@@ -4874,26 +5345,57 @@ class GPUModelRunner(
                     else:
                         target_hidden_states = hidden_states[token_indices]
                 else:
-                    (
-                        common_attn_metadata,
-                        token_indices_to_sample,
-                        num_rejected_tokens_gpu,
-                    ) = self.drafter.prepare_inputs_padded(
-                        common_attn_metadata,
-                        spec_decode_metadata,
-                        valid_sampled_tokens_count,
-                    )
-                    total_num_tokens = common_attn_metadata.num_actual_tokens
-                    # When padding the batch, token_indices is just a range
-                    target_token_ids = self.input_ids.gpu[:total_num_tokens]
-                    target_positions = self._get_positions(total_num_tokens)
-                    if self.use_aux_hidden_state_outputs:
-                        assert aux_hidden_states is not None
-                        target_hidden_states = torch.cat(
-                            [h[:total_num_tokens] for h in aux_hidden_states], dim=-1
+                    if (
+                        spec_config.use_ddtree()
+                        and self._ddtree_accepted_node_indices is not None
+                    ):
+                        total_num_tokens = common_attn_metadata.num_actual_tokens
+                        target_token_ids = self.input_ids.gpu[:total_num_tokens]
+                        target_positions = self._get_positions(total_num_tokens)
+                        if self.use_aux_hidden_state_outputs:
+                            assert aux_hidden_states is not None
+                            target_hidden_states = torch.cat(
+                                [h[:total_num_tokens] for h in aux_hidden_states],
+                                dim=-1,
+                            )
+                        else:
+                            target_hidden_states = hidden_states[:total_num_tokens]
+
+                        (
+                            common_attn_metadata,
+                            target_token_ids,
+                            target_positions,
+                            target_hidden_states,
+                        ) = self._prepare_ddtree_drafter_context(
+                            common_attn_metadata=common_attn_metadata,
+                            target_token_ids=target_token_ids,
+                            target_positions=target_positions,
+                            target_hidden_states=target_hidden_states,
                         )
+                        token_indices_to_sample = None
+                        num_rejected_tokens_gpu = None
                     else:
-                        target_hidden_states = hidden_states[:total_num_tokens]
+                        (
+                            common_attn_metadata,
+                            token_indices_to_sample,
+                            num_rejected_tokens_gpu,
+                        ) = self.drafter.prepare_inputs_padded(
+                            common_attn_metadata,
+                            spec_decode_metadata,
+                            valid_sampled_tokens_count,
+                        )
+                        total_num_tokens = common_attn_metadata.num_actual_tokens
+                        # When padding the batch, token_indices is just a range
+                        target_token_ids = self.input_ids.gpu[:total_num_tokens]
+                        target_positions = self._get_positions(total_num_tokens)
+                        if self.use_aux_hidden_state_outputs:
+                            assert aux_hidden_states is not None
+                            target_hidden_states = torch.cat(
+                                [h[:total_num_tokens] for h in aux_hidden_states],
+                                dim=-1,
+                            )
+                        else:
+                            target_hidden_states = hidden_states[:total_num_tokens]
 
             if self.supports_mm_inputs and self.drafter.supports_mm_inputs:
                 mm_embed_inputs = self._gather_mm_embeddings(
@@ -4915,6 +5417,7 @@ class GPUModelRunner(
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 slot_mappings=slot_mappings,
             )
+            self._ddtree_accepted_node_indices = None
 
         return draft_token_ids
 
@@ -5717,6 +6220,7 @@ class GPUModelRunner(
                     self.drafter,
                     EagleProposer
                     | DFlashProposer
+                    | DDTreeProposer
                     | DraftModelProposer
                     | ExtractHiddenStatesProposer
                     | Gemma4Proposer,
@@ -6531,7 +7035,7 @@ class GPUModelRunner(
         ):
             assert isinstance(
                 self.drafter,
-                EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,
+                EagleProposer | DFlashProposer | DDTreeProposer | DraftModelProposer | Gemma4Proposer,
             )
             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 
@@ -6586,6 +7090,7 @@ class GPUModelRunner(
                 self.drafter,
                 EagleProposer
                 | DFlashProposer
+                | DDTreeProposer
                 | ExtractHiddenStatesProposer
                 | Gemma4Proposer,
             )
