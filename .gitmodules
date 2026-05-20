@@ -1,0 +1,6 @@
+[submodule "external/lucebox-hub"]
+	path = external/lucebox-hub
+	url = https://github.com/Luce-Org/lucebox-hub
+[submodule "external/vllm-fork-habana"]
+	path = external/vllm-fork-habana
+	url = https://github.com/HabanaAI/vllm-fork
