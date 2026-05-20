@@ -4,3 +4,6 @@
 [submodule "external/vllm-fork-habana"]
 	path = external/vllm-fork-habana
 	url = https://github.com/HabanaAI/vllm-fork
+[submodule "external/vllm-gaudi"]
+	path = external/vllm-gaudi
+	url = https://github.com/UnieAI/vllm-gaudi
