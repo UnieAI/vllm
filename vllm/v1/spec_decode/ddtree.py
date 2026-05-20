@@ -388,6 +388,25 @@ class DDTreeProposer(DFlashProposer):
         self._budget = self.num_speculative_tokens
         self._child_maps: list[list[dict[int, int]]] | None = None
         self._node_depths: list[torch.Tensor] | None = None
+        self._force_chain_topology = False
+        self._logged_chain_topology = False
+
+    def _should_use_chain_topology(self) -> bool:
+        if self._force_chain_topology:
+            return True
+        kv_cache_config = getattr(self._runner, "kv_cache_config", None)
+        if kv_cache_config is None:
+            return False
+        self._force_chain_topology = bool(
+            getattr(kv_cache_config, "has_mamba_layers", False)
+        )
+        if self._force_chain_topology and not self._logged_chain_topology:
+            logger.warning(
+                "DDTree branching is disabled for hybrid/Mamba/GDN target "
+                "models; using a chain topology to preserve correctness."
+            )
+            self._logged_chain_topology = True
+        return self._force_chain_topology
 
     @override
     def build_per_group_and_layer_attn_metadata(
@@ -424,6 +443,44 @@ class DDTreeProposer(DFlashProposer):
         logits = self.model.compute_logits(hidden_states)
         vocab_size = logits.shape[-1]
         logits_per_req = logits.float().view(batch_size, depth, vocab_size)
+
+        if self._should_use_chain_topology():
+            draft = torch.argmax(logits_per_req, dim=-1).to(torch.long)
+            depths = torch.arange(
+                1,
+                self._budget + 1,
+                dtype=torch.long,
+                device=self.device,
+            )
+            visibility = torch.tril(
+                torch.ones(
+                    self._budget + 1,
+                    self._budget + 1,
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+            )
+            all_child_maps = []
+            for r in range(batch_size):
+                child_maps = [{} for _ in range(self._budget + 1)]
+                for node_idx, token_id in enumerate(draft[r].tolist()):
+                    child_maps[node_idx][int(token_id)] = node_idx + 1
+                all_child_maps.append(child_maps)
+            self._child_maps = all_child_maps
+            self._node_depths = [depths for _ in range(batch_size)]
+            self._update_target_tree_attn_bias(
+                torch.where(
+                    visibility.unsqueeze(0).expand(batch_size, -1, -1),
+                    torch.zeros(1, dtype=torch.float32, device=self.device),
+                    torch.full(
+                        (1,),
+                        float("-inf"),
+                        dtype=torch.float32,
+                        device=self.device,
+                    ),
+                )
+            )
+            return draft.reshape(-1)
 
         all_child_maps: list[list[dict[int, int]]] = []
         all_draft_tokens: list[torch.Tensor] = []

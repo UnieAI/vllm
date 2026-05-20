@@ -606,7 +606,11 @@ class SpecDecodeBaseProposer:
     ) -> torch.Tensor:
         """Update positions, slot mappings, and sequence metadata for the
         next draft step. Returns the updated positions tensor."""
-        positions_1d = positions[0] if self.uses_mrope else positions
+        positions_1d = (
+            positions[0]
+            if self.uses_mrope or (self.uses_xdrope_dim > 0 and positions.dim() > 1)
+            else positions
+        )
         if self.uses_mrope:
             out_pos = self.mrope_positions[0, :batch_size]
         elif self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0:

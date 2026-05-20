@@ -2065,6 +2065,7 @@ class GPUModelRunner(
         # unique KV slots per sibling); depth-based positions are only for RoPE
         # so that siblings at the same depth share a position ID.
         _ddtree_drafter = getattr(self, "drafter", None)
+        ddtree_position_overrides: list[tuple[slice, torch.Tensor]] = []
         if (
             scheduler_output.scheduled_spec_decode_tokens
             and isinstance(_ddtree_drafter, DDTreeProposer)
@@ -2127,9 +2128,16 @@ class GPUModelRunner(
                 # the previous round's accepted count. The CPU value can still
                 # be optimistic, so use the GPU value for DDTree RoPE positions.
                 context_len = self.num_computed_tokens[req_idx].to(torch.long)
-                self.positions[
-                    token_start + 1 : token_start + 1 + _ddtree_drafter._budget
-                ] = context_len + depths
+                position_slice = slice(
+                    token_start + 1,
+                    token_start + 1 + _ddtree_drafter._budget,
+                )
+                override_positions = context_len + depths
+                self.positions[position_slice] = override_positions
+                if self.uses_mrope or self.uses_xdrope_dim > 0:
+                    ddtree_position_overrides.append(
+                        (position_slice, override_positions)
+                    )
         else:
             self._ddtree_step_slot_mappings = None
 
@@ -2161,6 +2169,10 @@ class GPUModelRunner(
             )
             target = self.mrope_positions if self.uses_mrope else self.xdrope_positions
             target.gpu[:, :total_num_scheduled_tokens] += drift
+        if ddtree_position_overrides:
+            target = self.mrope_positions if self.uses_mrope else self.xdrope_positions
+            for position_slice, override_positions in ddtree_position_overrides:
+                target.gpu[:, position_slice] = override_positions.unsqueeze(0)
 
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
         if not use_spec_decode:
@@ -3730,14 +3742,50 @@ class GPUModelRunner(
             compacted_token_ids[dst_slice] = target_token_ids.index_select(
                 0, src_indices
             )
-            compacted_positions[dst_slice] = target_positions.index_select(
-                0, src_indices
+            self._copy_ddtree_token_positions(
+                compacted_positions,
+                dst_slice,
+                self._select_ddtree_token_positions(target_positions, src_indices),
             )
             compacted_hidden_states[dst_slice] = target_hidden_states.index_select(
                 0, src_indices
             )
 
         return compacted_token_ids, compacted_positions, compacted_hidden_states
+
+    @staticmethod
+    def _new_ddtree_position_buffer(
+        target_positions: torch.Tensor,
+        total_num_tokens: int,
+    ) -> torch.Tensor:
+        if target_positions.dim() == 1:
+            shape = (total_num_tokens,)
+        else:
+            shape = (*target_positions.shape[:-1], total_num_tokens)
+        return torch.empty(
+            shape,
+            dtype=target_positions.dtype,
+            device=target_positions.device,
+        )
+
+    @staticmethod
+    def _select_ddtree_token_positions(
+        target_positions: torch.Tensor,
+        token_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        token_dim = 0 if target_positions.dim() == 1 else target_positions.dim() - 1
+        return target_positions.index_select(token_dim, token_indices)
+
+    @staticmethod
+    def _copy_ddtree_token_positions(
+        output_positions: torch.Tensor,
+        token_slice: slice,
+        selected_positions: torch.Tensor,
+    ) -> None:
+        if output_positions.dim() == 1:
+            output_positions[token_slice] = selected_positions
+        else:
+            output_positions[..., token_slice] = selected_positions
 
     def _prepare_ddtree_drafter_context(
         self,
@@ -3775,10 +3823,9 @@ class GPUModelRunner(
             dtype=target_token_ids.dtype,
             device=self.device,
         )
-        compacted_positions = torch.empty(
+        compacted_positions = self._new_ddtree_position_buffer(
+            target_positions,
             total_num_tokens,
-            dtype=target_positions.dtype,
-            device=self.device,
         )
         compacted_hidden_states = torch.empty(
             (total_num_tokens, target_hidden_states.shape[-1]),
@@ -3808,8 +3855,10 @@ class GPUModelRunner(
             compacted_token_ids[dst_slice] = target_token_ids.index_select(
                 0, src_indices
             )
-            compacted_positions[dst_slice] = target_positions.index_select(
-                0, src_indices
+            self._copy_ddtree_token_positions(
+                compacted_positions,
+                dst_slice,
+                self._select_ddtree_token_positions(target_positions, src_indices),
             )
             compacted_hidden_states[dst_slice] = target_hidden_states.index_select(
                 0, src_indices
@@ -3854,15 +3903,14 @@ class GPUModelRunner(
                 f"Unsupported DDTree KV cache layout: {tuple(kv_cache.shape)}"
             )
 
-        num_blocks = kv_cache.shape[1]
         block_size = kv_cache.shape[2]
-        flat_kv_cache = kv_cache.view(
-            kv_cache.shape[0],
-            num_blocks * block_size,
-            *kv_cache.shape[3:],
-        )
-        kept = flat_kv_cache.index_select(1, keep_slots)
-        flat_kv_cache[:, dst_slots] = kept
+        keep_blocks = keep_slots // block_size
+        keep_offsets = keep_slots % block_size
+        dst_blocks = dst_slots // block_size
+        dst_offsets = dst_slots % block_size
+
+        kept = kv_cache[:, keep_blocks, keep_offsets].clone()
+        kv_cache[:, dst_blocks, dst_offsets] = kept
 
     def _bookkeeping_sync(
         self,
