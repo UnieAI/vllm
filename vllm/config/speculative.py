@@ -793,6 +793,35 @@ class SpeculativeConfig:
                         "`num_speculative_tokens` was not provided"
                     )
 
+                if self.method == "ddtree":
+                    # DDTree needs enough verifier nodes to explore alternate
+                    # branches. A tiny DFlash-style horizon (for example 4)
+                    # leaves almost no tree budget and is usually slower than
+                    # DFlash. Keep this internal so users do not need a second
+                    # serve-time knob.
+                    min_ddtree_budget = 16
+                    if self.num_speculative_tokens < min_ddtree_budget:
+                        expanded_budget = min_ddtree_budget
+                        if n_predict is not None and expanded_budget % n_predict != 0:
+                            expanded_budget = (
+                                (expanded_budget + n_predict - 1) // n_predict
+                            ) * n_predict
+                        logger.info(
+                            "DDTree auto-expanded num_speculative_tokens from %d "
+                            "to %d for the internal tree budget.",
+                            self.num_speculative_tokens,
+                            expanded_budget,
+                        )
+                        self.num_speculative_tokens = expanded_budget
+
+                    if hasattr(
+                        self.draft_model_config.hf_config,
+                        "num_lookahead_tokens",
+                    ):
+                        self.draft_model_config.hf_config.num_lookahead_tokens = (
+                            self.num_speculative_tokens
+                        )
+
                 self.draft_tensor_parallel_size = (
                     SpeculativeConfig._verify_and_get_draft_tp(
                         self.target_parallel_config,

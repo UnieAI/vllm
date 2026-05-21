@@ -945,14 +945,45 @@ class VllmConfig:
         if (
             self.speculative_config is not None
             and self.speculative_config.use_ddtree()
-            and self.attention_config.backend is not None
-            and self.attention_config.backend.name != "TREE_ATTN"
         ):
-            raise ValueError(
-                "DDTree speculative decoding requires "
-                "attention_config.backend = 'TREE_ATTN'. "
-                f"Got: {self.attention_config.backend.name!r}."
+            from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+            is_hybrid_target = bool(
+                self.model_config is not None and self.model_config.is_hybrid
             )
+            if self.attention_config.use_non_causal:
+                # DFlash/DDTree draft models use non-causal attention. TREE_ATTN
+                # is only for target-side tree verification and can crash the
+                # draft model's non-causal forward path.
+                if (
+                    self.attention_config.backend is not None
+                    and self.attention_config.backend.name == "TREE_ATTN"
+                ):
+                    self.attention_config.backend = None
+            elif is_hybrid_target:
+                if (
+                    self.attention_config.backend is not None
+                    and self.attention_config.backend.name == "TREE_ATTN"
+                ):
+                    logger.info_once(
+                        "DDTree detected a hybrid/Mamba/GDN target model; "
+                        "using the DFlash-compatible fallback with the default "
+                        "attention backend instead of TREE_ATTN."
+                    )
+                    self.attention_config.backend = None
+            else:
+                if self.attention_config.backend is None:
+                    logger.info_once(
+                        "DDTree selected TREE_ATTN automatically for the "
+                        "target model."
+                    )
+                    self.attention_config.backend = AttentionBackendEnum.TREE_ATTN
+                elif self.attention_config.backend.name != "TREE_ATTN":
+                    raise ValueError(
+                        "DDTree speculative decoding requires "
+                        "attention_config.backend = 'TREE_ATTN'. "
+                        f"Got: {self.attention_config.backend.name!r}."
+                    )
 
         if (
             self.model_config is not None
@@ -1473,6 +1504,38 @@ class VllmConfig:
         upper bound on the number of slots that can be added.
         """
         if self.speculative_config is not None:
+            if self.speculative_config.use_ddtree():
+                max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
+                max_num_seqs = self.scheduler_config.max_num_seqs
+                # Parallel drafting reserves num_speculative_tokens - 1 extra
+                # slots per sequence. Bound DDTree's internal auto budget by
+                # the current scheduler capacity so users do not need to tune
+                # max_num_batched_tokens/max_num_seqs just to start serving.
+                max_safe_spec_tokens = max(
+                    1,
+                    (max_num_batched_tokens - 1) // max_num_seqs + 1,
+                )
+                if self.speculative_config.num_speculative_tokens > max_safe_spec_tokens:
+                    logger.info(
+                        "DDTree capped internal num_speculative_tokens from %d "
+                        "to %d to fit max_num_batched_tokens=%d and max_num_seqs=%d.",
+                        self.speculative_config.num_speculative_tokens,
+                        max_safe_spec_tokens,
+                        max_num_batched_tokens,
+                        max_num_seqs,
+                    )
+                    self.speculative_config.num_speculative_tokens = (
+                        max_safe_spec_tokens
+                    )
+                    draft_config = self.speculative_config.draft_model_config
+                    if (
+                        draft_config is not None
+                        and hasattr(draft_config.hf_config, "num_lookahead_tokens")
+                    ):
+                        draft_config.hf_config.num_lookahead_tokens = (
+                            max_safe_spec_tokens
+                        )
+
             scheduled_token_delta = (
                 self.speculative_config.max_num_new_slots_for_drafting
                 * self.scheduler_config.max_num_seqs

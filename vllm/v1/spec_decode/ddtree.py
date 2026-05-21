@@ -272,11 +272,12 @@ def ddtree_verify(
         accepted_node_indices.append(accepted_indices)
 
         if _dbg and r == 0:
-            print(
-                f"[ddtree_verify] draft={draft_tokens_cpu[r]}"
-                f" posterior={posterior[:budget]}"
-                f" acc_len={len(accepted_indices)}"
-                f" maps={child_maps[r]}"
+            logger.debug(
+                "DDTree verify sample: draft=%s posterior=%s acc_len=%d maps=%s",
+                draft_tokens_cpu[r],
+                posterior[:budget],
+                len(accepted_indices),
+                child_maps[r],
             )
 
         out_pos = 0
@@ -306,8 +307,10 @@ class DDTreeProposer(DFlashProposer):
     Each request gets its own tree topology derived from its own draft logits.
 
     Requirements:
-    - attention_config.backend = "TREE_ATTN": needed for per-request
-      ancestor-only attention masking over the draft tree.
+    - Non-hybrid targets use TREE_ATTN for per-request ancestor-only
+      attention masking over the draft tree.
+    - Hybrid/Mamba/GDN targets automatically fall back to DFlash-style flat
+      verification because their recurrent state update is not tree-aware.
     - speculative_config.method = "ddtree": selects this proposer.
 
     Example (budget=4, num_speculative_tokens=4):
@@ -388,22 +391,25 @@ class DDTreeProposer(DFlashProposer):
         self._budget = self.num_speculative_tokens
         self._child_maps: list[list[dict[int, int]]] | None = None
         self._node_depths: list[torch.Tensor] | None = None
-        self._force_chain_topology = False
+        self._force_chain_topology = bool(
+            vllm_config.model_config is not None
+            and vllm_config.model_config.is_hybrid
+        )
         self._logged_chain_topology = False
 
     def _should_use_chain_topology(self) -> bool:
-        if self._force_chain_topology:
-            return True
-        kv_cache_config = getattr(self._runner, "kv_cache_config", None)
-        if kv_cache_config is None:
-            return False
-        self._force_chain_topology = bool(
-            getattr(kv_cache_config, "has_mamba_layers", False)
-        )
+        if not self._force_chain_topology:
+            kv_cache_config = getattr(self._runner, "kv_cache_config", None)
+            if kv_cache_config is None:
+                return False
+            self._force_chain_topology = bool(
+                getattr(kv_cache_config, "has_mamba_layers", False)
+            )
         if self._force_chain_topology and not self._logged_chain_topology:
-            logger.warning(
+            logger.info(
                 "DDTree branching is disabled for hybrid/Mamba/GDN target "
-                "models; using a chain topology to preserve correctness."
+                "models; using the DFlash-compatible fallback to preserve "
+                "correctness."
             )
             self._logged_chain_topology = True
         return self._force_chain_topology
@@ -419,6 +425,17 @@ class DDTreeProposer(DFlashProposer):
         return SpecDecodeBaseProposer.build_per_group_and_layer_attn_metadata(
             self, cad, draft_index
         )
+
+    def _clear_target_tree_attn_bias(self) -> None:
+        if self._runner is None:
+            return
+        for attn_groups in self._runner.attn_groups:
+            for attn_group in attn_groups:
+                builder = attn_group.get_metadata_builder()
+                if isinstance(builder, TreeAttentionMetadataBuilder):
+                    builder.tree_attn_bias = torch.empty(0, device=self.device)
+                    builder.reorder_batch_threshold = self._budget
+                    builder._tree_decode_threshold = self._budget + 1
 
     @override
     def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -445,41 +462,13 @@ class DDTreeProposer(DFlashProposer):
         logits_per_req = logits.float().view(batch_size, depth, vocab_size)
 
         if self._should_use_chain_topology():
+            # Hybrid/GDN/Mamba target layers do not have a tree-aware recurrent
+            # state update. Use DFlash's flat draft path instead of paying
+            # DDTree verify/compaction overhead for a correctness-only chain.
             draft = torch.argmax(logits_per_req, dim=-1).to(torch.long)
-            depths = torch.arange(
-                1,
-                self._budget + 1,
-                dtype=torch.long,
-                device=self.device,
-            )
-            visibility = torch.tril(
-                torch.ones(
-                    self._budget + 1,
-                    self._budget + 1,
-                    dtype=torch.bool,
-                    device=self.device,
-                )
-            )
-            all_child_maps = []
-            for r in range(batch_size):
-                child_maps = [{} for _ in range(self._budget + 1)]
-                for node_idx, token_id in enumerate(draft[r].tolist()):
-                    child_maps[node_idx][int(token_id)] = node_idx + 1
-                all_child_maps.append(child_maps)
-            self._child_maps = all_child_maps
-            self._node_depths = [depths for _ in range(batch_size)]
-            self._update_target_tree_attn_bias(
-                torch.where(
-                    visibility.unsqueeze(0).expand(batch_size, -1, -1),
-                    torch.zeros(1, dtype=torch.float32, device=self.device),
-                    torch.full(
-                        (1,),
-                        float("-inf"),
-                        dtype=torch.float32,
-                        device=self.device,
-                    ),
-                )
-            )
+            self._child_maps = None
+            self._node_depths = None
+            self._clear_target_tree_attn_bias()
             return draft.reshape(-1)
 
         all_child_maps: list[list[dict[int, int]]] = []
