@@ -123,7 +123,6 @@ class MinimaxM2ToolParser(ToolParser):
         else:
             self._current_tool_id += 1
         self._ensure_tool_state()
-        self._current_tool_name = None
         self.current_tool_name_sent = False
         self._args_started[self._current_tool_id] = False
         self._args_closed[self._current_tool_id] = False
@@ -133,14 +132,29 @@ class MinimaxM2ToolParser(ToolParser):
 
     def _finish_tool_call(self) -> None:
         self.current_tool_index += 1
-        self._current_tool_id += 1
         self._current_tool_name = None
         self.current_tool_name_sent = False
         self._args_started = [False]
         self._args_closed = [False]
         self._pending_key = None
         self._streaming_string_value = False
+        self.is_tool_call_started = False
+
+    def _reset_streaming_state(self) -> None:
+        """Reset all streaming state for a new request."""
+        self.is_tool_call_started = False
+        self.current_tool_index = 0
+        self.current_tool_name_sent = False
         self._buffer = ""
+        self._current_tool_name = None
+        self._current_tool_id = -1
+        self._args_started = [False]
+        self._args_closed = [False]
+        self._pending_key = None
+        self._streaming_string_value = False
+        self._tool_call_ids = []
+        self.prev_tool_call_arr = []
+        self.streamed_args_for_tool = []
 
     def _json_escape_string_content(self, s: str) -> str:
         if not s:
@@ -150,18 +164,9 @@ class MinimaxM2ToolParser(ToolParser):
     def _is_string_type(self, tool_name: str, arg_name: str) -> bool:
         if self.tools is None:
             return False
-        for tool in self.tools:
-            if tool.function.name != tool_name:
-                continue
-            if tool.function.parameters is None:
-                return False
-            arg_type = (
-                tool.function.parameters.get("properties", {})
-                .get(arg_name, {})
-                .get("type", None)
-            )
-            return arg_type == "string"
-        return False
+        param_schema = find_tool_properties(self.tools, tool_name).get(arg_name, {})
+        types = self._extract_types_from_schema(param_schema)
+        return "string" in types
 
     def _emit_tool_name_delta(self, name: str) -> DeltaMessage:
         tool_call_id = self._generate_tool_call_id()
@@ -501,6 +506,9 @@ class MinimaxM2ToolParser(ToolParser):
         Uses incremental parsing to emit tool names and arguments as soon
         as they are parsed, rather than waiting for complete <invoke> blocks.
         """
+        if not previous_text:
+            self._reset_streaming_state()
+
         self._buffer += delta_text
 
         if not self.is_tool_call_started:
@@ -533,7 +541,6 @@ class MinimaxM2ToolParser(ToolParser):
                     )
                     self._buffer = self._buffer[invoke_name_match.end() :]
                     self.current_tool_name_sent = True
-                    self._begin_tool_call()
                     return self._emit_tool_name_delta(self._current_tool_name)
 
                 end_pos = self._buffer.find(self.tool_call_end_token)
