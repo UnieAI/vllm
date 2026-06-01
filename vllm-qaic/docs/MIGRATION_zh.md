@@ -1,297 +1,277 @@
-# QAIC → vLLM 0.21+ 迁移:完整改动清单(中文版)
+# QAIC → vLLM 0.21+ 迁移工单(中文)
 
-本文件是把 Qualcomm QAIC 后端(fork `UnieAI/vllm@v1_ngram`,基线 **v0.10.1**)
-迁移到 **vLLM 0.21/0.22**、并重构成树外插件 `vllm-qaic` 的**完整工单**。
-
-涵盖 Qualcomm "qaic patch"(`bd90d0d`)动过的**每一个文件**(45 个新增 + 40 个
-修改的核心文件),加上 UnieAI 自己的改动,以及 `GPUModelRunner` 的新旧深度对照。
-
-> 英文版见 `MIGRATION_GPUModelRunner_old_vs_new.md`,两者内容一致。
-> **可信度:** 标 `⚠待确认` 的分类是根据「文件名 + diff 体积」推断、尚未逐行读过,
-> 采用前请先核实;其余均有读过代码支撑。术语保留英文以免歧义。
-
-## 图例(5 个桶)
-
-| 标记 | 含义 | 去向 |
-|---|---|---|
-| 🟢 **PLUGIN** | 可用官方扩展点实现,无需改核心 | `vllm-qaic` 包 |
-| 🔵 **PORT** | 必须搬过来的 QAIC 逻辑(继承/复制) | `vllm-qaic` 包 |
-| 🟠 **CORE-PATCH** | 不可避免的极小核心补丁,或向上游提 PR | 一个薄补丁 / PR |
-| ⚪ **DROP-V0** | 只有 V0 引擎用到;V1-only 部署不需要 | 不迁移 |
-| ⚫ **OPTIONAL** | 独立功能(gpt-oss / 拆分式 / pooling / 多模态)——需要才做 | 按功能 |
+把我们现在跑在 vLLM **v0.10.1** 上的 QAIC 后端,搬到 **vLLM 0.21/0.22**,并重构成
+树外插件 `vllm-qaic`。本文件逐个文件说明**迁移时该怎么处理**,外加最难那块
+(`GPUModelRunner`)的新旧对照。目标是**能拿来沟通和分工的工单**。
 
 ---
 
-## 1. 策略概览
+## 怎么读这份文档(先看这段)
 
-fork 改了约 40 个核心文件。插件化 + 只跑 V1,会大幅缩减工作量:
+我们要把 v0.10.1 上「QAIC 相关的所有文件」一个个搬到 0.21。每个文件标一个
+**处理方式**(该怎么办)和一个**状态**(做到哪了)。
 
-- **约一半是 ⚪ DROP-V0**(V0 的 scheduler / block manager / sequence / engine /
-  spec-decode 基础设施)。V1-only 部署直接丢弃。
-- **其余大多是 🟢 PLUGIN**(platform、量化、KV connector、模型注册、CLI 参数 →
-  改走 `--additional-config`)。
-- **真正绕不开的核心补丁(🟠)只剩很短一张表** —— 见 §6。
-- **真正的工程量是 🔵 PORT**,集中在 `QaicModelRunner`(§4)。
+**处理方式(5 类):**
+
+| 标记 | 意思 | 大白话 |
+|---|---|---|
+| 🟢 **插件化** | 用 0.21 官方留的扩展接口接上,不用改 vLLM 本体 | 「有现成插座,插上即可」 |
+| 🔵 **搬运** | 这块 QAIC 逻辑得搬进我们的包(复制/继承后改) | 「家具得自己搬过去」 |
+| 🟠 **改本体** | 绕不开,得直接改 vLLM 核心文件(或给上游提 PR) | 「得在房东的墙上打个洞」 |
+| ⚪ **丢弃(V0)** | 只有旧引擎 V0 用得到;我们只跑 V1,直接不要 | 「旧零件,扔」 |
+| ⚫ **可选** | 是独立功能(gpt-oss / 拆分式 / embedding / 多模态),要用才搬 | 「选配件」 |
+
+**状态:** ✅ 已完成 ・ 🟡 已写未上机验证 ・ 🔬 待验证(go/no-go)・ ⬜ 还没做(需上机)
+
+**几个会反复出现的词,先解释:**
+
+- **逐行确认过**:我真的把那个文件在出货版里的改动 diff 一行行读过了,不是看文件名猜的。
+- **优雅降级 (graceful fallback)**:某个「GPU 专用的加速算子」在 QAIC 上没法用时,
+  代码**自动改用一段纯 Python 的慢速等价实现**,不报错。所以这类文件在 QAIC 上
+  「能跑,只是慢一点」。
+- **字段**:Python 对象上的属性名(例如 `metadata.num_draft_tokens`)。我们说「字段还在」,
+  意思是**0.21 的对象上这个属性名依然存在**,所以照搬的代码不会因为「找不到属性」而崩。
+
+> 出处说明:下面表格里的文件都来自我们的 v0.10.1 fork。本文件只讲「**迁移时怎么处理**」,
+> 不区分「谁写的字」——那部分(原始码出处)在 `UnieAI_Quic_integrated.md` 里专门讲。
+> 这里所有迁移/整合/重构工作,都是我们的工作。
 
 ---
 
-## 2. qaic patch 新增的文件(45)
+## 1. 总览:工作量其实没看起来那么大
 
-### 2a. 搬进插件
+v0.10.1 上 QAIC 改了约 40 个核心文件 + 新增约 45 个。但「重构成插件 + 只跑 V1」后:
 
-| 文件 | 桶 | 备注 |
-|---|---|---|
-| `vllm/v1/worker/qaic_model_runner.py` | 🔵 PORT | → `vllm_qaic/model_runner.py`。**最难的一块**(§4)。 |
-| `vllm/v1/worker/qaic_worker.py` | 🔵 PORT | → `vllm_qaic/worker.py`。继承 `WorkerBase`。 |
-| `vllm/model_executor/model_loader/qaic_v1.py` | 🔵 PORT | → `vllm_qaic/model_loader.py`。QPC 加载/编译。 |
-| `vllm/model_executor/model_loader/qaic.py` | 🔵 PORT | → `vllm_qaic/compile_config.py`。`_clean_config()`。 |
-| `vllm/model_executor/model_loader/qaic_session_np.py` | 🔵 PORT | → `vllm_qaic/session.py`。**BSD-3-Clause**(其余文件是专有)。纯 numpy+qaicrt。 |
-| `vllm/platforms/qaic.py` | 🟢→🔵 | → `vllm_qaic/platform.py`(已起草,OOT enum)。 |
-| `vllm/model_executor/layers/quantization/qaic_quant.py` | 🟢 PLUGIN | → `vllm_qaic/quant.py`,用 `register_quantization_config`。 |
-| `vllm/distributed/kv_transfer/kv_connector/qaic_connector.py` | ⚫ OPTIONAL | 仅拆分式 prefill/decode 需要。用 factory 注册。 |
-| `vllm/model_executor/models/qaic_custom_mm_processor.py` | ⚫ OPTIONAL | 仅多模态模型需要。 |
-
-### 2b. V0 的 QAIC 文件 —— V1-only 部署丢弃
-
-| 文件 | 桶 |
-|---|---|
-| `vllm/worker/qaic_model_runner.py` | ⚪ DROP-V0 |
-| `vllm/worker/qaic_worker.py` | ⚪ DROP-V0 |
-| `vllm/worker/qaic_pooling_model_runner.py` | ⚪ DROP-V0(需要 pooling 则 ⚫) |
-| `vllm/spec_decode/qaic_multi_step_worker.py` | ⚪ DROP-V0(这是 V0 的 draft-model 投机,不是 V1 ngram 路径) |
-| `vllm/core/block/qaic_prefix_caching_block.py` | ⚪ DROP-V0 |
-
-### 2c. patch 重新加回的 V0 spec-decode 基础设施 —— V1 丢弃
-
-`vllm/spec_decode/*`(重加的:`spec_decode_worker.py`、`multi_step_worker.py`、
-`ngram_worker.py`、`top1_proposer.py`、`batch_expansion.py`、`mqa_scorer.py`、
-`draft_model_runner.py`、`target_model_runner.py`、`medusa_worker.py`、
-`mlp_speculator_worker.py`、`smaller_tp_proposer_worker.py`、
-`proposer_worker_base.py`、`interfaces.py`、`metrics.py`、`util.py`、
-`__init__.py`),加上 `vllm/model_executor/layers/rejection_sampler.py`、
-`spec_decode_base_sampler.py`、`typical_acceptance_sampler.py`,以及
-`vllm/engine/output_processor/multi_step.py` —— 全部 **⚪ DROP-V0**。V1 的投机
-解码在 `vllm/v1/spec_decode/`,由上游提供。
-
-### 2d. 示例 —— 仅供参考(⚪/⚫,按需改)
-`examples/offline_inference/qaic*.py`(11 个)。
+- **约一半是 ⚪ 丢弃**(都是旧引擎 V0 的东西:V0 的调度器 / block 管理 / sequence / engine)。
+- **大部分剩下的是 🟢 插件化**(平台、量化、KV connector、模型注册、CLI 参数 → 改走
+  `--additional-config`)。
+- **🟠 改本体的清单非常短**,而且复查后**很可能一项都不需要**(见 §6)。
+- **真正的工程量是 🔵 搬运**,集中在一个文件 `GPUModelRunner`(见 §4)。
 
 ---
 
-## 3. 修改的核心文件(40)—— 完整分类
+## 2. 新增的 QAIC 文件(约 45 个)怎么处理
 
-### 3a. 🟢 PLUGIN —— 用扩展点替代,不改核心
+### 2a. 搬进插件(🔵 搬运 / 🟢 插件化)
 
-| 文件 | +行 | 原本干啥 | 插件替代 |
-|---|---|---|---|
-| `vllm/platforms/__init__.py` | 33 | qaic 检测 | `vllm.platform_plugins` 入口点 |
-| `vllm/engine/arg_utils.py` | 74 | `--override-qaic-config`、`--device-group` | `--additional-config` 字典 |
-| `vllm/config/__init__.py` | 126 | `override_qaic_config` / `device_group` 字段 + 校验 | 从 `additional_config` 读 |
-| `vllm/model_executor/layers/quantization/__init__.py` | 9 | 注册 `mxfp6` | `register_quantization_config("mxfp6")` |
-| `vllm/distributed/kv_transfer/kv_connector/factory.py` | 34 | 注册 qaic connector | `KVConnectorFactory.register_connector()` |
-| `vllm/model_executor/models/registry.py` | 10 | 注册 qaic 模型 | `general_plugins` 里 `ModelRegistry.register_model()` |
-| `vllm/transformers_utils/configs/__init__.py` | 10 | 注册自定义 HF config | 在 `general_plugins` 注册 |
-| `vllm/envs.py` | 8 | `VLLM_QAIC_*` 环境变量 | 插件自己读 `os.environ` |
-
-### 3b. 🟠 CORE-PATCH —— 不可避免的小补丁(或上游 PR)。见 §6。
-
-| 文件 | +行 | 为什么插件做不到 |
+| 文件 | 处理 | 备注 |
 |---|---|---|
-| `vllm/config/cache.py` | 12 | 往**封闭的 `CacheDType` Literal** 里加 `"mxint8"` + 校验。枚举无法从外部扩展。 |
-| `vllm/platforms/interface.py` | 10 | 加 Platform 基类方法/枚举。⚠待确认:多数 0.21 已有(`is_kv_cache_dtype_supported`、`OOT`),可能已是空操作。 |
-| `vllm/_custom_ops.py` | 8 | ⚠待确认:大概率是让 custom-op 在无 CUDA 时优雅降级。0.21 上可能已不需要。 |
-| `vllm/transformers_utils/config.py` | 15 | ⚠待确认:qaic 模型的 HF config 加载钩子。可能改用 configs registry 即可。 |
+| `vllm/v1/worker/qaic_model_runner.py` | 🔵 搬运 | → `vllm_qaic/model_runner.py`。**最难的一块**(§4)。 |
+| `vllm/v1/worker/qaic_worker.py` | 🔵 搬运 | → `vllm_qaic/worker.py`。继承 `WorkerBase`。 |
+| `vllm/model_executor/model_loader/qaic_v1.py` | 🔵 搬运 | → `vllm_qaic/model_loader.py`。QPC 加载/编译。 |
+| `vllm/model_executor/model_loader/qaic.py` | 🔵 搬运 | → `vllm_qaic/compile_config.py`。编译参数整理。 |
+| `vllm/model_executor/model_loader/qaic_session_np.py` | 🔵 搬运 | → `vllm_qaic/session.py`。纯 numpy+qaicrt,不依赖 torch。 |
+| `vllm/platforms/qaic.py` | 🔵 搬运 | → `vllm_qaic/platform.py`(已起草,用 0.21 的树外平台机制)。 |
+| `vllm/model_executor/layers/quantization/qaic_quant.py` | 🟢 插件化 | → `vllm_qaic/quant.py`,用 `register_quantization_config` 注册 mxfp6。 |
+| `vllm/distributed/kv_transfer/kv_connector/qaic_connector.py` | ⚫ 可选 | 只有用「拆分式 prefill/decode」才需要。 |
+| `vllm/model_executor/models/qaic_custom_mm_processor.py` | ⚫ 可选 | 只有跑多模态模型才需要。 |
 
-### 3c. ⚪ DROP-V0 —— V1-only 部署不需要
+### 2b. 旧引擎 V0 的 QAIC 文件 —— 我们只跑 V1,⚪ 丢弃
 
-| 文件 | +行 | 备注 |
-|---|---|---|
-| `vllm/core/scheduler.py` | 37 | V0 scheduler(V1 用 `vllm/v1/core`) |
-| `vllm/core/block_manager.py` | 17 | V0 |
-| `vllm/core/block/cpu_gpu_block_allocator.py` | 46 | V0 block allocator |
-| `vllm/engine/llm_engine.py` | 54 | V0 engine |
-| `vllm/engine/output_processor/interfaces.py` | 28 | V0 multi-step 输出 |
-| `vllm/sequence.py` | 36 | V0 序列结构 |
-| `vllm/worker/worker_base.py` | 4 | V0 worker base |
-| `vllm/model_executor/layers/sampler.py` | 6 | V0 sampler 钩子 |
-| `vllm/engine/metrics.py` / `metrics_types.py` | 87 / 14 | V0 指标(⚫ 想在 V1 上要 QAIC 指标,用 V1 logging 重做) |
-| `vllm/config/scheduler.py` | 15 | ⚠待确认:看是否有 V1 相关的行 |
+`vllm/worker/qaic_model_runner.py`、`vllm/worker/qaic_worker.py`、
+`vllm/worker/qaic_pooling_model_runner.py`(要 embedding 才留)、
+`vllm/spec_decode/qaic_multi_step_worker.py`(V0 的 draft-model 投机,不是我们的 ngram)、
+`vllm/core/block/qaic_prefix_caching_block.py`。
 
-### 3d. 已坐实(每个 diff 都对着 `bd90d0d` 逐行读过)
+### 2c. 出货版顺手带进来的一堆 V0 投机解码基础设施 —— 也 ⚪ 丢弃
 
-**根因洞察:** 几乎所有 QAIC-specific 的*核心*改动都归结到两个机制。把这两个处理掉,清单大半消失:
-1. **「这是不是 QAIC 平台?」** —— patch 加了 `current_platform.is_qaic()` + `QAIC`
-   枚举。0.21 的 OOT 平台没有这枚举,改用 `current_platform.device_type == "qaic"`(无需改核心)。
-2. **「QAIC 没有 torch custom op / 没有 CUDA `_C`」** —— patch 让
-   `supports_custom_op()` 在 QAIC 返回 `False` 并跳过 `vllm._C`。一旦如此,
-   mxfp4 / gguf / bitsandbytes 的「优雅降级」回退会**自动触发**,不是单独工作。
+`vllm/spec_decode/*` 整目录(`spec_decode_worker.py`、`multi_step_worker.py`、
+`ngram_worker.py`、`top1_proposer.py` …)、`vllm/model_executor/layers/rejection_sampler.py`、
+`spec_decode_base_sampler.py`、`typical_acceptance_sampler.py`、
+`vllm/engine/output_processor/multi_step.py`。
+**原因:** 0.21 的 V1 投机解码在 `vllm/v1/spec_decode/`,由上游提供,这些 V0 旧件用不上。
 
-#### QAIC 必需的核心改动(很小)
-
-| 文件 | +行 | 坐实:做了啥 | 桶 |
-|---|---|---|---|
-| `vllm/utils/__init__.py` | 10 | (1) 加 `"mxint8": torch.uint8` dtype;(2) `supports_custom_op()` 在 QAIC → `False` | 🟠 CORE-PATCH(根因 #2)—— 或在插件 init 复制 |
-| `vllm/_custom_ops.py` | 8 | QAIC 跳过 `import vllm._C`(无 CUDA op) | 🟢 PLUGIN/🟠 小 —— OOT 平台本就不 build `_C` 的话大概率不需要 |
-| `vllm/platforms/interface.py` | 10 | 加 `QAIC` 枚举 + `is_qaic()` | 🟢 可绕过 —— OOT 平台用 `device_type=="qaic"` |
-| `vllm/env_override.py` | 10 | QAIC 跳过 `torch._inductor` 线程配置 | ⚪ 你启动命令里 `TORCH_COMPILE_DISABLE=1` 已覆盖 |
-| `vllm/transformers_utils/config.py` | 15 | mllama:QAIC 上强制 `is_encoder_decoder=False`(无 cross-attn)+ 2 个新模型 config | ⚫ OPTIONAL(mllama)—— 新 config 大概率已上游 |
-
-#### 可选功能 —— 基础 V1 chat(Qwen2.5, mxfp6, fp8)不需要
-
-| 文件 | +行 | 坐实:做了啥 | 桶 |
-|---|---|---|---|
-| `vllm/entrypoints/openai/serving_chat.py` | 252 | kimi_k2 tool-call ID + harmony actions + `return_token_ids` 调试流式 | ⚫ OPTIONAL(工具调用 / gpt-oss / 调试) |
-| `vllm/entrypoints/openai/protocol.py` | 72 | 可选字段:`return_token_ids`、计时、embedding-bytes | ⚫ OPTIONAL —— 向后兼容,大概率已上游 |
-| `vllm/entrypoints/openai/serving_pooling.py` | 104 | embedding 编码格式(float/base64/**bytes**) | ⚫ OPTIONAL(embeddings) |
-| `vllm/entrypoints/openai/api_server.py` | 9 | 派发 `PoolingBytesResponse` | ⚫ OPTIONAL(embeddings) |
-| `vllm/entrypoints/chat_utils.py` | 17 | kimi_k2 tool-call-id 辅助函数 | ⚫ OPTIONAL(工具调用) |
-| `vllm/entrypoints/openai/tool_parsers/__init__.py` | 5 | 注册 `OpenAIToolParser` | 🟢 PLUGIN(ToolParserManager) |
-| `vllm/entrypoints/harmony_utils.py` | 106 | gpt-oss 函数调用 | ⚫ OPTIONAL(gpt-oss) |
-| `vllm/reasoning/gptoss_reasoning_parser.py` | 45 | gpt-oss reasoning 解析 | ⚫ OPTIONAL(gpt-oss) |
-| `vllm/model_executor/models/config.py` | 6 | 重命名 gpt-oss reasoning backend | ⚫ IGNORE —— 大概率已上游,与 QAIC 无关 |
-| `vllm/distributed/kv_transfer/kv_connector/base.py` | 142 | 重加 V0 `KVConnectorBase`(拆分式) | ⚪ DROP-V0 / ⚫ OPTIONAL(disagg) |
-| `vllm/distributed/kv_transfer/kv_transfer_state.py` | 9 | V0 connector 初始化路径 | ⚪ DROP-V0 / ⚫ OPTIONAL(disagg) |
-| `vllm/model_executor/layers/quantization/utils/mxfp4_utils.py` | 22 | 无 custom op 时纯 Python 回退 | ⚫ OPTIONAL(mxfp4)—— 根因 #2 自动触发 |
-| `vllm/model_executor/layers/quantization/gguf.py` | 29 | 无 custom op 时纯 Python 回退 | ⚫ OPTIONAL(gguf)—— 根因 #2 自动触发 |
-| `vllm/model_executor/layers/quantization/bitsandbytes.py` | 10 | QAIC 跳过 bnb custom op | ⚫ OPTIONAL(bnb)—— 根因 #2 自动触发 |
-| `setup.py` | 40 | QAIC 构建检测 / SDK 版本 / `qaic.txt` | 🟢 不适用 —— 插件有自己的 `pyproject.toml` |
+### 2d. 示例脚本 `examples/.../qaic*.py`(11 个)—— 参考用,按需改。
 
 ---
 
-## 4. `GPUModelRunner`:v0.10.1(fork 基线) vs 0.21/0.22(目标)—— 深度对照
+## 3. 修改过的核心文件(约 40 个)怎么处理
 
-`QaicModelRunner` 继承 `GPUModelRunner`,后者从约 2–3k 行被重构到 7000+ 行。
-这是核心 🔵 PORT 工作。源文件:
-- 旧:fork `vllm/v1/worker/qaic_model_runner.py`(819 行)。
-- 新:已安装的 `vllm/v1/worker/gpu_model_runner.py`。
+### 3a. 🟢 插件化 —— 用 0.21 的扩展接口接上,不改本体
 
-### 4.A 类与构造函数
-
-| | 旧 | 新 | 动作 |
-|---|---|---|---|
-| 基类 | `GPUModelRunner(...)` | `GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin)` | 继承没问题;注意有 mixin |
-| `__init__` 签名 | `(vllm_config, device, speculative_model_type=None)` | `(vllm_config, device)` | **去掉第 3 个参数**,内部推导(已做) |
-
-### 4.B 输入准备的数据模型 —— **最大断点**
-
-| fork 用的属性 | 0.21 还有吗 | 0.21 替代 |
+| 文件 | 出货版改了什么 | 0.21 怎么接 |
 |---|---|---|
-| `self.positions_np` | ❌ | `self.positions` / 由 `num_computed_tokens_cpu` 重算 |
-| `self.cu_num_tokens` | ❌ | `_prepare_inputs` 内计算;`self.query_start_loc` |
-| `self.num_decodes` | ❌ | 用 `reorder_batch_to_split_decodes_and_prefills` 重算 |
-| `self.input_ids_cpu` | ❌ | `self.input_ids`(`CpuGpuBuffer`)+ `InputBatch.token_ids_cpu` |
-| `self.batch_indices` | ❌ | `InputBatch.block_table[...]` |
-| `self.arange_np` | ❌ | 本地重建 |
-| input batch 字段 | 不同 | `InputBatch`(`gpu_input_batch.py`):`token_ids_cpu`、`num_tokens_no_spec`、`num_computed_tokens_cpu`、`block_table`、`sampling_metadata` |
+| `vllm/platforms/__init__.py` | 加 QAIC 平台检测 | `vllm.platform_plugins` 入口点 |
+| `vllm/engine/arg_utils.py` | 加 `--override-qaic-config`、`--device-group` | 改走通用的 `--additional-config` |
+| `vllm/config/__init__.py` | 加 QAIC 配置字段 + 校验 | 从 `additional_config` 读 |
+| `vllm/model_executor/layers/quantization/__init__.py` | 注册 mxfp6 | `register_quantization_config("mxfp6")` |
+| `vllm/distributed/kv_transfer/kv_connector/factory.py` | 注册 QAIC connector | `KVConnectorFactory.register_connector()` |
+| `vllm/model_executor/models/registry.py` | 注册 QAIC 模型 | 启动时用 `general_plugins` 注册 |
+| `vllm/transformers_utils/configs/__init__.py` | 注册自定义 HF config | 同上 |
+| `vllm/envs.py` | 加 `VLLM_QAIC_*` 环境变量 | 插件自己读 `os.environ` |
 
-**后果:** 重写 `_prepare_qaic_inputs()` / `_postprocess_tensors()`,改从
-`scheduler_output` + `InputBatch` 取数据。时间主要花这里。
+### 3b. 那些 QAIC-specific 的零散改动,其实归到两个根因
 
-### 4.C 前向 + 采样 —— **架构性拆分**
+复查发现,出货版里散落在很多文件的 QAIC 改动,**根子上只有两件事**。把这两件处理掉,
+一大半文件就不用单独管了:
 
-| | 旧 | 新 | 动作 |
-|---|---|---|---|
-| `execute_model` | 一个方法:准备 → QPC 前向 → 采样 → `ModelRunnerOutput` | 可能返回 `None` 并暂存 `self.execute_model_state`;再调 `sample_tokens(grammar_output)` 采样 | QAIC 前向是同步、host 驱动 → 最简做法是在 `execute_model` 里走完整 QAIC 流程、直接返回 `ModelRunnerOutput`,绕过 `sample_tokens`。需确认基类允许。 |
+- **根因 1:「这是不是 QAIC 平台?」** —— 出货版到处用 `current_platform.is_qaic()`
+  来判断。0.21 的树外平台没这个方法,统一改成 `current_platform.device_type == "qaic"`,
+  **不用改本体**。
+- **根因 2:「QAIC 没有 GPU 专用算子」** —— QAIC 主机是 CPU,跑不了 vLLM 那些
+  GPU/CUDA 编译算子。出货版的做法是「检测到不支持就**优雅降级**到纯 Python」。
+  只要让「检测算子是否可用」在 QAIC 上返回「不可用」,下面这些文件的降级分支就
+  **自动生效**,不是单独的活:`mxfp4_utils.py`、`gguf.py`、`bitsandbytes.py`。
 
-### 4.D 投机解码
+逐行确认过的清单:
 
-| | 旧 | 新 | 动作 |
-|---|---|---|---|
-| `_calc_spec_decode_metadata` | fork 自带,numpy | 基类方法 `gpu_model_runner.py:2698`,torch 张量 | 优先用基类;删 fork 副本 |
-| `SpecDecodeMetadata` | 字段较少 | `draft_token_ids`、`num_draft_tokens`(list)、`cu_num_draft_tokens`(tensor)、`cu_num_sampled_tokens`、`target_logits_indices`、`bonus_logits_indices`、`logits_indices` | UnieAI 采样器用到的字段都还在 |
-| `NgramProposer.propose` | `propose(context_tokens)` | `propose(sampled_token_ids, num_tokens_no_spec, token_ids_cpu, slot_mappings=None)` | 更新调用 / 委托给基类 |
-| `propose_draft_token_ids` | `(scheduler_output, sampled_token_ids)` | `(+hidden_states, sample_hidden_states, aux_hidden_states, spec_decode_metadata, common_attn_metadata, slot_mappings)` | 重写 override 或委托 `super()` |
-| `RejectionSampler` | 基于 Triton(UnieAI 用 CPU 实现绕开) | `nn.Module.forward(metadata, draft_probs, logits, sampling_metadata)`(`v1/sample/rejection_sampler.py`) | **确认是否还依赖 GPU/Triton。** 还依赖 → 保留 UnieAI 的 CPU `_qaic_rejection_sample`。 |
-
-### 4.E 低风险 override
-
-| 方法 | 旧 → 新 | 动作 |
+| 文件 | 出货版改了什么(逐行确认过) | 处理 |
 |---|---|---|
-| `load_model` | `(*args, **kwargs)` → `(load_dummy_weights=False)` | 对齐签名;调 `load_qaic_model` |
-| `initialize_kv_cache` | `(kv_cache_config)` → `(kv_cache_config, is_profiling=False)` | 加参数 |
-| `get_kv_cache_spec` | `FullAttentionSpec` 字典 → 形状相同 | 低风险;核对字段名 |
-| `_init_device_properties` / `_sync_device` | 空 stub | 基类仍调用就保留 |
-| `_may_reorder_batch` | 设 `self.num_decodes` | 围绕已删字段改写 |
+| `vllm/utils/__init__.py` | (1) 加 `mxint8` 这个 dtype 映射;(2) 让「算子可用吗」在 QAIC 上返回 False | 🟠 改本体(根因 2 的开关)—— 或在插件初始化里复制这逻辑 |
+| `vllm/_custom_ops.py` | QAIC 上跳过 `import vllm._C`(没有 CUDA 算子) | 见 §6(很可能不用) |
+| `vllm/platforms/interface.py` | 加 `QAIC` 枚举 + `is_qaic()` 方法 | 见 §6(不用,改用树外机制) |
+| `vllm/env_override.py` | QAIC 上跳过 torch inductor 的线程设置 | ⚪ 你启动已带 `TORCH_COMPILE_DISABLE=1`,自然不触发 |
+| `vllm/transformers_utils/config.py` | mllama 模型在 QAIC 上关掉 cross-attention + 2 个新模型 config | ⚫ 可选(mllama);新 config 大概率已上游 |
 
-### 4.F 不变的部分
+### 3c. ⚪ 丢弃(只有 V0 引擎用)
 
-UnieAI 那 7 个 `_qaic_rejection_sample*` 函数是纯 `torch` + `sampling_metadata`
-+ `SpecDecodeMetadata` → **逐字移植**(已在 `vllm_qaic/model_runner.py` 完成);
-只需瞄一眼 `SpecDecodeMetadata` 字段名(0.21 上都还在)。
+`vllm/core/scheduler.py`、`block_manager.py`、`block/cpu_gpu_block_allocator.py`、
+`engine/llm_engine.py`、`engine/output_processor/interfaces.py`、`sequence.py`、
+`worker/worker_base.py`、`model_executor/layers/sampler.py`、`engine/metrics*.py`。
+**这些都是旧引擎 V0 的内部件,只跑 V1 就用不到。**
 
-### 4.G UnieAI 的 ngram 采样器 —— 改了什么 / 为什么 / 怎么做
+### 3d. ⚫ 可选功能(基础聊天用不到,要哪个功能才搬)
 
-**改了什么。** 三件事,全在 host(QPC 的计算不动):
-1. 在 V1+QAIC 路径上**解禁**投机解码(Qualcomm 出货时是
-   `raise ValueError("...not yet supported...")`),并限定只能 `ngram`。
-2. 把 decode 批次**打包成 2D** `[num_decodes, N+1]`,让 target QPC **一次** card
-   pass 就验证「上一个 token + 最多 N 个提案」。
-3. **写了一个 CPU 拒绝采样器** —— 那 7 个 `_qaic_rejection_sample*` 函数 ——
-   决定哪些提案被接受。
-
-**为什么必须这么做。** vLLM 内置的 V1 拒绝采样器跑在 GPU 上、用 **Triton** kernel。
-QAIC 的 host 在 **CPU** 上跑,可能没有 Triton 驱动,所以内置的验证器**根本跑不了**。
-没有 CPU 验证器,投机解码在 QAIC 上就无法运作 —— 这正是 Qualcomm 把它禁掉的原因。
-我们的 CPU 采样器实现了**同样、数学上忠实**的接受规则(按概率接受、拒绝时恢复、
-greedy 快路径),所以输出分布与非投机解码**完全一致**,只是每次 card pass 吐的
-token 变多。
-
-**为什么能扛过 0.21 迁移。** 这 7 个函数只依赖 `torch`、现有的 `sampling_metadata`
-(temperature / top_k / top_p / generators / all_greedy)、以及 `SpecDecodeMetadata`
-(`num_draft_tokens`、`max_spec_len`、`cu_num_draft_tokens`、`draft_token_ids`)。
-它们**完全没碰**被删掉的 `GPUModelRunner` 内部(没有 `positions_np`、
-`cu_num_tokens`、`num_decodes`,也没有 `InputBatch` 字段)。我们逐一核实过这些
-`SpecDecodeMetadata` 字段在 0.21 上都还在(其中 `cu_num_draft_tokens` 现在是
-tensor,而代码里本就用 `.item()` 处理了)。这就是为什么这一块能**逐字移植**、
-而周边的输入准备不行 —— 它当初是对着稳定的采样 API 写的,不是易变的 runner 内部。
+| 文件 | 出货版改了什么(逐行确认过) | 属于哪个功能 |
+|---|---|---|
+| `vllm/entrypoints/openai/serving_chat.py` (+252) | kimi_k2 的 tool-call id、harmony、`return_token_ids` 调试 | 工具调用 / gpt-oss / 调试 |
+| `vllm/entrypoints/openai/protocol.py` (+72) | 加可选返回字段、计时、embedding bytes | 向后兼容字段,大概率已上游 |
+| `vllm/entrypoints/openai/serving_pooling.py` (+104) | embedding 的多种编码格式 | embedding |
+| `vllm/entrypoints/openai/api_server.py` (+9) | 处理 embedding bytes 返回 | embedding |
+| `vllm/entrypoints/chat_utils.py` (+17) | kimi_k2 tool-call id 辅助函数 | 工具调用 |
+| `vllm/entrypoints/openai/tool_parsers/__init__.py` (+5) | 注册一个 tool parser | 工具调用(🟢 可插件化注册) |
+| `vllm/entrypoints/harmony_utils.py` (+106) | gpt-oss 函数调用 | gpt-oss |
+| `vllm/reasoning/gptoss_reasoning_parser.py` (+45) | gpt-oss reasoning | gpt-oss |
+| `vllm/model_executor/models/config.py` (+6) | 改 gpt-oss reasoning 后端名 | 与 QAIC 无关,大概率已上游,可忽略 |
+| `kv_connector/base.py` (+142) / `kv_transfer_state.py` (+9) | 重加 V0 KV connector | 拆分式服务(不用就丢) |
+| `quantization/utils/mxfp4_utils.py` / `gguf.py` / `bitsandbytes.py` | 算子优雅降级 | 由根因 2 自动触发 |
+| `setup.py` (+40) | QAIC 构建检测 / SDK 版本 | 插件自带 `pyproject.toml`,不适用 |
 
 ---
 
-## 5. UnieAI 自己的改动(唯一非 Qualcomm、非上游的代码)
+## 4. 最难的一块:`GPUModelRunner` 新旧对照
 
-在 commit `909a809`。完整叙述见 `docs/UnieAI_Quic_integrated.md`。摘要:
+我们的 QAIC model runner 是**继承** `GPUModelRunner` 的。这个基类从 v0.10.1 的约
+2–3 千行,被 0.21 重构到 **7000+ 行**,内部数据结构大改。所以继承它的我们这个子类,
+**每个重写的方法都得对着新基类重新对一遍**。这是整次迁移真正花时间的地方。
 
-| 文件(fork) | 改动 | 移植状态 |
+源文件:旧 = fork `vllm/v1/worker/qaic_model_runner.py`(819 行);新 = 已装的
+`vllm/v1/worker/gpu_model_runner.py`。
+
+### 4.A 构造函数
+- 旧:`__init__(vllm_config, device, speculative_model_type=None)`
+- 新:`__init__(vllm_config, device)`(去掉第 3 个参数,内部自己推导)—— 已处理。
+
+### 4.B 输入准备 —— **最大断点(看 `REBUILD_input_prep_4B.md` 上机做)**
+
+「输入准备」= 把调度器的决定(这步每个请求各算几个 token)翻译成卡能吃的 numpy 数组。
+旧版靠 runner 上几个现成数组,**0.21 全删了**,数据搬进了 `InputBatch`:
+
+| 旧版用的属性 | 0.21 还有吗 | 改从哪拿 |
 |---|---|---|
-| `vllm/v1/worker/qaic_model_runner.py` | +222:7 个 ngram CPU 拒绝采样函数 + 2D decode 打包 + ngram gate | ✅ 已移植进 `vllm_qaic/model_runner.py`(函数逐字 + `_pack_decode_batch`) |
-| `vllm/model_executor/model_loader/qaic_v1.py` | +27:target QPC 输出 `N+1` logits | 在 `vllm_qaic/model_loader.py` 内移植 |
+| `self.positions_np` | ❌ 删了 | 由 `InputBatch.num_computed_tokens_cpu` 算 |
+| `self.cu_num_tokens` | ❌ 删了 | 自己 cumsum |
+| `self.num_decodes` | ❌ 删了 | 用 `reorder_batch_to_split_decodes_and_prefills` 重算 |
+| `self.input_ids_cpu` | ❌ 删了 | `InputBatch.token_ids_cpu` |
+| `self.batch_indices` | ❌ 删了 | `InputBatch.block_table` |
+
+**这块只能上机边跑边对**,实操步骤见 `REBUILD_input_prep_4B.md`。
+
+### 4.C 前向 + 采样 —— 架构被拆成两半
+- 旧:`execute_model` 一个方法里走完「准备 → 卡上前向 → 采样」并返回结果。
+- 新:`execute_model` 可能先返回 `None`、把状态存起来,再由 `sample_tokens()` 出结果。
+- 做法:QAIC 前向是同步的,最简单就是在 `execute_model` 里走完整流程直接返回,
+  绕过 `sample_tokens`(上机确认基类允许)。
+
+### 4.D 投机解码相关方法
+
+| 项 | 旧 → 新 | 动作 |
+|---|---|---|
+| `_calc_spec_decode_metadata` | 旧自带 → 基类已有(`gpu_model_runner.py:2698`) | 用基类的,删自己那份 |
+| `SpecDecodeMetadata` 的字段 | 见下 | 我们 ngram 采样器用到的字段,0.21 上**都还在**(见 §4.F) |
+| `NgramProposer.propose` | 参数变多 | 更新调用,或直接委托给基类 |
+| `propose_draft_token_ids` | 参数变多 | 重写或委托 `super()` |
+| `RejectionSampler` | 旧是 Triton(GPU)→ 新仍是 `nn.Module` | **要上机确认它是否还只能 GPU/Triton。** 还是的话,继续用我们的 CPU 版 |
+
+### 4.E 低风险方法(签名小改,已搬好)
+`load_model`、`get_kv_cache_spec`、`initialize_kv_cache` —— 都已按 0.21 新签名搬进
+`vllm_qaic/model_runner.py`。
+
+### 4.F 不用改、可以照搬的部分(以及到底是哪些「字段」)
+
+我们的 ngram CPU 采样器(7 个函数)**只用到这些字段**,而它们在 0.21 上都还在,
+所以这段代码能**逐字照搬**:
+
+- 来自 `SpecDecodeMetadata`(投机解码的元数据对象):
+  - `num_draft_tokens` —— 每个请求这步猜了几个候选 token
+  - `max_spec_len` —— 一次最多猜几个
+  - `cu_num_draft_tokens` —— 候选数的累加和(0.21 上变成了 tensor,我们代码本来就用 `.item()` 取值,不受影响)
+  - `draft_token_ids` —— 候选 token 本身
+- 来自 `sampling_metadata`(采样参数对象):
+  - `temperature`、`top_k`、`top_p` —— 采样温度/截断参数
+  - `generators` —— 每个请求的随机数发生器
+  - `all_greedy` / `all_random` —— 整批是否全贪心/全随机
+
+「这些字段都还在」= 上面这些**属性名在 0.21 的对应对象上依然存在**,所以照搬的代码
+不会因为「找不到属性」而崩。这也是为什么这段能照搬、而 §4.B 的输入准备不行 ——
+它当初是对着「稳定的采样接口」写的,没碰那些被删掉的 runner 内部属性。
+
+---
+
+## 5. ngram 投机解码优化(我们写的原创代码)
+
+这是我们在 V1 上从 0 到 1 加的投机解码优化(原理见 `EXPLAINER_plain_zh.md` §5、
+逐行权属见 `UnieAI_Quic_integrated.md` §7)。迁移状态:
+
+| 涉及文件 | 内容 | 迁移状态 |
+|---|---|---|
+| `qaic_model_runner.py` | 7 个 CPU 拒绝采样函数 + 2D 打包 + ngram 开关 | ✅ 已逐字搬进 `vllm_qaic/model_runner.py` |
+| `qaic_v1.py` | 让 target QPC 多输出 `N+1` 行打分 | 随 `model_loader.py` 一起搬 |
 | `docs/qaic-v1-ngram-speculative.md` | 设计文档 | 参考 |
 
 ---
 
-## 6. 🟠 必须改核心的短清单(其余都是 plugin/port/drop)
+## 6. 「要不要改 vLLM 本体」的最终结论:很可能一项都不用
 
-若想做到核心完全不 fork,只剩这几项要决策:
+复查后,原本以为绕不开的几处 🟠,逐条看下来基本都能不改本体:
 
-1. **`vllm/config/cache.py` —— `CacheDType` 加 `"mxint8"`。→ 大概率不需要。**
-   mxint8 和 fp8 是**不同的东西、在不同的层**:
-   - `fp8` = **vLLM 层**的 8-bit **浮点** KV dtype(`--kv-cache-dtype`)。
-   - `mxint8` = microscaling int8,是 **QEfficient 编译器**的标志,决定 QPC 在
-     **卡上**怎么存 KV —— 通过 `--additional-config` 传,**不是** `--kv-cache-dtype`。
+1. **`vllm/config/cache.py` 加 `mxint8` —— 不需要。**
+   QAIC 的**卡上 KV 本来就是 mxint8**(由 QEfficient 编译时决定,走 `--additional-config`)。
+   vLLM 层的 `--kv-cache-dtype` 填 `fp8` 还是 `fp16` 都**不影响**卡上的实际存储格式 ——
+   它对 QAIC 来说只是个记账标签。所以**没必要**把 `mxint8` 塞进 vLLM 那张 `--kv-cache-dtype`
+   的合法值清单里。(`--kv-cache-dtype` 是一张写死在源码里的字符串白名单,插件无法从外部
+   往里加值;但既然不需要加,这点就无所谓了。)
 
-   生产启动命令用的是 `--kv-cache-dtype fp8`,而 `mxint8_kv_cache` 走 override/
-   additional config。所以 vLLM 层是 `fp8`(无需核心补丁),mxint8 由插件的
-   additional_config 处理。**只有**当你想额外把 `--kv-cache-dtype mxint8` 暴露成
-   vLLM 选项(启动命令没这么用)才需要改枚举。插件放行 fp8
-   (`platform.py::is_kv_cache_dtype_supported`)对这套栈是正确的。
-2. **`vllm/platforms/interface.py`** —— ⚠待确认是否还需要;0.21 大概率已是空操作。
-3. **`vllm/_custom_ops.py`** —— ⚠待确认;0.21 上可能不需要。
-4. **`vllm/transformers_utils/config.py`** —— ⚠待确认;可能用 configs registry
-   (`general_plugins`)即可替代。
+2. **`vllm/platforms/interface.py` —— 不需要,归入丢弃。**
+   这个文件是 vLLM「平台」的基类定义(规定每种硬件平台要实现哪些方法)。出货版在这里
+   加了个 `QAIC` 枚举值和 `is_qaic()` 方法。但 0.21 提供了**树外平台机制**(我们用
+   `device_type == "qaic"` 判断),所以这个改动在 0.21 上**没有作用**(我之前说的「空操作」
+   就是这个意思:加了也不会被用到)。→ **不留在清单里,直接归到「丢弃」。**
 
-2–4 都是「确认一下、大概率不用」。**第 1 项是唯一真正的核心缺口。**
+3. **`vllm/_custom_ops.py` —— 大概率不需要。**
+   这个文件负责加载 vLLM 的 CUDA 编译算子(`vllm._C`)。出货版让 QAIC 跳过它。
+   在 0.21 上,我们的树外平台本来就不会去 build/加载 CUDA 算子,所以**多半用不上**;
+   归到「上机确认,基本可丢」。
+
+4. **`vllm/transformers_utils/config.py` —— 目前无法判断,需上机确认。**
+   出货版在这里做了两件事:给 mllama 模型在 QAIC 上关掉 cross-attention(QAIC 不支持),
+   以及加了两个新模型 config。是否需要,**取决于你们实际要跑哪些模型**(只跑 Qwen 这类
+   普通文本模型就不需要;要跑 mllama 才需要)。所以**现在判不了,等确定模型清单 + 上机
+   才能定**。
+
+> **结论:** 「必须改 vLLM 本体」的清单,复查后**很可能为空**。第 1、2 项确定不用,
+> 第 3 项基本不用,第 4 项取决于模型清单、需上机确认。
 
 ---
 
 ## 7. 建议顺序(降风险)
 
-1. **先做 GO 测试**(README PART 0)—— torch 墙(gate 1/2)。NO-GO 就停。
-2. 搭起插件外壳:🟢 platform + 量化 + 模型/配置注册;确认
-   `current_platform == QaicPlatform`。
-3. 🔵 先搬低风险:`session.py`、`model_loader.py`、`get_kv_cache_spec`、
-   `load_model`、`initialize_kv_cache`。
-4. 🔵 重写输入准备(§4.B)—— 先把**不带投机**的 prefill/decode 跑通。
-5. 🔵 再开 ngram:把已就位的 `_pack_decode_batch` + `_qaic_rejection_sample`
-   接进重写后的 `execute_model`;解决 §4.D 的 RejectionSampler。
-6. 🟠 决定 `mxint8`(§6.1)。
-7. ⚫ 按需加可选功能(pooling / 拆分式 / gpt-oss / 多模态)。
+1. **先做 GO 测试**(README PART 0)—— torch 版本墙(gate 1/2)。过不了就停,别白做。
+2. 搭插件外壳:🟢 平台 + 量化 + 模型/配置注册;确认 `current_platform` 是 QaicPlatform。
+3. 🔵 先搬低风险:`session.py`、`model_loader.py`,以及已搬好的
+   `load_model` / `get_kv_cache_spec` / `initialize_kv_cache`。
+4. 🔵 重写输入准备(§4.B,照 `REBUILD_input_prep_4B.md`)——**先把不带投机的 prefill/decode
+   跑通**。
+5. 🔵 再开 ngram:把已就位的 2D 打包 + CPU 拒绝采样接进 `execute_model`;
+   并确认 §4.D 的 RejectionSampler 是否还依赖 Triton。
+6. ⚫ 按需加可选功能(embedding / 拆分式 / gpt-oss / 多模态)。

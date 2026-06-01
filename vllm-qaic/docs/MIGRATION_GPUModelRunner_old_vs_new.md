@@ -294,7 +294,13 @@ If you want a truly fork-free core, only these need a decision:
 4. **`vllm/transformers_utils/config.py`** — ⚠confirm; may be replaced by the
    configs registry (`general_plugins`).
 
-Items 2–4 are "confirm, probably not needed". Item 1 is the one real core gap.
+**Bottom line: this list is probably EMPTY.** Item 1 (mxint8) is not needed —
+QAIC's on-card KV is mxint8 regardless of the vLLM `--kv-cache-dtype` value
+(fp8/fp16 at the vLLM layer doesn't change the on-card format). Item 2 is not
+needed (OOT platform replaces it; move to DROP). Item 3 is almost certainly not
+needed. Item 4 cannot be decided yet — it depends on which models you run
+(only needed for mllama); confirm on-machine. (The Chinese `MIGRATION_zh.md` is
+the more readable, fully revised version of this document.)
 
 ---
 
