@@ -23,16 +23,20 @@ def _qaic_available() -> bool:
     Mirrors the detection the fork did in platforms/__init__.py, minus the
     ``"qaic" in version("vllm")`` hack (the plugin entry point replaces it).
     """
+    def _add_path(p: str) -> None:  # avoid duplicate sys.path entries
+        if p not in sys.path:
+            sys.path.append(p)
+
     try:
         try:
             import qaicrt  # noqa: F401
         except ImportError:
-            sys.path.append(f"/opt/qti-aic/dev/lib/{platform.machine()}")
+            _add_path(f"/opt/qti-aic/dev/lib/{platform.machine()}")
             import qaicrt  # noqa: F401
         try:
             import QAicApi_pb2  # noqa: F401
         except ImportError:
-            sys.path.append("/opt/qti-aic/dev/python")
+            _add_path("/opt/qti-aic/dev/python")
             import QAicApi_pb2  # noqa: F401
         return True
     except Exception:

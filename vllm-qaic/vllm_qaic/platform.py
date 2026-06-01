@@ -32,8 +32,11 @@ class QaicPlatform(Platform):
     device_type: str = "qaic"
     # Host-side tensors live on CPU; real compute runs on the AIC via qaicrt.
     dispatch_key: str = "CPU"
+    # Mirrors the fork's list (incl. mxfp4). Only mxfp6 is wired through
+    # register_quantization_config today; the rest are declared for parity so we
+    # don't silently reject models the fork accepted.
     supported_quantization: list[str] = [
-        "mxfp6", "awq", "gptq", "fp8", "compressed-tensors",
+        "mxfp6", "mxfp4", "awq", "gptq", "fp8", "compressed-tensors",
     ]
 
     @classmethod
@@ -100,8 +103,13 @@ class QaicPlatform(Platform):
                     "Prefix caching is not supported on QAIC V1; disabling.")
             cache_config.block_size = model_config.max_model_len
 
-        # Stash the cleaned config where the model loader will read it.
-        # TODO(port): bring over the fork's _clean_config() normalisation from
-        # vllm/model_executor/model_loader/qaic.py (num_cores, mxfp6_matmul,
-        # prefill_seq_len, aic_enable_depth_first, device_group, ...).
+        # Pass QAIC knobs through verbatim. NORMALIZATION IS NOT DONE HERE:
+        # the fork normalizes keys (num_cores/aic_num_cores, mxfp6->mxfp6_matmul,
+        # mxint8_kv_cache, prefill_seq_len, aic_enable_depth_first/dfs,
+        # device_group/device_ids, ...) inside compile-config assembly via
+        # _clean_config(). That lives in compile_config.py (ported from the
+        # fork's model_loader/qaic.py by port_from_fork.sh). CONTRACT: the ported
+        # compile_config MUST read these knobs from `vllm_config.additional_config`
+        # and run `_clean_config()` on them before calling QEfficient.compile(),
+        # otherwise the compile keys won't match QEfficient's expectations.
         vllm_config.additional_config = qaic_cfg

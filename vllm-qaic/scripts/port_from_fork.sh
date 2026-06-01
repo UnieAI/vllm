@@ -42,10 +42,14 @@ cat <<'EOF'
 
 DONE (mechanical). Now the TWO manual adaptations (search & fix):
 
-  1) QAIC config source:
-     OLD: vllm_config.model_config.override_qaic_config
-     NEW: vllm_config.additional_config
-     (the plugin moves QAIC knobs onto --additional-config; see platform.py)
+  1) QAIC config source + normalization (CRITICAL — on the compile critical path):
+     In compile_config.py (the ported qaic.py), the compile-config assembly must
+       a) read the QAIC knobs from  vllm_config.additional_config
+          (OLD: vllm_config.model_config.override_qaic_config), AND
+       b) still run them through _clean_config() before QEfficient.compile().
+     platform.py passes additional_config through RAW (no normalization), so if
+     compile_config does not call _clean_config(additional_config) the compile
+     keys (num_cores, mxfp6_matmul, prefill_seq_len, ...) won't match QEfficient.
 
   2) Platform check:
      OLD: current_platform.is_qaic()

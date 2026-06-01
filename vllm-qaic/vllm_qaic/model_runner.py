@@ -35,14 +35,19 @@ from vllm_qaic.model_loader import load_qaic_model
 
 logger = init_logger(__name__)
 
-# TODO(verify import path on target): PLACEHOLDER_TOKEN_ID moved across releases.
-# In the fork it came from the spec-decode utils. On 0.21 check:
-#   from vllm.v1.spec_decode.utils import PLACEHOLDER_TOKEN_ID   (or)
-#   from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
-try:  # be tolerant until pinned
-    from vllm.v1.spec_decode.utils import PLACEHOLDER_TOKEN_ID
-except Exception:  # pragma: no cover
-    PLACEHOLDER_TOKEN_ID = -1
+# Resolve the sentinels from the SAME module the V1 RejectionSampler uses, so
+# our CPU rejection sampler agrees with RejectionSampler.parse_output().
+# Import (do NOT silently default): a mismatched PLACEHOLDER_TOKEN_ID would
+# silently corrupt accepted/rejected speculative tokens, and the greedy
+# sentinel changed across releases (v0.10.1 used -1.0; 0.21 uses
+# GREEDY_TEMPERATURE == 0). gpu_model_runner already imports this module, so
+# this adds no new dependency. If the import path moves, fail loudly here.
+# (Verified against vllm/v1/sample/rejection_sampler.py on 0.21:
+#  PLACEHOLDER_TOKEN_ID == -1, GREEDY_TEMPERATURE == 0.)
+from vllm.v1.sample.rejection_sampler import (
+    GREEDY_TEMPERATURE,
+    PLACEHOLDER_TOKEN_ID,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -61,9 +66,13 @@ class QaicModelRunner(GPUModelRunner):
     #        speculative_model_type parameter anymore — derive it internally.
     # -------------------------------------------------------------------------
     def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
-        super().__init__(vllm_config, device)
-
+        # Check device first so a wrong device fails with a clear message.
+        # NOTE: super().__init__ below is the 0.21 GPUModelRunner init (7000-line
+        # class) and is the FIRST concrete on-machine failure point to test — it
+        # may make CUDA/device assumptions that need re-fitting for a CPU-only
+        # QAIC host (allocating device buffers, querying torch.cuda, cudagraphs).
         assert device == torch.device("cpu"), "QAIC keeps host tensors on CPU."
+        super().__init__(vllm_config, device)
 
         # --- UnieAI ngram gating (ported verbatim from the fork) ------------
         self.speculative_model_type: Optional[str] = None
@@ -222,7 +231,10 @@ class QaicModelRunner(GPUModelRunner):
         if sampling_metadata.all_random:
             return False
         assert sampling_metadata.temperature is not None
-        return float(sampling_metadata.temperature[req_idx].item()) == -1.0
+        return (
+            float(sampling_metadata.temperature[req_idx].item())
+            == float(GREEDY_TEMPERATURE)
+        )
 
     @staticmethod
     def _qaic_rejection_sample_greedy_req(
@@ -299,7 +311,7 @@ class QaicModelRunner(GPUModelRunner):
         logits = logits.float().clone()
         if sampling_metadata.temperature is not None:
             temperature = float(sampling_metadata.temperature[req_idx].item())
-            if temperature != -1.0:
+            if temperature != float(GREEDY_TEMPERATURE):
                 logits.div_(temperature)
 
         self._qaic_apply_top_k_top_p(logits, sampling_metadata, req_idx)
