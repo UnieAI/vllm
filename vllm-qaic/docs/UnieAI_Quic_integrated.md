@@ -1,9 +1,9 @@
 # UnieAI × Qualcomm Cloud AI 100 — Technical Integration Note
 
-> **New here / not deep in the internals?** Read the plain-language explainer
-> first: **[`EXPLAINER_plain_zh.md`](EXPLAINER_plain_zh.md)** (中文白话版,含一个完整小例子).
-> It explains *what we did* with an analogy and a worked example; this document
-> is the precise version for engineers and counsel.
+> **Want the overview first?** Read **[`EXPLAINER_plain_zh.md`](EXPLAINER_plain_zh.md)**
+> (中文,资工硕士可读版): a concise "what we did" with the two pillars
+> (porting/upgrade + ngram) and a per-item status table. This document is the
+> precise version with provenance and line-level attribution.
 
 **Subject:** UnieAI's engineering on the Qualcomm Cloud AI 100 (QAIC) vLLM
 backend — (A) the porting/upgrade work that brings the QAIC backend onto
