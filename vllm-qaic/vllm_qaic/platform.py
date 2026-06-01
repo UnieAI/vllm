@@ -1,0 +1,107 @@
+"""QaicPlatform: the out-of-tree (OOT) platform class vLLM loads for QAIC.
+
+Ported and trimmed from the fork's vllm/platforms/qaic.py, with two changes:
+  1. ``_enum = PlatformEnum.OOT`` (upstream has no QAIC enum value).
+  2. QAIC knobs are read from ``vllm_config.additional_config`` instead of the
+     fork's custom ``ModelConfig.override_qaic_config`` field, so we never have
+     to patch arg_utils.py / config.
+
+IMPORTANT: method signatures on vllm.platforms.interface.Platform drift between
+releases. After ``pip install vllm==<target>``, open the installed
+``vllm/platforms/interface.py`` and confirm the signatures below still match
+(the README PART 1 tells you exactly how). Where unsure, a TODO marks it.
+"""
+
+from typing import TYPE_CHECKING, Optional
+
+import torch
+
+import vllm.envs as envs
+from vllm.logger import init_logger
+from vllm.platforms.interface import Platform, PlatformEnum
+
+logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm.config import ModelConfig, VllmConfig
+
+
+class QaicPlatform(Platform):
+    _enum = PlatformEnum.OOT
+    device_name: str = "qaic"
+    device_type: str = "qaic"
+    # Host-side tensors live on CPU; real compute runs on the AIC via qaicrt.
+    dispatch_key: str = "CPU"
+    supported_quantization: list[str] = [
+        "mxfp6", "awq", "gptq", "fp8", "compressed-tensors",
+    ]
+
+    @classmethod
+    def get_device_name(cls, device_id: int = 0) -> str:
+        return "qaic"
+
+    @classmethod
+    def is_async_output_supported(cls, enforce_eager: Optional[bool]) -> bool:
+        return False
+
+    @classmethod
+    def inference_mode(cls):
+        return torch.no_grad()
+
+    @classmethod
+    def is_pin_memory_available(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_v1(cls, model_config: "ModelConfig") -> bool:
+        return True
+
+    @classmethod
+    def is_kv_cache_dtype_supported(
+        cls, kv_cache_dtype: str, model_config: "ModelConfig" = None
+    ) -> bool:
+        # KNOWN CORE GAP: upstream CacheDType Literal (vllm/config/cache.py)
+        # does NOT include "mxint8" in vLLM 0.21+. So mxint8 KV cache fails
+        # *validation* before it ever reaches us. Until that is resolved
+        # (small core patch or upstream PR — see README "Known core gaps"),
+        # only fp8 passes here.
+        return kv_cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2")
+
+    @classmethod
+    def get_punica_wrapper(cls) -> str:
+        return "vllm.lora.punica_wrapper.punica_cpu.PunicaWrapperCPU"
+
+    @classmethod
+    def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
+        parallel_config = vllm_config.parallel_config
+
+        # This plugin supports the V1 engine ONLY. The fork's V0 path
+        # (and ~half of the Qualcomm core patch) is intentionally dropped.
+        if parallel_config.worker_cls == "auto":
+            assert envs.VLLM_USE_V1, (
+                "vllm-qaic supports the V1 engine only. Set VLLM_USE_V1=1."
+            )
+            parallel_config.worker_cls = "vllm_qaic.worker.QaicWorker"
+
+        if parallel_config.world_size > 1:
+            parallel_config.distributed_executor_backend = "uni"
+
+        # QAIC knobs come from --additional-config '{"num_cores":16, ...}'
+        # (replaces the fork's --override-qaic-config / --device-group).
+        qaic_cfg = dict(vllm_config.additional_config or {})
+
+        # block_size for QAIC: one logical block == full context (ctx_len).
+        cache_config = vllm_config.cache_config
+        model_config = vllm_config.model_config
+        if cache_config is not None:
+            if envs.VLLM_USE_V1 and cache_config.enable_prefix_caching:
+                cache_config.enable_prefix_caching = False
+                logger.warning_once(
+                    "Prefix caching is not supported on QAIC V1; disabling.")
+            cache_config.block_size = model_config.max_model_len
+
+        # Stash the cleaned config where the model loader will read it.
+        # TODO(port): bring over the fork's _clean_config() normalisation from
+        # vllm/model_executor/model_loader/qaic.py (num_cores, mxfp6_matmul,
+        # prefill_seq_len, aic_enable_depth_first, device_group, ...).
+        vllm_config.additional_config = qaic_cfg

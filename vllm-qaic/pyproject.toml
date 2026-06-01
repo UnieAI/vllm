@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-qaic"
+version = "0.0.1"
+description = "Out-of-tree vLLM platform plugin for Qualcomm Cloud AI 100 (QAIC), V1 engine + ngram speculative decoding."
+requires-python = ">=3.10"
+
+# NOTE: We intentionally do NOT pin vllm/torch here. The whole point of the
+# split-environment design (see README PART 0) is that this package is
+# installed into the *serve* environment alongside vLLM 0.21+/torch 2.11,
+# while QPC compilation happens separately in a QEfficient/torch 2.7 env.
+# qaicrt + QAicApi_pb2 are provided by the Cloud AI SDK (system install),
+# NOT by pip.
+dependencies = [
+    "numpy",
+]
+
+# ---------------------------------------------------------------------------
+# THE PLUGIN WIRING (this is what makes vLLM load us without forking core).
+# Verified against vllm/plugins/__init__.py and vllm/platforms/__init__.py.
+# ---------------------------------------------------------------------------
+
+# 1) Platform plugin: vLLM calls this at startup; it returns the qualified
+#    class name of our Platform (or None if QAIC is not present on this host).
+[project.entry-points."vllm.platform_plugins"]
+qaic = "vllm_qaic:register_platform"
+
+# 2) General plugin: vLLM executes this function at startup. We use it to
+#    register the mxfp6 quantization config, KV connector, and any models.
+[project.entry-points."vllm.general_plugins"]
+qaic_register = "vllm_qaic:register"
+
+[tool.setuptools.packages.find]
+include = ["vllm_qaic*"]
