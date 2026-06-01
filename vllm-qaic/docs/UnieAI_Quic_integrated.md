@@ -1,7 +1,14 @@
 # UnieAI × Qualcomm Cloud AI 100 — Technical Integration Note
 
-**Subject:** How UnieAI added n-gram speculative decoding to the vLLM V1 engine
-running on the Qualcomm Cloud AI 100 (QAIC) backend.
+> **New here / not deep in the internals?** Read the plain-language explainer
+> first: **[`EXPLAINER_plain_zh.md`](EXPLAINER_plain_zh.md)** (中文白话版,含一个完整小例子).
+> It explains *what we did* with an analogy and a worked example; this document
+> is the precise version for engineers and counsel.
+
+**Subject:** UnieAI's engineering on the Qualcomm Cloud AI 100 (QAIC) vLLM
+backend — (A) the porting/upgrade work that brings the QAIC backend onto
+successive open-source vLLM bases and the V1 engine, and (B) an n-gram
+speculative-decoding optimization added on top.
 
 **Audience:** Qualcomm engineering (technical exchange) and reviewing counsel.
 This document is written so that a non-engineer can follow the *what* and *why*
@@ -18,20 +25,39 @@ Section 3 states exactly which lines are UnieAI's.
 
 ---
 
-## 1. One-paragraph summary (plain language)
+## 1. Summary (plain language) — UnieAI's work has TWO parts
 
-Qualcomm provides a version of the open-source inference server **vLLM** that
-runs large language models on the **Cloud AI 100** accelerator card. UnieAI took
-that version and **added a speed-up feature called "n-gram speculative
-decoding"** to it, specifically for vLLM's newer "V1" execution engine. The
-feature lets the model **guess several likely next words from the text it has
-already seen, then verify those guesses in a single pass on the card** — so it
-produces more words per step and runs faster, without changing the model's
-output. Qualcomm's version had explicitly **switched this feature off** on the
-V1 path; UnieAI switched it on and supplied the missing piece that makes it work
-on the card (a verification step written to run on the host CPU). The total of
-UnieAI's code is small and self-contained — about **250 lines in one file**,
-plus a design document.
+**Part A — Porting / upgrade engineering (the bulk of the work).** The
+open-source inference server **vLLM** changes fast, and Qualcomm's QAIC support
+is distributed as a patch tied to particular versions. UnieAI did the
+engineering to **bring the QAIC backend onto successive open-source vLLM bases
+and keep it running in production**, specifically:
+1. **Align to the v0.10.1 base** — make the Qualcomm QAIC patch apply and run on
+   open-source vLLM v0.10.1.
+2. **Adapt to the "V1" engine and productionize it** — vLLM has an older (V0) and
+   a newer, faster (V1) execution engine. Qualcomm's official guide demonstrates
+   **V0**; UnieAI's production runs on the **V1** engine (`VLLM_USE_V1=1`). V1 is
+   internally very different — this is an engine swap, not a recompile.
+3. **Integrate the QEfficient / Cloud AI SDK versions** — wire up
+   efficient-transformers **v1.21** + Cloud AI SDK **1.21** so the
+   compile-model→run-on-card path works end to end.
+4. **Migrate to vLLM 0.2x (in progress)** — bring the whole stack onto a much
+   newer vLLM, where the engine was refactored again.
+
+> Note on attribution: many QAIC files carry Qualcomm or upstream copyright
+> (Section 3). Part A is **integration/upgrade *labor*** — getting that code to
+> run on these specific bases/engines/SDKs and migrating it forward — not a claim
+> of authorship over Qualcomm's or upstream's source. Code provenance and
+> integration labor are distinct; both are stated explicitly in Section 3.
+
+**Part B — An n-gram speculative-decoding optimization (added on top).** On the
+ported stack, UnieAI added one speed-up: the model **guesses several likely next
+tokens from text it has already seen, then verifies them in a single pass on the
+card** — more tokens per step, identical output. Qualcomm had **switched this
+off** on the V1 path; UnieAI switched it on and wrote the missing verifier (a
+CPU rejection sampler — see §4). This is **originally authored UnieAI code**,
+about **250 lines in one file** plus a design document, and is **one optimization
+item within speculative decoding**, not the whole of UnieAI's work.
 
 ---
 
@@ -67,7 +93,18 @@ plus a design document.
 
 ## 3. Provenance — what is whose (the boundary of "our work")
 
-The fork `github.com/UnieAI/vllm`, branch `v1_ngram`, is three layers:
+**Two distinct kinds of UnieAI contribution — keep them separate:**
+
+- **(i) Integration / upgrade labor (Part A).** Engineering effort to make
+  existing code (Qualcomm's QAIC patch + upstream vLLM) run on specific bases and
+  engines and to migrate it forward (v0.10.1 → V1 engine → SDK v1.21 → 0.2x).
+  This is *work performed on* code authored by Qualcomm/upstream; it is **not** a
+  claim of copyright over that underlying source.
+- **(ii) Originally authored code (Part B).** New source written by UnieAI — the
+  n-gram speculative-decoding logic (~250 lines), enumerated to the line in §7.
+
+The fork `github.com/UnieAI/vllm`, branch `v1_ngram`, is three code-provenance
+layers:
 
 | Layer | Origin | Licensing marking | Contents |
 |---|---|---|---|
