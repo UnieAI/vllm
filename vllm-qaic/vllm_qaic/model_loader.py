@@ -1,25 +1,29 @@
-"""Model loader — PORT THIS from the fork. (Low risk: mostly self-contained.)
+"""Model loader — PORT from the fork via scripts/port_from_fork.sh.
 
-Sources (copy both into this package):
-  * vllm/model_executor/model_loader/qaic_v1.py   -> model_loader.py (this file)
-        QaicCausalLM (nn.Module shell) + load_qaic_model(vllm_config, ...)
-  * vllm/model_executor/model_loader/qaic.py      -> compile_config.py
-        _clean_config() + QEfficient compile-config assembly (num_cores,
-        prefill_seq_len, mxfp6_matmul, mxint8_kv_cache, ...).
+This file is a thin, import-SAFE placeholder so the rest of the package imports
+cleanly before porting. Running scripts/port_from_fork.sh OVERWRITES it with the
+fork's qaic_v1.py (QaicCausalLM + load_qaic_model), import-rewritten.
 
-These talk to QEfficient / qaicrt, not to vLLM internals, so they port with
-little change. The one edit: read QAIC knobs from vllm_config.additional_config
-(set by QaicPlatform.check_and_update_config) instead of
-vllm_config.model_config.override_qaic_config.
+Sources (copied by the port script):
+  * vllm/model_executor/model_loader/qaic_v1.py  -> this file (model_loader.py)
+  * vllm/model_executor/model_loader/qaic.py     -> compile_config.py
+  * vllm/model_executor/model_loader/qaic_session_np.py -> session.py
 
-SPLIT-ENV NOTE (see README PART 0): the QPC *compile* path imports
+These talk to QEfficient / qaicrt, not vLLM internals, so they port with little
+change beyond the two manual edits the port script prints (override_qaic_config
+-> additional_config; is_qaic() -> device_type=="qaic").
+
+SPLIT-ENV NOTE (README PART 0): the compile path imports
 `from QEfficient import QEFFAutoModelForCausalLM` and needs torch 2.7. In the
-serve environment (torch 2.11) you must hit the *pre-compiled* path only
-(pass qpc_path / VLLM_QAIC_QPC_PATH) so this import is never reached. Loading a
-prebuilt QPC uses only qaicrt (see session.py).
+serve env (torch 2.11) hit the PRE-COMPILED path only (pass qpc_path /
+VLLM_QAIC_QPC_PATH) so that import is never reached.
 """
 
-raise NotImplementedError(
-    "Port vllm/model_executor/model_loader/qaic_v1.py (+ qaic.py) from the "
-    "v1_ngram fork. See the module docstring and README PART 1, step 5."
-)
+from typing import Any
+
+
+def load_qaic_model(vllm_config: Any, speculative_model_type: Any = None):
+    raise NotImplementedError(
+        "vllm_qaic.model_loader is a placeholder. Run "
+        "scripts/port_from_fork.sh <fork> to bring over qaic_v1.py, then apply "
+        "the two manual adaptations it prints.")

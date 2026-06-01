@@ -17,15 +17,23 @@ host input-prep arrays (self.positions_np / self.cu_num_tokens / self.num_decode
 all REMOVED in 0.21) are marked TODO. See docs/MIGRATION_GPUModelRunner_old_vs_new.md.
 """
 
+import time
 from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.logger import init_logger
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+# Ported QAIC model loader (see vllm_qaic/model_loader.py / port_from_fork.sh).
+from vllm_qaic.model_loader import load_qaic_model
+
+logger = init_logger(__name__)
 
 # TODO(verify import path on target): PLACEHOLDER_TOKEN_ID moved across releases.
 # In the fork it came from the spec-decode utils. On 0.21 check:
@@ -350,25 +358,50 @@ class QaicModelRunner(GPUModelRunner):
             "signatures, or delegate to super(). See migration doc.")
 
     def get_kv_cache_spec(self) -> dict[str, "KVCacheSpec"]:
-        """OLD == NEW shape: dict[layer_name -> FullAttentionSpec]. Low risk.
-        Port the fork body; verify FullAttentionSpec field names (block_size,
-        num_kv_heads, head_size, dtype, use_mla) on the target.
+        """Ported from the fork (low risk). Builds one FullAttentionSpec per
+        layer. OLD==NEW shape; verify FullAttentionSpec fields on your target
+        (block_size, num_kv_heads, head_size, dtype, use_mla).
         """
-        raise NotImplementedError("Port get_kv_cache_spec from the fork (low risk).")
+        block_size = self.cache_config.block_size
+        kv_cache_spec: dict[str, "KVCacheSpec"] = {}
+        n_layers = self.model_config.get_num_layers(self.parallel_config)
+        for i in range(n_layers):
+            layer_name = f"layer_{i}"
+            kv_cache_spec[layer_name] = FullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                dtype=self.kv_cache_dtype,
+                use_mla=False,
+            )
+        return kv_cache_spec
 
     def initialize_kv_cache(self, kv_cache_config: "KVCacheConfig",
                             is_profiling: bool = False) -> None:
-        """OLD: initialize_kv_cache(kv_cache_config).
-        NEW: added is_profiling param. Fork body just stored the config.
+        """Ported from the fork. On QAIC the KV cache is owned by the QPC on the
+        card, so we only stash the config; no host tensors are allocated.
+        OLD: initialize_kv_cache(kv_cache_config); NEW adds is_profiling.
         """
-        raise NotImplementedError("Port initialize_kv_cache; mind the new is_profiling arg.")
+        self.kv_cache_config = kv_cache_config
+        # NOTE (fork): KV-transfer registration intentionally left out (only
+        # needed for disaggregated serving). Re-add if you port qaic_connector.
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
-        """OLD: load_model(*args, **kwargs) -> load_qaic_model(vllm_config, spec_type).
-        NEW: load_model(load_dummy_weights=False). Call into
-        vllm_qaic.model_loader.load_qaic_model and pass self.speculative_model_type.
+        """Ported from the fork. Loads/compiles the QPC via load_qaic_model.
+        OLD: load_model(*args, **kwargs); NEW: (load_dummy_weights=False).
         """
-        raise NotImplementedError("Port load_model -> vllm_qaic.model_loader.load_qaic_model.")
+        logger.info("Starting to load model %s...", self.model_config.model)
+        t0 = time.perf_counter()
+        with set_current_vllm_config(self.vllm_config):
+            self.model = load_qaic_model(
+                self.vllm_config,
+                speculative_model_type=self.speculative_model_type,
+            )
+            if self.lora_config:
+                self.model = self.load_lora_model(
+                    self.model, self.model_config, self.scheduler_config,
+                    self.lora_config, self.device)
+        logger.info("Model loading took %.6f seconds", time.perf_counter() - t0)
 
     def get_model(self) -> nn.Module:
         return self.model

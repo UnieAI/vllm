@@ -120,27 +120,47 @@ decoding lives in `vllm/v1/spec_decode/` and is provided by upstream.
 | `vllm/engine/metrics.py` / `metrics_types.py` | 87 / 14 | V0 metrics (⚫ if you want QAIC metrics on V1, re-do via V1 logging) |
 | `vllm/config/scheduler.py` | 15 | ⚠confirm: check whether any line is V1-relevant |
 
-### 3d. ⚫ OPTIONAL — separate features; port only if needed
+### 3d. VERIFIED (each diff line-read against `bd90d0d`)
 
-| File | +lines | Feature it serves |
-|---|---|---|
-| `vllm/entrypoints/openai/serving_chat.py` | 252 | ⚠ on-device sampling + gpt-oss/harmony. Not needed for basic serving. |
-| `vllm/entrypoints/openai/protocol.py` | 72 | ⚠ API fields for on-device sampling / gpt-oss |
-| `vllm/entrypoints/harmony_utils.py` | 106 | gpt-oss harmony format |
-| `vllm/reasoning/gptoss_reasoning_parser.py` | 45 | gpt-oss reasoning |
-| `vllm/entrypoints/openai/serving_pooling.py` | 104 | embeddings/pooling on QAIC |
-| `vllm/distributed/kv_transfer/kv_connector/base.py` | 142 | disaggregated prefill/decode |
-| `vllm/distributed/kv_transfer/kv_transfer_state.py` | 9 | disaggregated serving |
-| `vllm/model_executor/layers/quantization/utils/mxfp4_utils.py` | 22 | mxfp4 quant |
-| `vllm/model_executor/layers/quantization/gguf.py` | 29 | ⚠confirm gguf interaction |
-| `vllm/model_executor/layers/quantization/bitsandbytes.py` | 10 | ⚠confirm |
-| `vllm/entrypoints/chat_utils.py` | 17 | ⚠ chat template (MM?) |
-| `vllm/entrypoints/openai/api_server.py` | 9 | ⚠ minor server hook |
-| `vllm/entrypoints/openai/tool_parsers/__init__.py` | 5 | register a tool parser |
-| `vllm/model_executor/models/config.py` | 6 | ⚠ model config tweak |
-| `vllm/env_override.py` | 10 | ⚠ env overrides (could move to plugin `register()`) |
-| `vllm/utils/__init__.py` | 10 | ⚠ helper utils (copy needed ones into package) |
-| `setup.py` | 40 | build/packaging — N/A (plugin has its own `pyproject.toml`) |
+**Root-cause insight:** almost every QAIC-specific *core* touch reduces to TWO
+mechanisms. Handle these two and most of the list disappears:
+1. **"is this the QAIC platform?"** — the patch added `current_platform.is_qaic()`
+   + a `QAIC` enum. On 0.21 the OOT platform has no such enum; use
+   `current_platform.device_type == "qaic"` instead (no core edit).
+2. **"QAIC has no torch custom ops / no CUDA `_C`"** — the patch makes
+   `supports_custom_op()` return `False` on QAIC and skips `vllm._C`. Once that
+   is true, the mxfp4 / gguf / bitsandbytes "graceful-degradation" fallbacks
+   **trigger automatically** — they are not separate work.
+
+#### QAIC-required core touches (small)
+
+| File | +lines | Verified: what it does | Bucket |
+|---|---|---|---|
+| `vllm/utils/__init__.py` | 10 | (1) add `"mxint8": torch.uint8` dtype; (2) `supports_custom_op()` → `False` on QAIC | 🟠 CORE-PATCH (root cause #2) — or replicate in plugin init |
+| `vllm/_custom_ops.py` | 8 | skip `import vllm._C` on QAIC (no CUDA ops) | 🟢 PLUGIN/🟠 small — likely unneeded if OOT platform never builds `_C` |
+| `vllm/platforms/interface.py` | 10 | add `QAIC` enum + `is_qaic()` | 🟢 AVOIDED — use `device_type=="qaic"` on the OOT platform |
+| `vllm/env_override.py` | 10 | skip `torch._inductor` thread config on QAIC | ⚪ covered by `TORCH_COMPILE_DISABLE=1` already in your launch |
+| `vllm/transformers_utils/config.py` | 15 | mllama: force `is_encoder_decoder=False` on QAIC (no cross-attn) + 2 new model configs | ⚫ OPTIONAL(mllama) — new configs likely already upstream |
+
+#### Optional features — NOT needed for basic V1 chat (Qwen2.5, mxfp6, fp8)
+
+| File | +lines | Verified: what it does | Bucket |
+|---|---|---|---|
+| `vllm/entrypoints/openai/serving_chat.py` | 252 | kimi_k2 tool-call IDs + harmony actions + `return_token_ids` debug streaming | ⚫ OPTIONAL(tool-calling / gpt-oss / debug) |
+| `vllm/entrypoints/openai/protocol.py` | 72 | optional fields: `return_token_ids`, timing, embedding-bytes | ⚫ OPTIONAL — backwards-compat, likely upstream |
+| `vllm/entrypoints/openai/serving_pooling.py` | 104 | embedding encoding formats (float/base64/**bytes**) | ⚫ OPTIONAL(embeddings) |
+| `vllm/entrypoints/openai/api_server.py` | 9 | dispatch `PoolingBytesResponse` | ⚫ OPTIONAL(embeddings) |
+| `vllm/entrypoints/chat_utils.py` | 17 | kimi_k2 tool-call-id helpers | ⚫ OPTIONAL(tool-calling) |
+| `vllm/entrypoints/openai/tool_parsers/__init__.py` | 5 | register `OpenAIToolParser` | 🟢 PLUGIN (ToolParserManager) |
+| `vllm/entrypoints/harmony_utils.py` | 106 | gpt-oss function-calling | ⚫ OPTIONAL(gpt-oss) |
+| `vllm/reasoning/gptoss_reasoning_parser.py` | 45 | gpt-oss reasoning parse | ⚫ OPTIONAL(gpt-oss) |
+| `vllm/model_executor/models/config.py` | 6 | rename gpt-oss reasoning backend | ⚫ IGNORE — likely upstream, not QAIC |
+| `vllm/distributed/kv_transfer/kv_connector/base.py` | 142 | re-add V0 `KVConnectorBase` (disagg) | ⚪ DROP-V0 / ⚫ OPTIONAL(disagg) |
+| `vllm/distributed/kv_transfer/kv_transfer_state.py` | 9 | V0 connector init path | ⚪ DROP-V0 / ⚫ OPTIONAL(disagg) |
+| `vllm/model_executor/layers/quantization/utils/mxfp4_utils.py` | 22 | pure-Python fallback when no custom op | ⚫ OPTIONAL(mxfp4) — auto via root cause #2 |
+| `vllm/model_executor/layers/quantization/gguf.py` | 29 | pure-Python fallback when no custom op | ⚫ OPTIONAL(gguf) — auto via root cause #2 |
+| `vllm/model_executor/layers/quantization/bitsandbytes.py` | 10 | skip bnb custom op on QAIC | ⚫ OPTIONAL(bnb) — auto via root cause #2 |
+| `setup.py` | 40 | QAIC build detection / SDK version / `qaic.txt` | 🟢 N/A — plugin has its own `pyproject.toml` |
 
 ---
 
@@ -206,6 +226,36 @@ UnieAI's seven `_qaic_rejection_sample*` helpers are pure `torch` +
 `vllm_qaic/model_runner.py`); only glance at `SpecDecodeMetadata` field names
 (all present on 0.21).
 
+### 4.G UnieAI's ngram sampler — what / why / how
+
+**What we changed.** Three things, all on the host (the QPC math is untouched):
+1. *Un-gated* speculative decoding on the V1+QAIC path (Qualcomm shipped it
+   `raise ValueError("...not yet supported...")`), restricting it to `ngram`.
+2. *Packed* the decode batch as 2-D `[num_decodes, N+1]` so the target QPC
+   verifies the previous token + up to N proposals in **one** card pass.
+3. *Wrote a CPU rejection sampler* — the seven `_qaic_rejection_sample*`
+   functions — that decides which proposals to accept.
+
+**Why we had to.** vLLM's built-in V1 rejection sampler runs on the GPU via
+**Triton** kernels. The QAIC host executes on **CPU** and may have no Triton
+driver, so the built-in verifier cannot run there. Without a CPU verifier,
+speculative decoding simply cannot function on QAIC — which is exactly why
+Qualcomm had disabled it. Our CPU sampler implements the *same, mathematically
+faithful* acceptance rule (accept-with-probability, recover-on-reject, greedy
+fast-path), so output is identical in distribution to non-speculative decoding;
+only tokens-per-card-pass increases.
+
+**How it survives the 0.21 port.** The seven functions depend ONLY on
+`torch`, the existing `sampling_metadata` (temperature / top_k / top_p /
+generators / all_greedy), and `SpecDecodeMetadata`
+(`num_draft_tokens`, `max_spec_len`, `cu_num_draft_tokens`, `draft_token_ids`).
+They touch **no** removed `GPUModelRunner` internals (no `positions_np`,
+`cu_num_tokens`, `num_decodes`, no `InputBatch` fields). We verified every one of
+those `SpecDecodeMetadata` fields still exists on 0.21 (one, `cu_num_draft_tokens`,
+is now a tensor, which the existing `.item()` calls already handle). That is why
+this block ports **verbatim** while the surrounding input-prep does not — it was
+written against the stable sampling API, not the volatile runner internals.
+
 ---
 
 ## 5. UnieAI's own changes (the only non-Qualcomm, non-upstream code)
@@ -225,9 +275,19 @@ narrative. Summary:
 
 If you want a truly fork-free core, only these need a decision:
 
-1. **`vllm/config/cache.py` — add `"mxint8"` to `CacheDType`.** Options:
-   (a) ship a 1-line core patch; (b) use `fp8` and skip mxint8; (c) upstream PR.
-   The plugin currently allows fp8 only (`platform.py::is_kv_cache_dtype_supported`).
+1. **`vllm/config/cache.py` — `"mxint8"` in `CacheDType`. → PROBABLY NOT NEEDED.**
+   `mxint8` and `fp8` are different things at different layers:
+   - `fp8` = an 8-bit **float** KV dtype at the **vLLM** layer (`--kv-cache-dtype`).
+   - `mxint8` = microscaling int8, a **QEfficient compiler** flag deciding how the
+     QPC stores KV **on the card** — passed via `--additional-config`, NOT via
+     `--kv-cache-dtype`.
+
+   The production launch uses `--kv-cache-dtype fp8` and carries `mxint8_kv_cache`
+   in the override/additional config. So the vLLM-level dtype is `fp8` (no core
+   patch needed) and mxint8 is handled by the plugin's additional_config. Only if
+   you want to ALSO expose `--kv-cache-dtype mxint8` as a vLLM option (the launch
+   does not) would you need the core enum edit. The plugin allows fp8
+   (`platform.py::is_kv_cache_dtype_supported`); that is correct for this stack.
 2. **`vllm/platforms/interface.py`** — ⚠confirm whether anything is still
    needed; likely a no-op on 0.21 (methods/enum already upstream).
 3. **`vllm/_custom_ops.py`** — ⚠confirm; may be unnecessary on 0.21.
