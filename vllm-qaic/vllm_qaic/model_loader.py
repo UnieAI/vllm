@@ -498,12 +498,18 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
             self.decode_batch_inputs["input_ids"][num_decodes:] = -1
             self.decode_batch_inputs["position_ids"][num_decodes:] = -1
 
-
         if not self.ignore_batch_index:
-
-            self.decode_batch_inputs["batch_index"][:num_decodes,0] = batch_indices
+            self.decode_batch_inputs["batch_index"][:num_decodes,
+                                                     0] = batch_indices
             if num_decodes < self.decode_bsz:
-                self.decode_batch_inputs["batch_index"][num_decodes:] = -1
+                active_batch_indices = set(batch_indices[:num_decodes])
+                inactive_batch_indices = [
+                    idx for idx in range(self.decode_bsz)
+                    if idx not in active_batch_indices
+                ]
+                self.decode_batch_inputs["batch_index"][
+                    num_decodes:, 0] = inactive_batch_indices[:(
+                        self.decode_bsz - num_decodes)]
 
         if lora_ids is not None:
             self.decode_batch_inputs["lora_ids"][:num_decodes,0] = lora_ids
@@ -527,7 +533,7 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
 
         outputs = self.session.run(self.decode_batch_inputs)
         logits: np.ndarray = outputs["logits"]
-        decode_rows = np.asarray(batch_indices[:num_decodes], dtype=np.int64)
+        decode_rows = np.arange(num_decodes, dtype=np.int64)
         if decode_lengths is not None:
             return np.concatenate(
                 [

@@ -1185,7 +1185,7 @@ HF model / tokenizer 解析到：
 | `vllm-qaic/vllm_qaic/platform.py` | 從 `additional_config["max_seq_len_to_capture"]` 寫回 `model_config.max_seq_len_to_capture`，避免 `prefill_seq_len` 被錯算成 `max_model_len=2048` |
 | `vllm-qaic/vllm_qaic/model_loader.py` | logits vocab size 優先從 QPC allowed shapes 取最後一維，避免把 `96 * vocab_size` 誤當 vocab size |
 | `vllm-qaic/vllm_qaic/session.py` | `unskip_buffers()` 對 retained-state buffer 優先使用 allowed shapes 的最大維度，避免 output retained-state shape 停在 binding 預設 batch 1 |
-| `vllm-qaic/vllm_qaic/model_loader.py` | decode output 依 `batch_indices` 取 QPC row，而不是直接取 compact decode row |
+| `vllm-qaic/vllm_qaic/model_loader.py` | decode output row selection 後續再修正為 active compact row；詳見 12.5 |
 | `vllm-qaic/vllm_qaic/model_loader.py` | 非 disagg 模式對齊 fork：`past_*` input 與 `_RetainedState` output 必須 `skip_buffers()`，不能 `unskip_buffers()` |
 
 這些修補後，以下條件已成立：
@@ -1261,7 +1261,7 @@ OUTPUT: 台北是台灣的首都，一個融合了現代與傳統、繁忙與寧
 
 這避免把 `96 * vocab_size` 誤判成 vocab size，造成 logits buffer shape 變成 `1 x 1 x 14598144`。
 
-3. decode output 用 `batch_indices` 取 QPC row。
+3. decode output row selection 的中間修補（後續已被 12.5 取代）。
 
 ```diff
          outputs = self.session.run(self.decode_batch_inputs)
@@ -1282,7 +1282,7 @@ OUTPUT: 台北是台灣的首都，一個融合了現代與傳統、繁忙與寧
 +        return logits[decode_rows].squeeze(1)
 ```
 
-`batch_index` 已經傳給 QPC，回讀 logits 時也應以 request slot / batch row 對齊，而不是直接用 compact decode row。
+這個版本後續被證明不完整：對 QPC decode output 而言，回傳 logits 的 row order 仍是 compact active decode rows；`batch_index` 是 QPC 內部更新 retained-state slot 用，不應用來索引回傳 logits。最終修正見 12.5。
 
 #### `vllm-qaic/vllm_qaic/platform.py`
 
@@ -1315,3 +1315,109 @@ Python offline API 沒有 CLI 的 `--max-seq-len-to-capture` keyword，因此 QA
 ```
 
 這是防守性修補：雖然非 disagg 正確路徑已經會 `skip_buffers()`，但 disagg / 其他 retained-state 用法仍可能需要 `unskip_buffers()`，此時 shape 應以 QPC allowed shapes 為準。
+
+### 12.5 修復 sequential offline request 第二筆亂碼 / `!` 連發
+
+#### 錯誤現象
+
+在同一個 `LLM` instance 內連續執行多個 offline request 時，第一筆 request 輸出正常，但第二筆開始會出現亂碼或大量 `!`：
+
+```text
+REQ 1 OUTPUT: ' 成都是四川省的省會，是一座歷史文化與現代文明交融的城市。'
+REQ 2 OUTPUT: ' �!!!!!!!!!!!!!!!!!!!!!!!'
+REQ 3 OUTPUT: ' ______!!!!!!!!!!!!!!!!!!!!!!!'
+REQ 4 OUTPUT: ' !!!!!!!!!!!!!!!!!!!!!!!'
+```
+
+此問題同時出現在：
+
+- fp16 KV QPC：`qpc-30b1c39ccba6a4fc/qpc`
+- fp8 / mxint8 KV QPC：`qpc-1c76199bcb608b83/qpc`
+- offline sequential `llm.generate([prompt])` 多次呼叫
+- online server 的多次 request 路徑
+
+#### 排除過程
+
+已確認不是以下原因：
+
+- 不是 sampler 問題：argmax logits 與 sampled token 一致，錯誤已存在於 QPC logits。
+- 不是 prompt packing 問題：debug 顯示第二筆進 QPC 前的 `input_ids` / `positions` 仍正確。
+- 不是 vLLM block id / `batch_index` 重用問題：改成每個 request 使用新的 QAIC slot 後仍錯。
+- 不是單純 `past_key/value` 沒有補零：prefill 明確餵 zero past inputs 後仍錯，且會引入額外 runtime 風險。
+
+debug 期間看到第二筆 prefill 進 QPC 前資料是乾淨的：
+
+```text
+QAIC_DEBUG prefill req_ids=['1-8748b1d3']
+batch_indices=[1]
+token_counts=[7]
+input_ids=[100792, 11622, 104670, 86077, 111748, 106756, 1773]
+positions=[0, 1, 2, 3, 4, 5, 6]
+```
+
+#### 根因
+
+0.21 port 在 `_run_decode()` 內把 QPC decode output 當成「以 `batch_index` 排列的 full batch logits」讀取：
+
+```python
+decode_rows = np.asarray(batch_indices[:num_decodes], dtype=np.int64)
+return logits[decode_rows].squeeze(1)
+```
+
+但參考舊 `qserve_model_runner.py` 後確認，QPC decode output 的有效 logits row order 是 **compact active decode row order**，不是 `batch_index` order。
+
+也就是說：
+
+- `batch_index` 用來告訴 QPC 要更新哪個 retained-state slot。
+- `outputs["logits"]` 回傳時，active requests 仍在 row `0..num_decodes-1`。
+- 第二筆 request 的 `batch_index=1` 時，舊寫法會讀 `logits[1]`，等於讀到 inactive row，造成 `�` / `!` 連發。
+
+另外 inactive decode rows 的 `batch_index` 也對齊舊 runner：不要填 `-1`，而是填入本輪未使用的合法 slot id；inactive rows 的 `input_ids` / `position_ids` 仍維持 `-1`。
+
+#### 最終 code diff
+
+`vllm-qaic/vllm_qaic/model_loader.py`
+
+```diff
+         if not self.ignore_batch_index:
+-            self.decode_batch_inputs["batch_index"][:num_decodes,0] = batch_indices
++            self.decode_batch_inputs["batch_index"][:num_decodes,
++                                                     0] = batch_indices
+             if num_decodes < self.decode_bsz:
+-                self.decode_batch_inputs["batch_index"][num_decodes:] = -1
++                active_batch_indices = set(batch_indices[:num_decodes])
++                inactive_batch_indices = [
++                    idx for idx in range(self.decode_bsz)
++                    if idx not in active_batch_indices
++                ]
++                self.decode_batch_inputs["batch_index"][
++                    num_decodes:, 0] = inactive_batch_indices[:(
++                        self.decode_bsz - num_decodes)]
+
+         outputs = self.session.run(self.decode_batch_inputs)
+         logits: np.ndarray = outputs["logits"]
+-        decode_rows = np.asarray(batch_indices[:num_decodes], dtype=np.int64)
++        decode_rows = np.arange(num_decodes, dtype=np.int64)
+```
+
+#### 驗證結果
+
+fp16 KV QPC offline multiple request 通過：
+
+```text
+REQ 1 OUTPUT: ' 成都是四川省的省會，是一座歷史文化與現代文明交融的城市。'
+REQ 2 OUTPUT: ' 台北是台灣的首都，一個融合現代與傳統、多元文化與美食的城市。'
+REQ 3 OUTPUT: ' ________．____\nA. Paris\nB. London\nC. Berlin\nD. Rome\n答案:\nA'
+REQ 4 OUTPUT: ' 人工智慧是指由電腦模擬和複製人類智慧和行為的技術。'
+```
+
+fp8 / mxint8 KV QPC offline multiple request 也通過：
+
+```text
+REQ 1 OUTPUT: ' 成都是四川省的省會，是一座歷史文化與現代文明交融的城市。'
+REQ 2 OUTPUT: ' 台北是台灣的首都，一個融合現代與傳統、多元文化與美食的城市。'
+REQ 3 OUTPUT: ' ________．____\nA. Paris\nB. London\nC. Berlin\nD. Rome\n答案:\nA'
+REQ 4 OUTPUT: ' 人工智慧是指由電腦或其他機器模擬、延伸和拓展人類智能的一門技術。'
+```
+
+結論：sequential offline / online multi-request 亂碼問題的主因是 decode logits row selection 錯誤。修正後 fp16 與 fp8 QPC 的多筆 request 輸出均正常。
