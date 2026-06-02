@@ -304,7 +304,14 @@ class DisAgg_QAICInferenceSession:
         for binding in bindings:
             aic_dtype: int = binding.type
             np_dtype: np.dtype = aic_to_np_dtype_mapping[aic_dtype]
-            dims: List[int] = binding.dims
+            allowed_dims = [
+                allowed_shape[binding.index][1]
+                for allowed_shape in self.allowed_shapes
+                if binding.index < len(allowed_shape)
+            ]
+            dims: List[int] = max(
+                allowed_dims, key=lambda shape: int(np.prod(shape))
+            ) if allowed_dims else binding.dims
             arr = np.zeros(dims, dtype=np_dtype)
             buffers[binding.name] = arr
         self.set_buffers(buffers, index)

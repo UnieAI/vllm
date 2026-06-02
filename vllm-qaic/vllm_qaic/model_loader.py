@@ -203,10 +203,10 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
         if not self.disagg_serving_en:
             self.session = QAICInferenceSession(qpc_path, device_ids=device_id)
 
-            self.session.unskip_buffers(
+            self.session.skip_buffers(
                 [x for x in self.session.input_names if x.startswith("past_")]
             )
-            self.session.unskip_buffers(
+            self.session.skip_buffers(
                 [x for x in self.session.output_names if x.endswith("_RetainedState")]
             )
         else:
@@ -232,9 +232,11 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
                 )
         self.comp_ctx_lengths_prefill, self.comp_ctx_lengths_decode = self.get_comp_ctx_lengths()
         if "logits" in self.session.binding_index_map:
-            logits_binding = self.session.bindings[
-                self.session.binding_index_map["logits"]]
-            qpc_vocab_size = logits_binding.dims[-1]
+            logits_shapes = self.session.get_bindings_shapes(["logits"]).get(
+                "logits", [])
+            qpc_vocab_size = logits_shapes[0][-1] if logits_shapes else (
+                self.session.bindings[
+                    self.session.binding_index_map["logits"]].dims[-1])
             if qpc_vocab_size != self.vocab_size:
                 logger.warning(
                     "QPC logits vocab size (%s) differs from HF config vocab "
@@ -525,13 +527,17 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
 
         outputs = self.session.run(self.decode_batch_inputs)
         logits: np.ndarray = outputs["logits"]
+        decode_rows = np.asarray(batch_indices[:num_decodes], dtype=np.int64)
         if decode_lengths is not None:
             return np.concatenate(
-                [logits[i, :num_tokens] for i, num_tokens in enumerate(decode_lengths)],
+                [
+                    logits[row, :num_tokens]
+                    for row, num_tokens in zip(decode_rows, decode_lengths)
+                ],
                 axis=0)
         if self.is_spec_decode_target_model:
-            return logits[:num_decodes, 0]
-        return logits[:num_decodes].squeeze(1)
+            return logits[decode_rows, 0]
+        return logits[decode_rows].squeeze(1)
 
     def run_encode(
         self, qpc_inputs: dict, encode_num_logits_buffer: Optional[dict] = None

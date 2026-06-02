@@ -121,6 +121,9 @@ class QaicPlatform(Platform):
         # block_size for QAIC: one logical block == full context (ctx_len).
         cache_config = vllm_config.cache_config
         model_config = vllm_config.model_config
+        max_seq_len_to_capture = qaic_cfg.get("max_seq_len_to_capture")
+        if max_seq_len_to_capture is not None:
+            model_config.max_seq_len_to_capture = int(max_seq_len_to_capture)
         if (
             model_config is not None
             and not hasattr(model_config, "max_seq_len_to_capture")
