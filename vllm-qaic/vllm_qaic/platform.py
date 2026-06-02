@@ -29,7 +29,11 @@ if TYPE_CHECKING:
 
 class QaicPlatform(Platform):
     _enum = PlatformEnum.OOT
-    device_name: str = "qaic"
+    # vLLM still uses `device_name` in a few places to construct torch.device
+    # strings (for example distributed GroupCoordinator). QAIC is not a torch
+    # device type, so use CPU for host-side coordination and expose the hardware
+    # name through get_device_name().
+    device_name: str = "cpu"
     device_type: str = "qaic"
     # Host-side tensors live on CPU; real compute runs on the AIC via qaicrt.
     dispatch_key: str = "CPU"
@@ -53,8 +57,23 @@ class QaicPlatform(Platform):
         return torch.no_grad()
 
     @classmethod
+    def set_device(cls, device: torch.device) -> None:
+        # QAIC execution is owned by qaicrt; vLLM host-side tensors remain CPU.
+        return None
+
+    @classmethod
+    def manual_seed_all(cls, seed: int) -> None:
+        torch.manual_seed(seed)
+
+    @classmethod
     def is_pin_memory_available(cls) -> bool:
         return False
+
+    def uses_host_device_handling(self) -> bool:
+        # QAIC is not a torch device type. vLLM host tensors stay on CPU while
+        # the compiled QPC executes on the AIC through qaicrt, so DeviceConfig
+        # must not call torch.device("qaic").
+        return True
 
     @classmethod
     def supports_v1(cls, model_config: "ModelConfig") -> bool:
@@ -78,17 +97,21 @@ class QaicPlatform(Platform):
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         parallel_config = vllm_config.parallel_config
+        scheduler_config = vllm_config.scheduler_config
 
         # This plugin supports the V1 engine ONLY. The fork's V0 path
         # (and ~half of the Qualcomm core patch) is intentionally dropped.
         if parallel_config.worker_cls == "auto":
-            assert envs.VLLM_USE_V1, (
+            assert getattr(envs, "VLLM_USE_V1", True), (
                 "vllm-qaic supports the V1 engine only. Set VLLM_USE_V1=1."
             )
             parallel_config.worker_cls = "vllm_qaic.worker.QaicWorker"
 
         if parallel_config.world_size > 1:
             parallel_config.distributed_executor_backend = "uni"
+
+        if scheduler_config is not None:
+            scheduler_config.async_scheduling = False
 
         # QAIC knobs come from --additional-config '{"num_cores":16, ...}'
         # (replaces the fork's --override-qaic-config / --device-group).
@@ -98,8 +121,16 @@ class QaicPlatform(Platform):
         # block_size for QAIC: one logical block == full context (ctx_len).
         cache_config = vllm_config.cache_config
         model_config = vllm_config.model_config
+        if (
+            model_config is not None
+            and not hasattr(model_config, "max_seq_len_to_capture")
+        ):
+            model_config.max_seq_len_to_capture = model_config.max_model_len
         if cache_config is not None:
-            if envs.VLLM_USE_V1 and cache_config.enable_prefix_caching:
+            if (
+                getattr(envs, "VLLM_USE_V1", True)
+                and cache_config.enable_prefix_caching
+            ):
                 cache_config.enable_prefix_caching = False
                 logger.warning_once(
                     "Prefix caching is not supported on QAIC V1; disabling.")

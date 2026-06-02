@@ -28,6 +28,7 @@ from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.kv_transfer import has_kv_transfer_group
 from vllm.logger import init_logger
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
+from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.kv_cache_interface import FullAttentionSpec
@@ -75,6 +76,8 @@ class QaicModelRunner(GPUModelRunner):
         # QAIC host (allocating device buffers, querying torch.cuda, cudagraphs).
         assert device == torch.device("cpu"), "QAIC keeps host tensors on CPU."
         super().__init__(vllm_config, device)
+        self._postprocess_host_tensors()
+        self._postprocess_cpu_kernels()
 
         # --- UnieAI ngram gating (ported verbatim from the fork) ------------
         self.speculative_model_type: Optional[str] = None
@@ -89,7 +92,11 @@ class QaicModelRunner(GPUModelRunner):
         assert not self.uses_mrope, "mrope is not supported on QAIC."
         assert not self.supports_mm_inputs, "multimodal is not supported on QAIC."
 
-        self.max_seq_len = self.model_config.max_seq_len_to_capture
+        self.max_seq_len = getattr(
+            self.model_config,
+            "max_seq_len_to_capture",
+            self.model_config.max_model_len,
+        )
         self.num_kv_heads = self.model_config.get_num_kv_heads(
             self.parallel_config)
         self.head_size = self.model_config.get_head_size()
@@ -99,6 +106,96 @@ class QaicModelRunner(GPUModelRunner):
         # InputBatch + CpuGpuBuffer (self.input_ids). Re-fit against the new
         # InputBatch field names before calling it.
         # self._postprocess_tensors()
+
+    def _postprocess_host_tensors(self) -> None:
+        def replace_tensor(obj: Any, cpu_attr_name: str,
+                           device_attr_name: str) -> None:
+            cpu_tensor = getattr(obj, cpu_attr_name, None)
+            device_tensor = getattr(obj, device_attr_name, None)
+            if isinstance(cpu_tensor, torch.Tensor) and isinstance(
+                    device_tensor, torch.Tensor):
+                setattr(obj, device_attr_name, cpu_tensor)
+
+        for value in vars(self).values():
+            if isinstance(value, CpuGpuBuffer):
+                value.gpu = value.cpu
+
+        for key, value in vars(self.input_batch).items():
+            if key.endswith("_cpu_tensor") and isinstance(value, torch.Tensor):
+                replace_tensor(self.input_batch, key, key[:-11])
+
+        for block_table in self.input_batch.block_table.block_tables:
+            for value in vars(block_table).values():
+                if isinstance(value, CpuGpuBuffer):
+                    value.gpu = value.cpu
+
+    def _postprocess_cpu_kernels(self) -> None:
+        import vllm.v1.worker.block_table
+
+        class _PythonSlotMappingKernel:
+            def __getitem__(self, grid):
+                def launch(
+                    num_tokens,
+                    max_num_tokens,
+                    query_start_loc,
+                    positions,
+                    block_table,
+                    block_table_stride,
+                    block_size,
+                    slot_mapping,
+                    *,
+                    TOTAL_CP_WORLD_SIZE,
+                    TOTAL_CP_RANK,
+                    CP_KV_CACHE_INTERLEAVE_SIZE,
+                    PAD_ID,
+                    BLOCK_SIZE,
+                ):
+                    slot_mapping[num_tokens:max_num_tokens].fill_(PAD_ID)
+                    virtual_block_size = block_size * TOTAL_CP_WORLD_SIZE
+                    num_reqs = int(query_start_loc.numel() - 1)
+                    for req_idx in range(num_reqs):
+                        start = int(query_start_loc[req_idx].item())
+                        end = int(query_start_loc[req_idx + 1].item())
+                        for offset in range(start, end):
+                            pos = int(positions[offset].item())
+                            block_index = pos // virtual_block_size
+                            block_number = int(block_table[req_idx,
+                                                           block_index].item())
+                            virtual_block_offset = (
+                                pos - block_index * virtual_block_size)
+                            is_local = (
+                                virtual_block_offset //
+                                CP_KV_CACHE_INTERLEAVE_SIZE
+                            ) % TOTAL_CP_WORLD_SIZE == TOTAL_CP_RANK
+                            local_block_offset = (
+                                virtual_block_offset // (
+                                    TOTAL_CP_WORLD_SIZE *
+                                    CP_KV_CACHE_INTERLEAVE_SIZE)
+                            ) * CP_KV_CACHE_INTERLEAVE_SIZE + (
+                                virtual_block_offset %
+                                CP_KV_CACHE_INTERLEAVE_SIZE)
+                            slot_mapping[offset] = (
+                                block_number * block_size + local_block_offset
+                                if is_local else PAD_ID)
+
+                return launch
+
+        vllm.v1.worker.block_table._compute_slot_mapping_kernel = (
+            _PythonSlotMappingKernel())
+
+    def _init_device_properties(self) -> None:
+        # GPUModelRunner expects a CUDA SM count for heuristics. QAIC execution
+        # is delegated to a precompiled QPC, so keep a harmless host-side value.
+        self.num_sms = 1
+
+    def _sync_device(self) -> None:
+        # qaicrt/session calls are synchronous from this runner's perspective.
+        return None
+
+    def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
+        if sampled_token_ids.device.type != "cpu":
+            sampled_token_ids = sampled_token_ids.cpu()
+        return sampled_token_ids.tolist()
 
     # -------------------------------------------------------------------------
     # execute_model  ***THE BIG ARCHITECTURAL BREAK***
@@ -251,7 +348,7 @@ class QaicModelRunner(GPUModelRunner):
             hidden_states,
             self.input_batch.sampling_metadata,
         )
-        if scheduler_output.grammar_bitmask is not None:
+        if getattr(scheduler_output, "grammar_bitmask", None) is not None:
             raise NotImplementedError(
                 "Grammar bitmask is not supported by V1 QAICModelRunner.")
 
@@ -544,7 +641,7 @@ class QaicModelRunner(GPUModelRunner):
     def get_kv_cache_spec(self) -> dict[str, "KVCacheSpec"]:
         """Ported from the fork (low risk). Builds one FullAttentionSpec per
         layer. OLD==NEW shape; verify FullAttentionSpec fields on your target
-        (block_size, num_kv_heads, head_size, dtype, use_mla).
+        (block_size, num_kv_heads, head_size, dtype).
         """
         block_size = self.cache_config.block_size
         kv_cache_spec: dict[str, "KVCacheSpec"] = {}
@@ -556,7 +653,6 @@ class QaicModelRunner(GPUModelRunner):
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
                 dtype=self.kv_cache_dtype,
-                use_mla=False,
             )
         return kv_cache_spec
 

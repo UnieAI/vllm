@@ -17,11 +17,11 @@ import requests
 from multiprocessing import Queue
 from transformers import PretrainedConfig, AutoModelForCausalLM
 from vllm.config import VllmConfig, ModelConfig, PoolerConfig
-from vllm.model_executor.layers.pooler import DispatchPooler, Pooler, PoolingType
-from vllm.model_executor.pooling_metadata import PoolingMetadata
-from vllm.sequence import IntermediateTensors, PoolerOutput
-from vllm.entrypoints.openai.serving_models import LoRAModulePath
-from peft import PeftConfig
+from vllm.model_executor.layers.pooler import DispatchPooler, Pooler
+from vllm.sequence import IntermediateTensors
+from vllm.v1.outputs import PoolerOutput
+from vllm.v1.pool.metadata import PoolingMetadata
+from vllm.entrypoints.openai.models.protocol import LoRAModulePath
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
@@ -29,7 +29,7 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm_qaic.qserve_model_runner import QServeModelRunner
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import _CONFIG_REGISTRY
-from vllm.utils import cdiv
+from vllm.utils.math_utils import cdiv
 logger = init_logger(__name__)
 
 VLLM_CACHE_DTYPE_TO_QAIC_CACHE_DTYPE = {
@@ -122,12 +122,18 @@ class QaicCausalLM(nn.Module):
         self._pooler = None
         if vllm_config.model_config.runner_type == "pooling" and not vllm_config.model_config.is_multimodal_model:
             assert pooler_config is not None
-            self._pooler = DispatchPooler({
-                "encode": Pooler.for_encode(pooler_config),
-                "embed": Pooler.for_embed(pooler_config),
-                "classify": Pooler.for_classify(pooler_config, None),
-                "score": Pooler.for_classify(pooler_config, None),
-            })
+            if hasattr(Pooler, "for_embed"):
+                self._pooler = DispatchPooler({
+                    "encode": Pooler.for_encode(pooler_config),
+                    "embed": Pooler.for_embed(pooler_config),
+                    "classify": Pooler.for_classify(pooler_config, None),
+                    "score": Pooler.for_classify(pooler_config, None),
+                })
+            else:
+                self._pooler = DispatchPooler({
+                    **DispatchPooler.for_embedding(pooler_config).poolers_by_task,
+                    **DispatchPooler.for_seq_cls(pooler_config).poolers_by_task,
+                })
         # below variables are specific for turbo run
 
         # init variables to hold speculations for prefill/decode
@@ -149,6 +155,12 @@ class QaicCausalLM(nn.Module):
             self.hidden_states = torch.arange(precode_len).view(1, precode_len, 1).expand(bs, precode_len, 1)
             self.extracted_hidden_states = self.hidden_states[:,0]
             self.batch_indices = torch.arange(bs)
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError(
+            "QAIC executes token embeddings inside the compiled QPC; "
+            "embed_input_ids is present only for vLLM generation protocol "
+            "detection.")
 
     def forward(
         self,
@@ -651,12 +663,17 @@ def _get_qaic_compile_config(
 
     qaic_extra_config = _qaic_additional_config(vllm_config)
     device_group = qaic_extra_config.get("device_group")
+    max_seq_len_to_capture = getattr(
+        vllm_config.model_config,
+        "max_seq_len_to_capture",
+        vllm_config.model_config.max_model_len,
+    )
 
     # Prepare default config
     cfg = {
         "qpc_path": None,
-        "prefill_seq_len": vllm_config.model_config.max_seq_len_to_capture,
-        "ctx_len": vllm_config.scheduler_config.max_model_len,
+        "prefill_seq_len": max_seq_len_to_capture,
+        "ctx_len": vllm_config.model_config.max_model_len,
         "batch_size": 1,
         "full_batch_size": vllm_config.scheduler_config.max_num_seqs,
         "kv_cache_batch_size": kv_cache_batch_size,
@@ -1062,6 +1079,8 @@ def get_qaic_model(model: QaicCausalLM,
     return model.eval()
 
 def search_adapters_in_cache(base_model_name) -> List[str]:
+    from peft import PeftConfig
+
     cached_lora_module_paths = []
 
     hf_home = os.environ.get("HF_HOME", None)

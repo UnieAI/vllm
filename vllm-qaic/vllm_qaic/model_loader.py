@@ -86,6 +86,12 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
         if self.lora_mode:
             self.decode_batch_inputs["lora_ids"] = np.full((self.decode_bsz,1),-1, dtype=np.int64)
 
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError(
+            "QAIC executes token embeddings inside the compiled QPC; "
+            "embed_input_ids is present only for vLLM generation protocol "
+            "detection.")
+
     def forward(
         self,
         input_ids: np.ndarray,
@@ -197,10 +203,10 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
         if not self.disagg_serving_en:
             self.session = QAICInferenceSession(qpc_path, device_ids=device_id)
 
-            self.session.skip_buffers(
+            self.session.unskip_buffers(
                 [x for x in self.session.input_names if x.startswith("past_")]
             )
-            self.session.skip_buffers(
+            self.session.unskip_buffers(
                 [x for x in self.session.output_names if x.endswith("_RetainedState")]
             )
         else:
@@ -225,6 +231,18 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
                     y,
                 )
         self.comp_ctx_lengths_prefill, self.comp_ctx_lengths_decode = self.get_comp_ctx_lengths()
+        if "logits" in self.session.binding_index_map:
+            logits_binding = self.session.bindings[
+                self.session.binding_index_map["logits"]]
+            qpc_vocab_size = logits_binding.dims[-1]
+            if qpc_vocab_size != self.vocab_size:
+                logger.warning(
+                    "QPC logits vocab size (%s) differs from HF config vocab "
+                    "size (%s); using QPC shape for QAIC runtime buffers.",
+                    qpc_vocab_size, self.vocab_size)
+                self.vocab_size = qpc_vocab_size
+                self.logits_processor = LogitsProcessor(
+                    self.vocab_size, logits_as_input=True)
         e = time.perf_counter() - s
         logger.info(f"Successfully loaded QPC in {e} secs")
 
@@ -267,6 +285,16 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
             self.ignore_batch_index = False
         else:
             self.ignore_batch_index = True
+            self.decode_batch_inputs.pop("batch_index", None)
+
+        input_ids_binding = self.session.bindings[
+            self.session.binding_index_map["input_ids"]]
+        qpc_input_width = input_ids_binding.dims[1]
+        if qpc_input_width != self.decode_batch_inputs["input_ids"].shape[1]:
+            self.decode_batch_inputs["input_ids"] = np.full(
+                (self.decode_bsz, qpc_input_width), -1, dtype=np.int64)
+            self.decode_batch_inputs["position_ids"] = np.full(
+                (self.decode_bsz, qpc_input_width), -1, dtype=np.int64)
         if self.disagg_producer_en:
             self.decode_bsz = 0
 

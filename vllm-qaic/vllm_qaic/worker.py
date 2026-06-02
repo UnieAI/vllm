@@ -17,9 +17,9 @@ from vllm.distributed import (
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
-from vllm.model_executor import set_random_seed
 from vllm.tasks import SupportedTask
-from vllm.utils import cdiv
+from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.core.kv_cache_utils import get_uniform_page_size
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
@@ -56,9 +56,12 @@ class QaicWorker(WorkerBase):
 
         if self.model_config.trust_remote_code:
             # note: lazy import to avoid importing torch before initializing
-            from vllm.utils import init_cached_hf_modules
-
-            init_cached_hf_modules()
+            try:
+                from vllm.utils import init_cached_hf_modules
+            except ImportError:
+                init_cached_hf_modules = None
+            if init_cached_hf_modules is not None:
+                init_cached_hf_modules()
 
         self.profiler = None
 
@@ -100,7 +103,7 @@ class QaicWorker(WorkerBase):
 
     def init_device(self) -> None:
         """Initialize qaic device"""
-        self.device = self.device_config.device
+        self.device = self.device_config.device or torch.device("cpu")
 
         init_qaic_worker_distributed_environment(
             self.vllm_config,
@@ -192,7 +195,7 @@ class QaicWorker(WorkerBase):
             # This is a hack for time-being as
             # multi-modality support is only for single batch currrently
             num_gpu_blocks *= 2
-        page_size = get_uniform_page_size(self.get_kv_cache_spec())
+        page_size = get_uniform_page_size(self.get_kv_cache_spec().values())
         return (
             num_gpu_blocks
             * page_size
@@ -273,4 +276,5 @@ def init_qaic_worker_distributed_environment(
         1,
         1,
     )
-    ensure_kv_transfer_initialized(vllm_config)
+    if vllm_config.kv_transfer_config is not None:
+        ensure_kv_transfer_initialized(vllm_config, None)

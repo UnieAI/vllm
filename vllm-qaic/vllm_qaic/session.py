@@ -656,3 +656,6 @@ class DisAgg_QAICInferenceSession:
             raise ValueError(error_message)
         self.execObj_ids_dict[self.execObj[index].getId()] = -1
         self.execObj_available += 1
+
+
+QAICInferenceSession = DisAgg_QAICInferenceSession
