@@ -232,6 +232,9 @@ class QaicModelRunner(GPUModelRunner):
                 "execute_model() returns None.")
 
         deferred_state_corrections_fn = self._update_states(scheduler_output)
+        if self.num_prompt_logprobs:
+            raise NotImplementedError(
+                "prompt_logprobs is not supported by V1 QAICModelRunner.")
         if not scheduler_output.total_num_scheduled_tokens:
             if not has_kv_transfer_group():
                 return EMPTY_MODEL_RUNNER_OUTPUT
@@ -272,37 +275,56 @@ class QaicModelRunner(GPUModelRunner):
             self.input_batch.num_computed_tokens_cpu[:num_reqs]
             >= self.input_batch.num_prompt_tokens[:num_reqs]
         )
-        num_decodes = int(is_decode.sum())
+        decode_req_indices = np.nonzero(is_decode)[0]
+        prefill_req_indices = np.nonzero(~is_decode)[0]
+        num_decodes = int(decode_req_indices.size)
 
         block_table = self.input_batch.block_table[0].get_numpy_array()
-        batch_indices = block_table[:num_reqs, 0].astype(np.int64) - 1
+        block_ids = block_table[:num_reqs, 0].astype(np.int64)
+        if np.any(block_ids < 1):
+            raise RuntimeError(
+                "QAIC expects allocated vLLM KV block ids to be >= 1; "
+                f"got {block_ids.tolist()}.")
+        batch_indices = block_ids - 1
 
-        decode_block_ids = batch_indices[:num_decodes]
+        token_starts = np.concatenate((
+            np.array([0], dtype=cu_num_tokens.dtype),
+            cu_num_tokens[:-1],
+        ))
+        token_ends = cu_num_tokens
+        decode_token_counts = num_scheduled_tokens_np[decode_req_indices]
+        prefill_token_counts = num_scheduled_tokens_np[prefill_req_indices]
+
+        decode_token_indices = self._qaic_flatten_req_token_indices(
+            decode_req_indices, token_starts, token_ends)
+        prefill_token_indices = self._qaic_flatten_req_token_indices(
+            prefill_req_indices, token_starts, token_ends)
+        decode_cu_num_tokens = np.cumsum(decode_token_counts, dtype=np.int32)
+        prefill_cum_sum = np.cumsum(prefill_token_counts, dtype=np.int32)
+
+        decode_block_ids = batch_indices[decode_req_indices]
         decode_lora_ids: Optional[np.ndarray] = None
         prefill_lora_ids: Optional[np.ndarray] = None
         if self.lora_config:
             request_lora_mapping = self.input_batch.request_lora_mapping
-            decode_lora_ids = request_lora_mapping[:num_decodes]
-            prefill_lora_ids = request_lora_mapping[num_decodes:num_reqs]
+            decode_lora_ids = request_lora_mapping[decode_req_indices]
+            prefill_lora_ids = request_lora_mapping[prefill_req_indices]
 
         (
             decode_input_ids,
             decode_positions,
             decode_lengths,
-            decode_token_count,
+            _,
         ) = self._pack_decode_batch(
-            input_ids,
-            positions_np,
+            input_ids[decode_token_indices],
+            positions_np[decode_token_indices],
             num_decodes,
-            cu_num_tokens,
+            decode_cu_num_tokens,
         )
 
-        prefill_input_ids = input_ids[
-            decode_token_count:total_num_scheduled_tokens]
-        prefill_positions = positions_np[
-            decode_token_count:total_num_scheduled_tokens]
-        prefill_block_ids = batch_indices[num_decodes:num_reqs]
-        prefill_cum_sum = cu_num_tokens[num_decodes:] - decode_token_count
+        prefill_input_ids = input_ids[prefill_token_indices]
+        prefill_positions = positions_np[prefill_token_indices]
+        prefill_block_ids = batch_indices[prefill_req_indices]
 
         hidden_states_decode = (
             self.model(
@@ -333,16 +355,13 @@ class QaicModelRunner(GPUModelRunner):
             else None
         )
 
-        if hidden_states_prefill is not None and hidden_states_decode is not None:
-            hidden_states = torch.cat(
-                (hidden_states_decode, hidden_states_prefill), dim=0)
-        else:
-            hidden_states = (
-                hidden_states_prefill
-                if hidden_states_prefill is not None
-                else hidden_states_decode
-            )
-        assert hidden_states is not None
+        hidden_states = self._qaic_merge_model_outputs(
+            hidden_states_decode,
+            hidden_states_prefill,
+            decode_req_indices,
+            prefill_req_indices,
+            decode_token_counts,
+        )
 
         logits = self.model.compute_logits(
             hidden_states,
@@ -405,6 +424,87 @@ class QaicModelRunner(GPUModelRunner):
             num_nans_in_logits=num_nans_in_logits,
             routed_experts=None,
         )
+
+    @staticmethod
+    def _qaic_flatten_req_token_indices(
+        req_indices: np.ndarray,
+        token_starts: np.ndarray,
+        token_ends: np.ndarray,
+    ) -> np.ndarray:
+        if req_indices.size == 0:
+            return np.empty(0, dtype=np.int64)
+        return np.concatenate([
+            np.arange(token_starts[i], token_ends[i], dtype=np.int64)
+            for i in req_indices
+        ])
+
+    @staticmethod
+    def _qaic_merge_model_outputs(
+        hidden_states_decode: Optional[torch.Tensor],
+        hidden_states_prefill: Optional[torch.Tensor],
+        decode_req_indices: np.ndarray,
+        prefill_req_indices: np.ndarray,
+        decode_token_counts: np.ndarray,
+    ) -> torch.Tensor:
+        """Restore QAIC QPC outputs to the row order vLLM sampling expects.
+
+        QAIC must run decode and prefill requests through separate QPC shapes.
+        Unlike the fork, the 0.21 port does not reorder InputBatch into
+        decode-first order. Build QPC inputs by mask, then scatter the returned
+        logits back to request/logits order before sampling.
+        """
+        pieces: list[torch.Tensor] = []
+        if hidden_states_decode is not None:
+            decode_rows: list[torch.Tensor] = []
+            cursor = 0
+            for count in decode_token_counts:
+                next_cursor = cursor + int(count)
+                decode_rows.append(hidden_states_decode[cursor:next_cursor])
+                cursor = next_cursor
+            if cursor != hidden_states_decode.shape[0]:
+                raise RuntimeError(
+                    "QAIC decode output row count does not match scheduled "
+                    "decode tokens: got "
+                    f"{hidden_states_decode.shape[0]}, expected {cursor}.")
+        else:
+            decode_rows = []
+            if decode_req_indices.size:
+                raise RuntimeError(
+                    "QAIC decode output is missing for scheduled decode "
+                    "requests.")
+
+        if hidden_states_prefill is not None:
+            prefill_rows = list(hidden_states_prefill)
+            if len(prefill_rows) != prefill_req_indices.size:
+                raise RuntimeError(
+                    "QAIC prefill output row count does not match scheduled "
+                    f"prefills: got {len(prefill_rows)}, expected "
+                    f"{prefill_req_indices.size}.")
+        else:
+            prefill_rows = []
+            if prefill_req_indices.size:
+                raise RuntimeError(
+                    "QAIC prefill output is missing for scheduled prefill "
+                    "requests.")
+
+        decode_by_req = {
+            int(req_idx): row
+            for req_idx, row in zip(decode_req_indices, decode_rows)
+        }
+        prefill_by_req = {
+            int(req_idx): row.unsqueeze(0)
+            for req_idx, row in zip(prefill_req_indices, prefill_rows)
+        }
+        for req_idx in sorted((*decode_by_req.keys(), *prefill_by_req.keys())):
+            if req_idx in decode_by_req:
+                pieces.append(decode_by_req[req_idx])
+            else:
+                pieces.append(prefill_by_req[req_idx])
+
+        if not pieces:
+            raise RuntimeError("QAIC model execution produced no logits.")
+
+        return torch.cat(pieces, dim=0)
 
     # -------------------------------------------------------------------------
     # 2D decode packing — UnieAI's ngram change to execute_model, factored out.
