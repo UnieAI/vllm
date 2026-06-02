@@ -364,25 +364,31 @@ class QaicModelRunner(GPUModelRunner):
                 next_cursor = cursor + int(count)
                 decode_rows.append(hidden_states_decode[cursor:next_cursor])
                 cursor = next_cursor
-            assert len(decode_rows) == decode_req_indices.size
-            assert cursor == hidden_states_decode.shape[0], (
-                "QAIC decode output row count does not match scheduled decode "
-                f"tokens: got {hidden_states_decode.shape[0]}, expected {cursor}.")
+            if cursor != hidden_states_decode.shape[0]:
+                raise RuntimeError(
+                    "QAIC decode output row count does not match scheduled "
+                    "decode tokens: got "
+                    f"{hidden_states_decode.shape[0]}, expected {cursor}.")
         else:
             decode_rows = []
-            assert decode_req_indices.size == 0, (
-                "QAIC decode output is missing for scheduled decode requests.")
+            if decode_req_indices.size:
+                raise RuntimeError(
+                    "QAIC decode output is missing for scheduled decode "
+                    "requests.")
 
         if hidden_states_prefill is not None:
             prefill_rows = list(hidden_states_prefill)
-            assert len(prefill_rows) == prefill_req_indices.size, (
-                "QAIC prefill output row count does not match scheduled "
-                f"prefills: got {len(prefill_rows)}, expected "
-                f"{prefill_req_indices.size}.")
+            if len(prefill_rows) != prefill_req_indices.size:
+                raise RuntimeError(
+                    "QAIC prefill output row count does not match scheduled "
+                    f"prefills: got {len(prefill_rows)}, expected "
+                    f"{prefill_req_indices.size}.")
         else:
             prefill_rows = []
-            assert prefill_req_indices.size == 0, (
-                "QAIC prefill output is missing for scheduled prefill requests.")
+            if prefill_req_indices.size:
+                raise RuntimeError(
+                    "QAIC prefill output is missing for scheduled prefill "
+                    "requests.")
 
         decode_by_req = {
             int(req_idx): row
