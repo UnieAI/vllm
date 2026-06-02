@@ -135,6 +135,9 @@ class QaicModelRunner(GPUModelRunner):
                 "execute_model() returns None.")
 
         deferred_state_corrections_fn = self._update_states(scheduler_output)
+        if self.num_prompt_logprobs:
+            raise NotImplementedError(
+                "prompt_logprobs is not supported by V1 QAICModelRunner.")
         if not scheduler_output.total_num_scheduled_tokens:
             if not has_kv_transfer_group():
                 return EMPTY_MODEL_RUNNER_OUTPUT
@@ -361,13 +364,25 @@ class QaicModelRunner(GPUModelRunner):
                 next_cursor = cursor + int(count)
                 decode_rows.append(hidden_states_decode[cursor:next_cursor])
                 cursor = next_cursor
+            assert len(decode_rows) == decode_req_indices.size
+            assert cursor == hidden_states_decode.shape[0], (
+                "QAIC decode output row count does not match scheduled decode "
+                f"tokens: got {hidden_states_decode.shape[0]}, expected {cursor}.")
         else:
             decode_rows = []
+            assert decode_req_indices.size == 0, (
+                "QAIC decode output is missing for scheduled decode requests.")
 
         if hidden_states_prefill is not None:
             prefill_rows = list(hidden_states_prefill)
+            assert len(prefill_rows) == prefill_req_indices.size, (
+                "QAIC prefill output row count does not match scheduled "
+                f"prefills: got {len(prefill_rows)}, expected "
+                f"{prefill_req_indices.size}.")
         else:
             prefill_rows = []
+            assert prefill_req_indices.size == 0, (
+                "QAIC prefill output is missing for scheduled prefill requests.")
 
         decode_by_req = {
             int(req_idx): row
