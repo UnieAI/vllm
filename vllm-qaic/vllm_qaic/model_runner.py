@@ -693,8 +693,45 @@ class QaicModelRunner(GPUModelRunner):
     def _qaic_dummy_run(self) -> None:
         """Warmup hook used by QaicWorker.
 
-        The fork's QPC load path initializes the QAIC sessions when the model is
-        constructed. vLLM 0.21 still calls a worker warmup method, so keep the
-        hook explicit and side-effect free.
+        Mirrors the fork's warmup. Besides shape validation, this primes the
+        QPC prefill/decode phase buffers before the first real request.
         """
-        return None
+        if self.model.disagg_serving_en or self.model.disagg_producer_en:
+            return
+
+        prefill_bsz = self.model.prefill_bsz
+        prefill_input_ids = self.input_batch.token_ids_cpu[
+            :prefill_bsz, :self.max_seq_len].flatten()
+        prefill_positions = self.arange_np[:self.max_seq_len].repeat(prefill_bsz)
+        prefill_block_ids = np.arange(prefill_bsz)
+        prefill_cum_sum = np.array(
+            [self.max_seq_len] * prefill_bsz, dtype=np.int64).cumsum()
+        prefill_lora_ids = None
+        if self.lora_config:
+            prefill_lora_ids = np.arange(prefill_bsz, dtype=np.int64)
+
+        self.model(
+            input_ids=prefill_input_ids,
+            positions=prefill_positions,
+            batch_indices=prefill_block_ids,
+            lora_ids=prefill_lora_ids,
+            is_prompt=True,
+            prefill_cum_sum=prefill_cum_sum,
+        )
+
+        decode_bsz = self.model.decode_bsz
+        decode_input_ids = np.zeros(decode_bsz, dtype=np.int64)
+        decode_positions = np.zeros(decode_bsz, dtype=np.int64)
+        decode_block_ids = np.arange(decode_bsz, dtype=np.int64)
+        decode_lora_ids = None
+        if self.lora_config:
+            decode_lora_ids = np.arange(decode_bsz, dtype=np.int64)
+
+        self.model(
+            input_ids=decode_input_ids,
+            positions=decode_positions,
+            batch_indices=decode_block_ids,
+            lora_ids=decode_lora_ids,
+            is_prompt=False,
+            bypass_model_exec=False,
+        )
