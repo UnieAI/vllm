@@ -12,6 +12,7 @@ releases. After ``pip install vllm==<target>``, open the installed
 (the README PART 1 tells you exactly how). Where unsure, a TODO marks it.
 """
 
+import shlex
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -91,7 +92,8 @@ class QaicPlatform(Platform):
 
         # QAIC knobs come from --additional-config '{"num_cores":16, ...}'
         # (replaces the fork's --override-qaic-config / --device-group).
-        qaic_cfg = dict(vllm_config.additional_config or {})
+        qaic_cfg = cls._normalize_qaic_config(
+            dict(vllm_config.additional_config or {}))
 
         # block_size for QAIC: one logical block == full context (ctx_len).
         cache_config = vllm_config.cache_config
@@ -113,3 +115,31 @@ class QaicPlatform(Platform):
         # and run `_clean_config()` on them before calling QEfficient.compile(),
         # otherwise the compile keys won't match QEfficient's expectations.
         vllm_config.additional_config = qaic_cfg
+
+    @staticmethod
+    def _normalize_qaic_config(config: dict) -> dict:
+        legacy_override = config.pop("override_qaic_config", None)
+        if legacy_override:
+            if isinstance(legacy_override, str):
+                for item in shlex.split(legacy_override):
+                    if "=" in item:
+                        key, value = item.split("=", 1)
+                        config[key] = value
+                    else:
+                        config[item] = True
+            elif isinstance(legacy_override, dict):
+                config.update(legacy_override)
+            else:
+                raise TypeError(
+                    "override_qaic_config must be a string or dict when "
+                    "passed through --additional-config.")
+
+        device_group = config.get("device_group")
+        if isinstance(device_group, str):
+            config["device_group"] = [
+                int(x) for x in device_group.replace(" ", "").split(",") if x
+            ]
+        elif isinstance(device_group, int):
+            config["device_group"] = [device_group]
+
+        return config

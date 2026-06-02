@@ -4,6 +4,12 @@ This is the full work-list for porting the Qualcomm QAIC backend (fork
 `UnieAI/vllm@v1_ngram`, based on upstream **v0.10.1**) onto **vLLM 0.21/0.22**,
 re-packaged as the out-of-tree plugin `vllm-qaic`.
 
+> **Version/status boundary:** the source patch lineage is v0.10.1. The target
+> API is vLLM 0.21/0.22. The current local branch describes as
+> `v0.21.1rc0-162-g...`, not exact `v0.21.0`; exact `v0.21.0` compatibility has
+> not been proven. This document is a migration work-list plus partial port
+> status, not a claim that `vllm serve` already runs on 0.21.
+
 It covers **every file** the Qualcomm "qaic patch" (`bd90d0d`) touched
 (45 new + 40 modified core files), plus UnieAI's own changes, plus the deep
 `GPUModelRunner` old/new comparison.
@@ -33,7 +39,7 @@ that dramatically:
   spec-decode infra). Gone for a V1-only deployment.
 - **Most of the rest are 🟢 PLUGIN** (platform, quant, KV connector, model
   registry, CLI knobs → `--additional-config`).
-- **The genuinely unavoidable core edits (🟠) are a short list** — see §6.
+- **The originally suspected core edits (🟠) are probably avoidable** — see §6.
 - **The real engineering is 🔵 PORT**, concentrated in `QaicModelRunner` (§4).
 
 ---
@@ -265,8 +271,8 @@ narrative. Summary:
 
 | File (fork) | Change | Port status |
 |---|---|---|
-| `vllm/v1/worker/qaic_model_runner.py` | +222: 7 ngram CPU rejection-sampler fns + 2D decode packing + ngram gate | ✅ ported into `vllm_qaic/model_runner.py` (verbatim helpers + `_pack_decode_batch`) |
-| `vllm/model_executor/model_loader/qaic_v1.py` | +27: target QPC emits `N+1` logits | port within `vllm_qaic/model_loader.py` |
+| `vllm/v1/worker/qaic_model_runner.py` | +222: 7 ngram CPU rejection-sampler fns + 2D decode packing + ngram gate | 🟡 ported into `vllm_qaic/model_runner.py` and wired into `execute_model`; not yet AIC-validated |
+| `vllm/model_executor/model_loader/qaic_v1.py` | +27: target QPC emits `N+1` logits | 🟡 ported into `vllm_qaic/model_loader.py`; not yet AIC-validated |
 | `docs/qaic-v1-ngram-speculative.md` | design doc | reference |
 
 ---
@@ -309,10 +315,25 @@ the more readable, fully revised version of this document.)
 1. **GO test first** (README PART 0) — torch wall (gate 1/2). No-go ⇒ stop.
 2. Stand up the plugin shell: 🟢 platform + quant + model/config registration;
    confirm `current_platform == QaicPlatform`.
-3. 🔵 Port low-risk: `session.py`, `model_loader.py`, `get_kv_cache_spec`,
-   `load_model`, `initialize_kv_cache`.
-4. 🔵 Rewrite input-prep (§4.B) — get **non-speculative** prefill/decode working.
-5. 🔵 Re-enable ngram: wire `_pack_decode_batch` + `_qaic_rejection_sample`
-   (already present) into the rebuilt `execute_model`; resolve §4.D RejectionSampler.
-6. 🟠 Decide on `mxint8` (§6.1).
-7. ⚫ Add optional features (pooling / disagg / gpt-oss / MM) only as needed.
+3. ✅ Low-risk files are now ported: `session.py`, `model_loader.py`,
+   `compile_config.py`, `qserve_model_runner.py`, and `worker.py`.
+4. 🟡 Input-prep and `execute_model` are now rewritten against 0.21
+   `InputBatch` / `_prepare_inputs`; next prove **non-speculative**
+   prefill/decode on the AIC host.
+5. 🟡 Ngram `_pack_decode_batch` + `_qaic_rejection_sample` are wired into the
+   rebuilt `execute_model`; enable ngram only after the base path passes.
+6. ⚫ Add optional features (pooling / disagg / gpt-oss / MM) only as needed.
+
+## 8. Current blockers before claiming 0.21 runtime support
+
+- The runtime path has been ported into the plugin and passes local syntax
+  compilation, but has not been run on an AIC host.
+- `qserve_model_runner.py` is carried in the plugin because `qaic.py` /
+  `qaic_v1.py` depend on it and upstream vLLM does not provide it.
+- Gate 1/Gate 2 must pass on an AIC host to prove the split torch 2.7/2.11
+  design.
+- A non-speculative `vllm serve` smoke test must pass before claiming the base
+  0.21 runtime path.
+- Ngram should be enabled only after the base path passes.
+- Exact `v0.21.0` support requires a clean test branch based on the `v0.21.0`
+  tag; the current branch is newer than that tag.

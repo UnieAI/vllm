@@ -3,6 +3,10 @@
 > 面向懂 LLM 推理基础(token、prefill/decode、KV cache、量化、采样)的读者。
 > 更精确的权属/逐行清单见 `UnieAI_Quic_integrated.md`;迁移工单见 `MIGRATION_zh.md`;
 > 最难一步的上机实操见 `REBUILD_input_prep_4B.md`。
+>
+> **版本提醒:**A1/A2/A3/B 说的是既有 v0.10.1 fork/生产线;A4 说的是正在做的
+> vLLM 0.21+ 迁移。当前本地分支不是 exact `v0.21.0` tag;runtime 主路径已经搬进
+> 插件并通过本地语法检查,但还没有完成 AIC 上机验证。
 
 ---
 
@@ -37,6 +41,16 @@ KV cache 常驻卡上(权重 mxfp6、卡上 KV mxint8 由编译器决定)。
 这套和原生 GPU 路径最大的不同:**卡上不是 torch 在算**,torch 只在 host 做采样等轻量
 操作。所以凡是「需要 GPU/Triton kernel」的 vLLM 组件,在 QAIC 上都得换成 CPU 实现 ——
 这是 B(ngram)那块存在的根本原因。
+
+因此版本关系要分清楚:
+
+- host 上的 vLLM 版本负责调度、batching、KV-block 记账、采样和 API server。
+- AI100 上执行的是 QEfficient + Cloud AI SDK 编译好的 QPC;卡上算子在编译期已经固定。
+- host↔AI100 的接口是 `qaicrt` + numpy buffer。
+- 所以把 host vLLM 从 0.10 升到 0.21,本质是 host 端软件/API 迁移,不要求因为
+  vLLM 升级就改 AI100 firmware/kernel/SDK。
+- 但这不是无条件兼容:Python ABI、`qaicrt` 路径、SDK runtime、QPC 格式和 buffer
+  shape 仍必须匹配,需要 Gate 1/2 和 serve smoke test 证明。
 
 ---
 
@@ -90,18 +104,23 @@ QAIC 不能直接跑 PyTorch/HF 模型,必须先经 **QEfficient(efficient-trans
 | 子项 | 具体做了什么 | 状态 |
 |---|---|---|
 | **完整改动盘点** | 把高通 patch 动过的 45 新增 + 40 修改文件全部分类(插件化/移植/丢 V0/小核心补丁);见 `MIGRATION_zh.md` | ✅ 已完成 |
-| **重构为树外插件** | 用 `vllm.platform_plugins` / `register_quantization_config` / `--additional-config` 等官方扩展点,避免 fork 核心;骨架 `vllm-qaic/` 已建 | 🟡 已写,未上机验证 |
-| **ngram 采样器移植** | 7 个函数 + 2D 打包逐字搬到 0.21(只依赖稳定的 sampling API,字段已核对仍在) | 🟡 已写,未上机验证 |
-| **loader/kv_cache 方法** | `load_model` / `get_kv_cache_spec` / `initialize_kv_cache` 按 0.21 新签名移植 | 🟡 已写,未上机验证 |
+| **重构为树外插件** | 用 `vllm.platform_plugins` / `register_quantization_config` / `--additional-config` 等官方扩展点,避免 fork 核心;`vllm-qaic/` 已建 | 🟡 已写,未上机验证 |
+| **ngram 采样器移植** | 7 个函数 + 2D 打包搬到 0.21,并接入 `execute_model` 主流程 | 🟡 已写,未上机验证 |
+| **loader/kv_cache 方法** | `load_model` / `get_kv_cache_spec` / `initialize_kv_cache` 的外层 0.21 签名已对齐;`load_model` 已接到 ported loader | 🟡 已写,未上机验证 |
 | **torch 版本墙** | QEfficient 钉 torch 2.7、vLLM 0.21 钉 2.11,冲突;方案=编译/服务分离;GO 测试脚本已备 | 🔬 **待验证**(go/no-go,需上机跑 gate1/2) |
-| **大文件移植(session/loader)** | 高通专有大文件(~2400 行)用 `port_from_fork.sh` 一键搬+改 import | ⬜ 脚本已备,**尚未运行** |
-| **输入准备重写(§4.B)** | 旧的 host 数组(`positions_np`/`cu_num_tokens`/`num_decodes`…)在 0.21 删了,要从新的 `InputBatch` 重建;有上机实操指南 | ⬜ **尚未做**(必须上机边跑边对) |
-| **execute_model 串接** | 等输入准备好后,把 2D 打包 + CPU 拒绝采样接回主流程;并确认 0.21 RejectionSampler 是否仍依赖 Triton | ⬜ **尚未做**(依赖上一项) |
+| **大文件移植(session/loader/qserve/worker)** | `session.py`、`model_loader.py`、`compile_config.py`、`qserve_model_runner.py`、`worker.py` 已从 fork 搬进插件并改 import | 🟡 已写,未上机验证 |
+| **输入准备重写(§4.B)** | 旧的 host 数组(`positions_np`/`cu_num_tokens`/`num_decodes`…)在 0.21 删了,已改用新的 `InputBatch` / `_prepare_inputs` 重建 | 🟡 已写,未上机验证 |
+| **execute_model 串接** | 已把 0.21 input-prep、QAIC decode/prefill、2D 打包、CPU 拒绝采样接进主流程 | 🟡 已写,未上机验证 |
 | **mxint8 决策** | 结论:不需要核心补丁——mxint8 是编译器开关走 `--additional-config`,vLLM 层用 fp8 | ✅ 已定 |
 
-> **A4 的诚实状态:** 「盘点 + 设计 + 插件骨架 + 可移植代码」已完成或已写好;但**整套尚未
-> 在 AIC 机器上验证过**。两个关键卡点尚未做:① torch 墙的 GO 测试(待验证,决定可行性);
-> ② 输入准备重写 + execute_model 串接(必须上机)。换言之:**A4 = 已铺好路,未通车。**
+> **A4 的诚实状态:** 「盘点 + 设计 + 插件骨架 + runtime 主路径移植」已完成或已写好;
+> 但**整套尚未在 AIC 机器上验证过**。关键卡点是:① torch 墙的 GO 测试(待验证,决定
+> 可行性);② precompiled QPC load/run;③ `vllm serve` smoke。换言之:**A4 = 路已接上,
+> 还没通车验收。**
+>
+> 进一步说,现在不能把 A4 描述成「vLLM 0.21.0 已跑通」。更准确的说法是:
+> **v0.10.1 QAIC patch 的 vLLM 0.21+ 迁移已盘点并完成 runtime 主路径移植;
+> 尚未完成 AIC 上机验证。**
 
 ---
 

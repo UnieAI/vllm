@@ -23,6 +23,14 @@ marked *"Confidential and Proprietary — Qualcomm Technologies"*. UnieAI's work
 described here was implemented as additions *inside / on top of* those files.
 Section 3 states exactly which lines are UnieAI's.
 
+**Status of the vLLM 0.21+ migration:** The v0.10.1 fork lineage and the
+vLLM 0.21+ plugin migration are separate version axes. The current local plugin
+branch has the runtime path ported into `vllm-qaic` (platform, worker, loader,
+qaicrt session, qserve dependency, and model-runner execute path) and passes
+local syntax compilation. It has **not** been validated on an AIC host. Do not
+describe this as exact `v0.21.0` support until a branch based on the `v0.21.0`
+tag passes the GO tests and a serve smoke test.
+
 ---
 
 ## 1. Summary (plain language) — UnieAI's work has TWO parts
@@ -42,7 +50,8 @@ and keep it running in production**, specifically:
    efficient-transformers **v1.21** + Cloud AI SDK **1.21** so the
    compile-model→run-on-card path works end to end.
 4. **Migrate to vLLM 0.2x (in progress)** — bring the whole stack onto a much
-   newer vLLM, where the engine was refactored again.
+   newer vLLM, where the engine was refactored again. This is not yet a
+   completed runtime claim for exact vLLM 0.21.0.
 
 > Note on attribution: many QAIC files carry Qualcomm or upstream copyright
 > (Section 3). Part A is **integration/upgrade *labor*** — getting that code to
@@ -74,6 +83,10 @@ item within speculative decoding**, not the whole of UnieAI's work.
   from the model's scores). The actual heavy math (the neural-network forward
   pass) runs on the card via the QPC. The two sides exchange plain numeric
   arrays.
+- **Version separation** — host vLLM and the AIC QPC/runtime are separate
+  compatibility axes. Moving host vLLM from 0.10.x to 0.21.x is primarily a
+  host-side API port; the card still executes the QPC through `qaicrt`. The
+  SDK/runtime/Python ABI/QPC format must still match on the AIC host.
 - **"V1" engine** — a rewritten, faster execution core inside vLLM. UnieAI's
   work targets this engine only.
 - **Speculative decoding** — a standard technique: cheaply *propose* several

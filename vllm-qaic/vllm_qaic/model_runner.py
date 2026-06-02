@@ -1,4 +1,4 @@
-"""QaicModelRunner — vLLM 0.21+ port of the v1_ngram fork's QaicModelRunner.
+"""QaicModelRunner: vLLM 0.21+ port of the v1_ngram fork's V1 QAIC runner.
 
 PROVENANCE (read docs/UnieAI_Quic_integrated.md):
   * The base QaicModelRunner is Qualcomm's (marked "Confidential and
@@ -10,11 +10,10 @@ PROVENANCE (read docs/UnieAI_Quic_integrated.md):
     here VERBATIM from the fork (only SpecDecodeMetadata field access may need
     touch-ups, flagged inline).
 
-STATUS: scaffold. The self-contained ngram helpers are complete and portable.
-The methods that touch GPUModelRunner internals carry the NEW 0.21 signatures
-plus inline "OLD(v0.10.1) -> NEW(0.21)" notes; their bodies that depend on the
-host input-prep arrays (self.positions_np / self.cu_num_tokens / self.num_decodes,
-all REMOVED in 0.21) are marked TODO. See docs/MIGRATION_GPUModelRunner_old_vs_new.md.
+The old fork carried QAIC-specific input packing inside execute_model. vLLM
+0.21 moved most of that state into InputBatch/CpuGpuBuffer, so this runner lets
+the upstream input-prep path populate the new buffers, then repacks the host
+arrays into the QPC decode/prefill inputs expected by Qualcomm's loader.
 """
 
 import time
@@ -24,8 +23,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.distributed.kv_transfer import has_kv_transfer_group
 from vllm.logger import init_logger
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.kv_cache_interface import FullAttentionSpec
@@ -127,12 +129,185 @@ class QaicModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors=None,
     ) -> "ModelRunnerOutput":
-        raise NotImplementedError(
-            "Port execute_model from the fork and re-fit input-prep against the "
-            "0.21 InputBatch/CpuGpuBuffer model. See the OLD->NEW note above and "
-            "docs/MIGRATION_GPUModelRunner_old_vs_new.md. The 2D decode packing "
-            "(_pack_decode_batch below) and the ngram rejection sampling "
-            "(_qaic_rejection_sample) are ready to call once inputs exist.")
+        if self.execute_model_state is not None:
+            raise RuntimeError(
+                "State error: sample_tokens() must be called after "
+                "execute_model() returns None.")
+
+        deferred_state_corrections_fn = self._update_states(scheduler_output)
+        if not scheduler_output.total_num_scheduled_tokens:
+            if not has_kv_transfer_group():
+                return EMPTY_MODEL_RUNNER_OUTPUT
+            return self.kv_connector_no_forward(scheduler_output,
+                                                self.vllm_config)
+
+        num_reqs = self.input_batch.num_reqs
+        req_ids = self.input_batch.req_ids
+        num_scheduled_tokens_np = np.array(
+            [scheduler_output.num_scheduled_tokens[req_id] for req_id in req_ids],
+            dtype=np.int32,
+        )
+        total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+
+        _, spec_decode_metadata = self._prepare_inputs(
+            scheduler_output,
+            num_scheduled_tokens_np,
+        )
+        cu_num_tokens = self._get_cumsum_and_arange(
+            num_scheduled_tokens_np,
+            self.query_pos.np,
+            cumsum_dtype=np.int32,
+        )
+
+        input_ids = (
+            self.input_ids.cpu[:total_num_scheduled_tokens]
+            .to(torch.int64)
+            .numpy()
+        )
+        positions_np = (
+            self.positions[:total_num_scheduled_tokens]
+            .to(torch.int64)
+            .cpu()
+            .numpy()
+        )
+
+        is_decode = (
+            self.input_batch.num_computed_tokens_cpu[:num_reqs]
+            >= self.input_batch.num_prompt_tokens[:num_reqs]
+        )
+        num_decodes = int(is_decode.sum())
+
+        block_table = self.input_batch.block_table[0].get_numpy_array()
+        batch_indices = block_table[:num_reqs, 0].astype(np.int64) - 1
+
+        decode_block_ids = batch_indices[:num_decodes]
+        decode_lora_ids: Optional[np.ndarray] = None
+        prefill_lora_ids: Optional[np.ndarray] = None
+        if self.lora_config:
+            request_lora_mapping = self.input_batch.request_lora_mapping
+            decode_lora_ids = request_lora_mapping[:num_decodes]
+            prefill_lora_ids = request_lora_mapping[num_decodes:num_reqs]
+
+        (
+            decode_input_ids,
+            decode_positions,
+            decode_lengths,
+            decode_token_count,
+        ) = self._pack_decode_batch(
+            input_ids,
+            positions_np,
+            num_decodes,
+            cu_num_tokens,
+        )
+
+        prefill_input_ids = input_ids[
+            decode_token_count:total_num_scheduled_tokens]
+        prefill_positions = positions_np[
+            decode_token_count:total_num_scheduled_tokens]
+        prefill_block_ids = batch_indices[num_decodes:num_reqs]
+        prefill_cum_sum = cu_num_tokens[num_decodes:] - decode_token_count
+
+        hidden_states_decode = (
+            self.model(
+                input_ids=decode_input_ids,
+                positions=decode_positions,
+                batch_indices=decode_block_ids,
+                is_prompt=False,
+                lora_ids=decode_lora_ids,
+                decode_lengths=decode_lengths,
+            )
+            if decode_input_ids.size > 0
+            else None
+        )
+        hidden_states_prefill = (
+            self.model(
+                input_ids=prefill_input_ids,
+                positions=prefill_positions,
+                batch_indices=prefill_block_ids,
+                is_prompt=True,
+                bypass_model_exec=False,
+                kv_caches=[],
+                logits_mem_buffs=None,
+                prefill_is_partial=False,
+                lora_ids=prefill_lora_ids,
+                prefill_cum_sum=prefill_cum_sum,
+            )
+            if prefill_input_ids.size > 0
+            else None
+        )
+
+        if hidden_states_prefill is not None and hidden_states_decode is not None:
+            hidden_states = torch.cat(
+                (hidden_states_decode, hidden_states_prefill), dim=0)
+        else:
+            hidden_states = (
+                hidden_states_prefill
+                if hidden_states_prefill is not None
+                else hidden_states_decode
+            )
+        assert hidden_states is not None
+
+        logits = self.model.compute_logits(
+            hidden_states,
+            self.input_batch.sampling_metadata,
+        )
+        if scheduler_output.grammar_bitmask is not None:
+            raise NotImplementedError(
+                "Grammar bitmask is not supported by V1 QAICModelRunner.")
+
+        sampling_metadata = self.input_batch.sampling_metadata
+        if spec_decode_metadata is None:
+            sampler_output = self.model.sample(
+                logits=logits,
+                sampling_metadata=sampling_metadata,
+            )
+        else:
+            assert self.speculative_config is not None
+            bonus_logits = logits[spec_decode_metadata.bonus_logits_indices]
+            sampler_output = self.sampler(
+                logits=bonus_logits,
+                sampling_metadata=sampling_metadata,
+            )
+            bonus_token_ids = sampler_output.sampled_token_ids
+            target_logits = logits[spec_decode_metadata.target_logits_indices]
+            sampler_output.sampled_token_ids = self._qaic_rejection_sample(
+                spec_decode_metadata,
+                target_logits,
+                bonus_token_ids,
+                sampling_metadata,
+            )
+
+        (
+            num_nans_in_logits,
+            logprobs_lists,
+            valid_sampled_token_ids,
+            prompt_logprobs_dict,
+            req_ids_output_copy,
+            req_id_to_index_output_copy,
+            _,
+        ) = self._bookkeeping_sync(
+            scheduler_output,
+            sampler_output,
+            logits,
+            hidden_states,
+            total_num_scheduled_tokens,
+        )
+
+        if deferred_state_corrections_fn is not None:
+            deferred_state_corrections_fn()
+
+        kv_connector_output = self.kv_connector_output
+        self.kv_connector_output = None
+        return ModelRunnerOutput(
+            req_ids=req_ids_output_copy,
+            req_id_to_index=req_id_to_index_output_copy,
+            sampled_token_ids=valid_sampled_token_ids,
+            logprobs=logprobs_lists,
+            prompt_logprobs_dict=prompt_logprobs_dict,
+            kv_connector_output=kv_connector_output,
+            num_nans_in_logits=num_nans_in_logits,
+            routed_experts=None,
+        )
 
     # -------------------------------------------------------------------------
     # 2D decode packing — UnieAI's ngram change to execute_model, factored out.
@@ -357,17 +532,14 @@ class QaicModelRunner(GPUModelRunner):
     # =========================================================================
 
     def propose_draft_token_ids(self, *args, **kwargs):
-        """OLD: propose_draft_token_ids(scheduler_output, sampled_token_ids)
-        -> thin wrapper over self.propose_ngram_draft_token_ids(...).
-        NEW: base signature expanded massively (hidden_states,
-        sample_hidden_states, aux_hidden_states, spec_decode_metadata,
-        common_attn_metadata, slot_mappings) AND NgramProposer.propose now takes
-        (sampled_token_ids, num_tokens_no_spec, token_ids_cpu, slot_mappings).
-        For ngram, prefer delegating to super().propose_draft_token_ids(...).
+        """Use vLLM 0.21's ngram proposer.
+
+        The v1_ngram fork implemented this against the old V1 signature. The
+        current upstream implementation already handles the new NgramProposer
+        contract, and this QAIC runner rejects non-ngram speculative methods in
+        __init__, so delegating here keeps the scheduler-facing API aligned.
         """
-        raise NotImplementedError(
-            "Re-fit against the new propose_draft_token_ids / NgramProposer.propose "
-            "signatures, or delegate to super(). See migration doc.")
+        return super().propose_draft_token_ids(*args, **kwargs)
 
     def get_kv_cache_spec(self) -> dict[str, "KVCacheSpec"]:
         """Ported from the fork (low risk). Builds one FullAttentionSpec per
@@ -417,3 +589,12 @@ class QaicModelRunner(GPUModelRunner):
 
     def get_model(self) -> nn.Module:
         return self.model
+
+    def _qaic_dummy_run(self) -> None:
+        """Warmup hook used by QaicWorker.
+
+        The fork's QPC load path initializes the QAIC sessions when the model is
+        constructed. vLLM 0.21 still calls a worker warmup method, so keep the
+        hook explicit and side-effect free.
+        """
+        return None
