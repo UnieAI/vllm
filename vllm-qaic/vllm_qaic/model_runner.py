@@ -150,33 +150,46 @@ class QaicModelRunner(GPUModelRunner):
                     PAD_ID,
                     BLOCK_SIZE,
                 ):
+                    num_tokens = int(num_tokens)
+                    max_num_tokens = int(max_num_tokens)
                     slot_mapping[num_tokens:max_num_tokens].fill_(PAD_ID)
+                    if num_tokens == 0:
+                        return
+
                     virtual_block_size = block_size * TOTAL_CP_WORLD_SIZE
-                    num_reqs = int(query_start_loc.numel() - 1)
-                    for req_idx in range(num_reqs):
-                        start = int(query_start_loc[req_idx].item())
-                        end = int(query_start_loc[req_idx + 1].item())
-                        for offset in range(start, end):
-                            pos = int(positions[offset].item())
-                            block_index = pos // virtual_block_size
-                            block_number = int(block_table[req_idx,
-                                                           block_index].item())
-                            virtual_block_offset = (
-                                pos - block_index * virtual_block_size)
-                            is_local = (
-                                virtual_block_offset //
-                                CP_KV_CACHE_INTERLEAVE_SIZE
-                            ) % TOTAL_CP_WORLD_SIZE == TOTAL_CP_RANK
-                            local_block_offset = (
-                                virtual_block_offset // (
-                                    TOTAL_CP_WORLD_SIZE *
-                                    CP_KV_CACHE_INTERLEAVE_SIZE)
-                            ) * CP_KV_CACHE_INTERLEAVE_SIZE + (
-                                virtual_block_offset %
-                                CP_KV_CACHE_INTERLEAVE_SIZE)
-                            slot_mapping[offset] = (
-                                block_number * block_size + local_block_offset
-                                if is_local else PAD_ID)
+                    token_positions = positions[:num_tokens]
+                    req_lengths = (
+                        query_start_loc[1:] - query_start_loc[:-1]).to(
+                            dtype=torch.long)
+                    req_indices = torch.repeat_interleave(
+                        torch.arange(req_lengths.numel(),
+                                     device=token_positions.device),
+                        req_lengths)
+
+                    block_indices = torch.div(token_positions,
+                                              virtual_block_size,
+                                              rounding_mode="floor")
+                    block_numbers = block_table[
+                        req_indices, block_indices.to(dtype=torch.long)]
+
+                    virtual_block_offsets = (
+                        token_positions - block_indices * virtual_block_size)
+                    is_local = (
+                        torch.div(virtual_block_offsets,
+                                  CP_KV_CACHE_INTERLEAVE_SIZE,
+                                  rounding_mode="floor")
+                        % TOTAL_CP_WORLD_SIZE == TOTAL_CP_RANK)
+                    local_block_offsets = (
+                        torch.div(
+                            virtual_block_offsets,
+                            TOTAL_CP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE,
+                            rounding_mode="floor")
+                        * CP_KV_CACHE_INTERLEAVE_SIZE
+                        + virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE)
+
+                    slots = block_numbers * block_size + local_block_offsets
+                    slot_mapping[:num_tokens] = torch.where(
+                        is_local, slots, torch.full_like(slots, PAD_ID))
 
                 return launch
 

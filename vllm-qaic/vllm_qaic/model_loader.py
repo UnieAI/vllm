@@ -82,6 +82,8 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
             "position_ids": np.full((self.decode_bsz,1),-1, dtype=np.int64),
             "batch_index": np.full((self.decode_bsz,1),-1, dtype=np.int64),
         }
+        self.decode_slot_ids = np.arange(self.decode_bsz, dtype=np.int64)
+        self.decode_inactive_mask = np.ones(self.decode_bsz, dtype=bool)
         self.list_of_comp_ctx_lengths = None
         if self.lora_mode:
             self.decode_batch_inputs["lora_ids"] = np.full((self.decode_bsz,1),-1, dtype=np.int64)
@@ -502,11 +504,10 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
             self.decode_batch_inputs["batch_index"][:num_decodes,
                                                      0] = batch_indices
             if num_decodes < self.decode_bsz:
-                active_batch_indices = set(batch_indices[:num_decodes])
-                inactive_batch_indices = [
-                    idx for idx in range(self.decode_bsz)
-                    if idx not in active_batch_indices
-                ]
+                self.decode_inactive_mask.fill(True)
+                self.decode_inactive_mask[batch_indices[:num_decodes]] = False
+                inactive_batch_indices = self.decode_slot_ids[
+                    self.decode_inactive_mask]
                 self.decode_batch_inputs["batch_index"][
                     num_decodes:, 0] = inactive_batch_indices[:(
                         self.decode_bsz - num_decodes)]
