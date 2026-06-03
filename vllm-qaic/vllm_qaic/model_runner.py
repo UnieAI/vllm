@@ -16,6 +16,7 @@ the upstream input-prep path populate the new buffers, then repacks the host
 arrays into the QPC decode/prefill inputs expected by Qualcomm's loader.
 """
 
+import os
 import time
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -91,6 +92,8 @@ class QaicModelRunner(GPUModelRunner):
 
         assert not self.uses_mrope, "mrope is not supported on QAIC."
         assert not self.supports_mm_inputs, "multimodal is not supported on QAIC."
+        self.qaic_profile = os.environ.get("VLLM_QAIC_PROFILE", "").lower() in (
+            "1", "true", "yes", "on")
 
         self.max_seq_len = getattr(
             self.model_config,
@@ -150,33 +153,46 @@ class QaicModelRunner(GPUModelRunner):
                     PAD_ID,
                     BLOCK_SIZE,
                 ):
+                    num_tokens = int(num_tokens)
+                    max_num_tokens = int(max_num_tokens)
                     slot_mapping[num_tokens:max_num_tokens].fill_(PAD_ID)
+                    if num_tokens == 0:
+                        return
+
                     virtual_block_size = block_size * TOTAL_CP_WORLD_SIZE
-                    num_reqs = int(query_start_loc.numel() - 1)
-                    for req_idx in range(num_reqs):
-                        start = int(query_start_loc[req_idx].item())
-                        end = int(query_start_loc[req_idx + 1].item())
-                        for offset in range(start, end):
-                            pos = int(positions[offset].item())
-                            block_index = pos // virtual_block_size
-                            block_number = int(block_table[req_idx,
-                                                           block_index].item())
-                            virtual_block_offset = (
-                                pos - block_index * virtual_block_size)
-                            is_local = (
-                                virtual_block_offset //
-                                CP_KV_CACHE_INTERLEAVE_SIZE
-                            ) % TOTAL_CP_WORLD_SIZE == TOTAL_CP_RANK
-                            local_block_offset = (
-                                virtual_block_offset // (
-                                    TOTAL_CP_WORLD_SIZE *
-                                    CP_KV_CACHE_INTERLEAVE_SIZE)
-                            ) * CP_KV_CACHE_INTERLEAVE_SIZE + (
-                                virtual_block_offset %
-                                CP_KV_CACHE_INTERLEAVE_SIZE)
-                            slot_mapping[offset] = (
-                                block_number * block_size + local_block_offset
-                                if is_local else PAD_ID)
+                    token_positions = positions[:num_tokens]
+                    req_lengths = (
+                        query_start_loc[1:] - query_start_loc[:-1]).to(
+                            dtype=torch.long)
+                    req_indices = torch.repeat_interleave(
+                        torch.arange(req_lengths.numel(),
+                                     device=token_positions.device),
+                        req_lengths)
+
+                    block_indices = torch.div(token_positions,
+                                              virtual_block_size,
+                                              rounding_mode="floor")
+                    block_numbers = block_table[
+                        req_indices, block_indices.to(dtype=torch.long)]
+
+                    virtual_block_offsets = (
+                        token_positions - block_indices * virtual_block_size)
+                    is_local = (
+                        torch.div(virtual_block_offsets,
+                                  CP_KV_CACHE_INTERLEAVE_SIZE,
+                                  rounding_mode="floor")
+                        % TOTAL_CP_WORLD_SIZE == TOTAL_CP_RANK)
+                    local_block_offsets = (
+                        torch.div(
+                            virtual_block_offsets,
+                            TOTAL_CP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE,
+                            rounding_mode="floor")
+                        * CP_KV_CACHE_INTERLEAVE_SIZE
+                        + virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE)
+
+                    slots = block_numbers * block_size + local_block_offsets
+                    slot_mapping[:num_tokens] = torch.where(
+                        is_local, slots, torch.full_like(slots, PAD_ID))
 
                 return launch
 
@@ -326,6 +342,8 @@ class QaicModelRunner(GPUModelRunner):
         prefill_positions = positions_np[prefill_token_indices]
         prefill_block_ids = batch_indices[prefill_req_indices]
 
+        if self.qaic_profile:
+            t_card_start = time.perf_counter()
         hidden_states_decode = (
             self.model(
                 input_ids=decode_input_ids,
@@ -354,6 +372,8 @@ class QaicModelRunner(GPUModelRunner):
             if prefill_input_ids.size > 0
             else None
         )
+        if self.qaic_profile:
+            t_card_end = time.perf_counter()
 
         hidden_states = self._qaic_merge_model_outputs(
             hidden_states_decode,
@@ -367,6 +387,8 @@ class QaicModelRunner(GPUModelRunner):
             hidden_states,
             self.input_batch.sampling_metadata,
         )
+        if self.qaic_profile:
+            t_logits_end = time.perf_counter()
         if getattr(scheduler_output, "grammar_bitmask", None) is not None:
             raise NotImplementedError(
                 "Grammar bitmask is not supported by V1 QAICModelRunner.")
@@ -392,6 +414,8 @@ class QaicModelRunner(GPUModelRunner):
                 bonus_token_ids,
                 sampling_metadata,
             )
+        if self.qaic_profile:
+            t_sample_end = time.perf_counter()
 
         (
             num_nans_in_logits,
@@ -408,6 +432,20 @@ class QaicModelRunner(GPUModelRunner):
             hidden_states,
             total_num_scheduled_tokens,
         )
+        if self.qaic_profile:
+            t_bookkeeping_end = time.perf_counter()
+            logger.info(
+                "QAIC-PROF reqs=%d decodes=%d prefills=%d decode_tokens=%d "
+                "prefill_tokens=%d logits_shape=%s | card=%.1fms "
+                "logits=%.1fms sample=%.1fms bookkeeping=%.1fms",
+                num_reqs, int(decode_req_indices.size),
+                int(prefill_req_indices.size), int(decode_token_counts.sum()),
+                int(prefill_token_counts.sum()), tuple(logits.shape),
+                (t_card_end - t_card_start) * 1e3,
+                (t_logits_end - t_card_end) * 1e3,
+                (t_sample_end - t_logits_end) * 1e3,
+                (t_bookkeeping_end - t_sample_end) * 1e3,
+            )
 
         if deferred_state_corrections_fn is not None:
             deferred_state_corrections_fn()
