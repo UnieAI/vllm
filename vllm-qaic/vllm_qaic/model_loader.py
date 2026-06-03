@@ -86,6 +86,12 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
         if self.lora_mode:
             self.decode_batch_inputs["lora_ids"] = np.full((self.decode_bsz,1),-1, dtype=np.int64)
 
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError(
+            "QAIC executes token embeddings inside the compiled QPC; "
+            "embed_input_ids is present only for vLLM generation protocol "
+            "detection.")
+
     def forward(
         self,
         input_ids: np.ndarray,
@@ -225,6 +231,20 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
                     y,
                 )
         self.comp_ctx_lengths_prefill, self.comp_ctx_lengths_decode = self.get_comp_ctx_lengths()
+        if "logits" in self.session.binding_index_map:
+            logits_shapes = self.session.get_bindings_shapes(["logits"]).get(
+                "logits", [])
+            qpc_vocab_size = logits_shapes[0][-1] if logits_shapes else (
+                self.session.bindings[
+                    self.session.binding_index_map["logits"]].dims[-1])
+            if qpc_vocab_size != self.vocab_size:
+                logger.warning(
+                    "QPC logits vocab size (%s) differs from HF config vocab "
+                    "size (%s); using QPC shape for QAIC runtime buffers.",
+                    qpc_vocab_size, self.vocab_size)
+                self.vocab_size = qpc_vocab_size
+                self.logits_processor = LogitsProcessor(
+                    self.vocab_size, logits_as_input=True)
         e = time.perf_counter() - s
         logger.info(f"Successfully loaded QPC in {e} secs")
 
@@ -267,6 +287,16 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
             self.ignore_batch_index = False
         else:
             self.ignore_batch_index = True
+            self.decode_batch_inputs.pop("batch_index", None)
+
+        input_ids_binding = self.session.bindings[
+            self.session.binding_index_map["input_ids"]]
+        qpc_input_width = input_ids_binding.dims[1]
+        if qpc_input_width != self.decode_batch_inputs["input_ids"].shape[1]:
+            self.decode_batch_inputs["input_ids"] = np.full(
+                (self.decode_bsz, qpc_input_width), -1, dtype=np.int64)
+            self.decode_batch_inputs["position_ids"] = np.full(
+                (self.decode_bsz, qpc_input_width), -1, dtype=np.int64)
         if self.disagg_producer_en:
             self.decode_bsz = 0
 
@@ -468,12 +498,18 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
             self.decode_batch_inputs["input_ids"][num_decodes:] = -1
             self.decode_batch_inputs["position_ids"][num_decodes:] = -1
 
-
         if not self.ignore_batch_index:
-
-            self.decode_batch_inputs["batch_index"][:num_decodes,0] = batch_indices
+            self.decode_batch_inputs["batch_index"][:num_decodes,
+                                                     0] = batch_indices
             if num_decodes < self.decode_bsz:
-                self.decode_batch_inputs["batch_index"][num_decodes:] = -1
+                active_batch_indices = set(batch_indices[:num_decodes])
+                inactive_batch_indices = [
+                    idx for idx in range(self.decode_bsz)
+                    if idx not in active_batch_indices
+                ]
+                self.decode_batch_inputs["batch_index"][
+                    num_decodes:, 0] = inactive_batch_indices[:(
+                        self.decode_bsz - num_decodes)]
 
         if lora_ids is not None:
             self.decode_batch_inputs["lora_ids"][:num_decodes,0] = lora_ids
@@ -497,13 +533,17 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
 
         outputs = self.session.run(self.decode_batch_inputs)
         logits: np.ndarray = outputs["logits"]
+        decode_rows = np.arange(num_decodes, dtype=np.int64)
         if decode_lengths is not None:
             return np.concatenate(
-                [logits[i, :num_tokens] for i, num_tokens in enumerate(decode_lengths)],
+                [
+                    logits[row, :num_tokens]
+                    for row, num_tokens in zip(decode_rows, decode_lengths)
+                ],
                 axis=0)
         if self.is_spec_decode_target_model:
-            return logits[:num_decodes, 0]
-        return logits[:num_decodes].squeeze(1)
+            return logits[decode_rows, 0]
+        return logits[decode_rows].squeeze(1)
 
     def run_encode(
         self, qpc_inputs: dict, encode_num_logits_buffer: Optional[dict] = None
