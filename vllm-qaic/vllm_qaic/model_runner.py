@@ -16,6 +16,7 @@ the upstream input-prep path populate the new buffers, then repacks the host
 arrays into the QPC decode/prefill inputs expected by Qualcomm's loader.
 """
 
+import os
 import time
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -91,6 +92,8 @@ class QaicModelRunner(GPUModelRunner):
 
         assert not self.uses_mrope, "mrope is not supported on QAIC."
         assert not self.supports_mm_inputs, "multimodal is not supported on QAIC."
+        self.qaic_profile = os.environ.get("VLLM_QAIC_PROFILE", "").lower() in (
+            "1", "true", "yes", "on")
 
         self.max_seq_len = getattr(
             self.model_config,
@@ -339,6 +342,8 @@ class QaicModelRunner(GPUModelRunner):
         prefill_positions = positions_np[prefill_token_indices]
         prefill_block_ids = batch_indices[prefill_req_indices]
 
+        if self.qaic_profile:
+            t_card_start = time.perf_counter()
         hidden_states_decode = (
             self.model(
                 input_ids=decode_input_ids,
@@ -367,6 +372,8 @@ class QaicModelRunner(GPUModelRunner):
             if prefill_input_ids.size > 0
             else None
         )
+        if self.qaic_profile:
+            t_card_end = time.perf_counter()
 
         hidden_states = self._qaic_merge_model_outputs(
             hidden_states_decode,
@@ -380,6 +387,8 @@ class QaicModelRunner(GPUModelRunner):
             hidden_states,
             self.input_batch.sampling_metadata,
         )
+        if self.qaic_profile:
+            t_logits_end = time.perf_counter()
         if getattr(scheduler_output, "grammar_bitmask", None) is not None:
             raise NotImplementedError(
                 "Grammar bitmask is not supported by V1 QAICModelRunner.")
@@ -405,6 +414,8 @@ class QaicModelRunner(GPUModelRunner):
                 bonus_token_ids,
                 sampling_metadata,
             )
+        if self.qaic_profile:
+            t_sample_end = time.perf_counter()
 
         (
             num_nans_in_logits,
@@ -421,6 +432,20 @@ class QaicModelRunner(GPUModelRunner):
             hidden_states,
             total_num_scheduled_tokens,
         )
+        if self.qaic_profile:
+            t_bookkeeping_end = time.perf_counter()
+            logger.info(
+                "QAIC-PROF reqs=%d decodes=%d prefills=%d decode_tokens=%d "
+                "prefill_tokens=%d logits_shape=%s | card=%.1fms "
+                "logits=%.1fms sample=%.1fms bookkeeping=%.1fms",
+                num_reqs, int(decode_req_indices.size),
+                int(prefill_req_indices.size), int(decode_token_counts.sum()),
+                int(prefill_token_counts.sum()), tuple(logits.shape),
+                (t_card_end - t_card_start) * 1e3,
+                (t_logits_end - t_card_end) * 1e3,
+                (t_sample_end - t_logits_end) * 1e3,
+                (t_bookkeeping_end - t_sample_end) * 1e3,
+            )
 
         if deferred_state_corrections_fn is not None:
             deferred_state_corrections_fn()
