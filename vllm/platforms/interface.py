@@ -585,6 +585,34 @@ class Platform:
                 attn_page_size_1_token = lcm(tq_page, skip_page)
             else:
                 attn_page_size_1_token = tq_page
+        elif cache_config.cache_dtype.startswith("polarquant_"):
+            from vllm.model_executor.layers.quantization.polarquant.config import (
+                PolarQuantConfig,
+            )
+            from vllm.v1.kv_cache_interface import PQFullAttentionSpec
+
+            pq_cfg = PolarQuantConfig.from_cache_dtype(
+                cache_config.cache_dtype, model_config.get_head_size()
+            )
+            pq_page = PQFullAttentionSpec(
+                block_size=1,
+                num_kv_heads=model_config.get_num_kv_heads(parallel_config),
+                head_size=model_config.get_head_size(),
+                head_size_v=model_config.get_head_size(),
+                dtype=kv_cache_dtype,
+                kv_quant_mode=kv_quant_mode,
+                pq_slot_size=pq_cfg.slot_size_aligned,
+            ).page_size_bytes
+            if cache_config.kv_cache_dtype_skip_layers:
+                skip_page = FullAttentionSpec(
+                    block_size=1,
+                    num_kv_heads=model_config.get_num_kv_heads(parallel_config),
+                    head_size=model_config.get_head_size(),
+                    dtype=model_config.dtype,
+                ).page_size_bytes
+                attn_page_size_1_token = lcm(pq_page, skip_page)
+            else:
+                attn_page_size_1_token = pq_page
         else:
             attn_page_size_1_token = FullAttentionSpec(
                 block_size=1,

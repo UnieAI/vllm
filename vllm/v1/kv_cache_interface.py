@@ -70,7 +70,10 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
 
 
 def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
-    return get_kv_quant_mode(kv_cache_dtype) != KVQuantMode.NONE
+    return (
+        get_kv_quant_mode(kv_cache_dtype) != KVQuantMode.NONE
+        or kv_cache_dtype.startswith("polarquant_")
+    )
 
 
 def kv_cache_uses_per_token_head_scales(kv_cache_dtype: str) -> bool:
@@ -331,6 +334,27 @@ class TQFullAttentionSpec(FullAttentionSpec):
             "All TQ layers in the same KV cache group must use the same tq_slot_size."
         )
         return replace(merged, tq_slot_size=specs[0].tq_slot_size)
+
+
+@dataclass(frozen=True, kw_only=True)
+class PQFullAttentionSpec(FullAttentionSpec):
+    """FullAttentionSpec with PolarQuant-aware page size."""
+
+    pq_slot_size: int = 0
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        if self.pq_slot_size > 0:
+            return self.block_size * self.num_kv_heads * self.pq_slot_size
+        return super().real_page_size_bytes
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        merged = super().merge(specs)
+        assert all(s.pq_slot_size == specs[0].pq_slot_size for s in specs), (
+            "All PolarQuant layers in the same KV cache group must use the same pq_slot_size."
+        )
+        return replace(merged, pq_slot_size=specs[0].pq_slot_size)
 
 
 @dataclass(frozen=True, kw_only=True)
