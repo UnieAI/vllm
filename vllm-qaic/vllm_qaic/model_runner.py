@@ -237,6 +237,12 @@ class QaicModelRunner(GPUModelRunner):
     #   and recompute the decode/prefill split locally (the fork relied on
     #   reorder_batch_to_split_decodes_and_prefills + self.num_decodes).
     # -------------------------------------------------------------------------
+    @property
+    def _qaic_paged_kv(self) -> bool:
+        """Paged (block-table) KV mode, from --additional-config paged_kv."""
+        cfg = getattr(self.vllm_config, "additional_config", None) or {}
+        return bool(isinstance(cfg, dict) and cfg.get("paged_kv", False))
+
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -296,12 +302,21 @@ class QaicModelRunner(GPUModelRunner):
         num_decodes = int(decode_req_indices.size)
 
         block_table = self.input_batch.block_table[0].get_numpy_array()
-        block_ids = block_table[:num_reqs, 0].astype(np.int64)
-        if np.any(block_ids < 1):
-            raise RuntimeError(
-                "QAIC expects allocated vLLM KV block ids to be >= 1; "
-                f"got {block_ids.tolist()}.")
-        batch_indices = block_ids - 1
+        paged_kv = self._qaic_paged_kv
+        if paged_kv:
+            # Paged: feed the FULL per-request logical->physical block map to the
+            # QPC (block_size == page_size, so each request spans many blocks).
+            # The paged QPC addresses the shared pool via block_table; batch_index
+            # is unused (the paged graph has no batch_index binding).
+            block_ids_full = block_table[:num_reqs, :].astype(np.int64)
+            batch_indices = np.arange(num_reqs, dtype=np.int64)
+        else:
+            block_ids = block_table[:num_reqs, 0].astype(np.int64)
+            if np.any(block_ids < 1):
+                raise RuntimeError(
+                    "QAIC expects allocated vLLM KV block ids to be >= 1; "
+                    f"got {block_ids.tolist()}.")
+            batch_indices = block_ids - 1
 
         token_starts = np.concatenate((
             np.array([0], dtype=cu_num_tokens.dtype),
@@ -352,6 +367,7 @@ class QaicModelRunner(GPUModelRunner):
                 is_prompt=False,
                 lora_ids=decode_lora_ids,
                 decode_lengths=decode_lengths,
+                block_table=(block_ids_full[decode_req_indices] if paged_kv else None),
             )
             if decode_input_ids.size > 0
             else None
@@ -368,6 +384,7 @@ class QaicModelRunner(GPUModelRunner):
                 prefill_is_partial=False,
                 lora_ids=prefill_lora_ids,
                 prefill_cum_sum=prefill_cum_sum,
+                block_table=(block_ids_full[prefill_req_indices] if paged_kv else None),
             )
             if prefill_input_ids.size > 0
             else None

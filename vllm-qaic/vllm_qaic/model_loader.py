@@ -110,6 +110,7 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
         prefill_is_partial: Optional[List[bool]] = None,
         prefill_cum_sum: Optional[np.ndarray] = None,
         decode_lengths: Optional[np.ndarray] = None,
+        block_table: Optional[np.ndarray] = None,
     ) -> torch.Tensor:
         if is_prompt and (self.disagg_producer_en or self.disagg_serving_en):
             assert kv_caches is not None and logits_mem_buffs is not None
@@ -133,12 +134,14 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
             ):  # TODO: Re-evaluate if it's needed for for MultiProcExecutor on a single machine
                 if is_prompt:
                     logits = self._run_prefill(
-                        input_ids, positions, batch_indices, prefill_cum_sum, lora_ids
+                        input_ids, positions, batch_indices, prefill_cum_sum, lora_ids,
+                        block_table=block_table,
                     )
                 else:
                     logits = self._run_decode(
                         input_ids, positions, batch_indices, lora_ids,
                         decode_lengths,
+                        block_table=block_table,
                     )
                     # logits is a non-writable array. pytorch needs to have a
                     # writable array to work properyly (else, behavior is undefined)
@@ -427,6 +430,7 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
         batch_indices: np.ndarray,
         prefill_cum_sum: np.ndarray,
         lora_ids: Optional[np.ndarray] = None,
+        block_table: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         # set qpc prefill state
         if self.last_decode:
@@ -456,6 +460,9 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
             if not self.ignore_batch_index:
                 batch_index = batch_indices[i:i+1].reshape(1,1)
                 chunk_inputs["batch_index"] = batch_index
+            if block_table is not None:
+                # Paged: this request's logical->physical block map, [1, max_blocks].
+                chunk_inputs["block_table"] = block_table[i:i + 1].astype(np.int64)
             if lora_ids is not None:
                 lora_index = lora_ids[i:i+1].reshape(1,1)
                 chunk_inputs["lora_ids"] = lora_index
@@ -486,6 +493,7 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
         batch_indices: np.ndarray,
         lora_ids: Optional[np.ndarray] = None,
         decode_lengths: Optional[np.ndarray] = None,
+        block_table: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         if input_ids.ndim == 1:
             num_decodes = input_ids.shape[-1]
@@ -516,6 +524,14 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
             self.decode_batch_inputs["lora_ids"][:num_decodes,0] = lora_ids
             if num_decodes < self.decode_bsz:
                 self.decode_batch_inputs["lora_ids"][num_decodes:] = -1
+
+        if block_table is not None:
+            # Paged: assemble the decode-batch block map [decode_bsz, max_blocks];
+            # inactive rows stay 0 (their padded positions are dropped in-graph).
+            max_blocks = block_table.shape[-1]
+            bt = np.zeros((self.decode_bsz, max_blocks), dtype=np.int64)
+            bt[:num_decodes] = block_table.astype(np.int64)
+            self.decode_batch_inputs["block_table"] = bt
 
         if not self.last_decode:
             # set qpc sesstion state to decode phase

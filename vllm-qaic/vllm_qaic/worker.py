@@ -80,12 +80,34 @@ class QaicWorker(WorkerBase):
         logger.warning("sleep mode is not supported on QAIC, ignore it.")
         pass
 
+    def _paged_kv_cfg(self) -> dict:
+        cfg = self.vllm_config.additional_config or {}
+        return cfg if isinstance(cfg, dict) else {}
+
+    def _paged_kv_enabled(self) -> bool:
+        return bool(self._paged_kv_cfg().get("paged_kv", False))
+
+    def _paged_num_blocks(self) -> int:
+        """Block-pool size for paged KV. MUST match the compiled QPC's num_blocks."""
+        cfg = self._paged_kv_cfg()
+        n = self.cache_config.num_gpu_blocks_override or cfg.get("num_blocks")
+        if n is None:
+            raise ValueError(
+                "paged_kv requires additional_config 'num_blocks' (the compiled QPC "
+                "block-pool size) or --num-gpu-blocks-override.")
+        return int(n)
+
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         self.cache_config.num_cpu_blocks = num_cpu_blocks
         # disable sliding window
         self.cache_config.sliding_window = None
 
         assert num_cpu_blocks == 0
+        if self._paged_kv_enabled():
+            # Paged: num_gpu_blocks is the shared block-pool size (typically much
+            # larger than max_num_seqs), and prefix caching is permitted.
+            self.cache_config.num_gpu_blocks = num_gpu_blocks
+            return
         if not self.cache_config.enable_prefix_caching:
             self.cache_config.num_gpu_blocks = num_gpu_blocks
             if (
@@ -176,13 +198,19 @@ class QaicWorker(WorkerBase):
         pass
 
     def determine_available_memory(self) -> int:
-        # QAIC does not support paged attention,
-        # so we set available memory based on desired num_gpu_blocks.
-        # The number of QAIC KV blocks should match the maximum number of
-        # sequences that can be processed in a single batch.
+        if self._paged_kv_enabled():
+            # Paged: report memory for the fixed block pool (num_blocks pages),
+            # so the v1 block manager allocates exactly that many blocks.
+            num_gpu_blocks = self._paged_num_blocks()
+            page_size = get_uniform_page_size(self.get_kv_cache_spec().values())
+            return (
+                num_gpu_blocks
+                * page_size
+                * self.model_config.get_num_layers(self.parallel_config)
+            )
 
-        # Since the v1 block pool creates a null_block using self.free_block_queue.popleft(),
-        # the actual number of usable blocks is num_gpu_blocks - 1.
+        # Non-paged QAIC: one block == full ctx; set available memory based on
+        # desired num_gpu_blocks (== max_num_seqs + 1, incl. the v1 null block).
         num_gpu_blocks = (
             self.cache_config.num_gpu_blocks_override
             if self.cache_config.num_gpu_blocks_override
