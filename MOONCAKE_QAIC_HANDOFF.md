@@ -18,6 +18,22 @@ uv pip install -e ./vllm-qaic
 
 ---
 
+## Critical contracts (read first)
+- **`num_blocks` is a dynamic axis**: the `export(paged_kv=True)` dummy value does not
+  fix it — `compile(..., num_blocks=N)` is authoritative (it injects the spec dim).
+  Pass the SAME `N` to `compile()` and to the plugin's `--additional-config num_blocks`.
+- **Null block**: `export`'s `paged_num_blocks` defaults to `base_bs*max_blocks + 1`
+  (the +1 is the reserved padding null block the cache layer needs); the cache routes
+  `position_ids<0` to block `num_blocks-1`. Size the pool with that spare block.
+- **Plugin `num_blocks`**: `worker.py` reads it as the pool size (and requires it for
+  paged); it does not currently cross-check against the QPC — keep them equal manually.
+- **KV dtype / mxint8**: `compile(..., mxint8_kv_cache=True)` for paged KV is untested
+  here; if used, ensure the staging arena dtype matches the on-card pool dtype.
+- **Where the arena is wired**: `QaicModelRunner.initialize_kv_cache`
+  (`model_runner.py:~814`) is currently a stub ("KV-transfer registration left out") —
+  that is the hook to build+attach the arena and call `register_kv_caches()` (gated on
+  `has_kv_transfer_group()`, `model_runner.py:~261`).
+
 ## Phase 1 — Paged attention on the card (unblocks everything else)
 
 ### 1.1 Compile a paged QPC (QEfficient)
@@ -38,7 +54,8 @@ that is the one real unknown (perf/lowering of a large-pool gather).
 vllm serve Qwen/Qwen2.5-7B-Instruct \
   --additional-config '{"paged_kv":true,"page_size":128,"num_blocks":N}'
 ```
-`num_blocks` MUST equal the QPC's compiled pool size (the plugin asserts it).
+`num_blocks` MUST equal the QPC's compiled pool size (`worker.py` reads it as the
+pool size; keep it equal manually — see Critical contracts).
 
 ### 1.3 Step-3 go/no-go gate (the decision)
 - **Accuracy:** same prompts, paged vs non-paged QPC → outputs must match (greedy)
