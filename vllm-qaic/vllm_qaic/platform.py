@@ -12,6 +12,7 @@ releases. After ``pip install vllm==<target>``, open the installed
 (the README PART 1 tells you exactly how). Where unsure, a TODO marks it.
 """
 
+import os
 import shlex
 from typing import TYPE_CHECKING, Optional
 
@@ -112,6 +113,16 @@ class QaicPlatform(Platform):
 
         if scheduler_config is not None:
             scheduler_config.async_scheduling = False
+
+            # Decode-priority scheduling: QAIC runs decode and prefill as separate
+            # sequential QPC graphs, so vLLM's default prefill/decode mixing
+            # (chunked prefill) adds the prefill QPC latency to every decode token's
+            # TPOT at high concurrency. Install a scheduler that keeps decode steps
+            # pure unless a user opts out or set their own scheduler_cls.
+            if (os.environ.get("QAIC_DISABLE_DECODE_PRIORITY_SCHEDULER") != "1"
+                    and scheduler_config.scheduler_cls in (None, "")):
+                scheduler_config.scheduler_cls = (
+                    "vllm_qaic.scheduler.QaicDecodePriorityScheduler")
 
         # QAIC knobs come from --additional-config '{"num_cores":16, ...}'
         # (replaces the fork's --override-qaic-config / --device-group).
