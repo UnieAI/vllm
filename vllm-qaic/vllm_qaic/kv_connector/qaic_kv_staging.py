@@ -76,9 +76,13 @@ class QaicKVStagingArena:
             caches[f"layer.{i}.value"] = self.v[i]
         return caches
 
-    @staticmethod
-    def _idx(block_ids: Sequence[int]) -> torch.Tensor:
-        return torch.as_tensor(list(block_ids), dtype=torch.long)
+    def _idx(self, block_ids: Sequence[int]) -> torch.Tensor:
+        idx = torch.as_tensor(list(block_ids), dtype=torch.long)
+        if idx.numel() and (int(idx.min()) < 0 or int(idx.max()) >= self.num_blocks):
+            raise ValueError(
+                f"block_ids out of range [0, {self.num_blocks}): "
+                f"min={int(idx.min())} max={int(idx.max())}")
+        return idx
 
     def card_to_staging(self, block_ids: Sequence[int]) -> None:
         """Pull the given physical blocks off the card into the staging mirror.

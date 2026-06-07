@@ -45,9 +45,21 @@ class QaicMooncakeStoreConnector(MooncakeStoreConnector):
         self._arena = arena
 
     def enable_qaic_transfers(self) -> None:
-        """Turn on card<->staging copies (call once block-id wiring is validated)."""
+        """Turn on card<->staging copies (call once block-id wiring is validated).
+
+        Fails fast (here, not mid-inference) if a subclass has not implemented the
+        box-side block-id derivation.
+        """
         if self._arena is None:
             raise RuntimeError("attach_staging_arena() must be called before enabling transfers")
+        cls = type(self)
+        if (
+            cls._qaic_save_block_ids is QaicMooncakeStoreConnector._qaic_save_block_ids
+            or cls._qaic_recv_block_ids is QaicMooncakeStoreConnector._qaic_recv_block_ids
+        ):
+            raise RuntimeError(
+                "QAIC Mooncake block-id derivation is not implemented; a subclass must "
+                "override _qaic_save_block_ids/_qaic_recv_block_ids before enabling transfers.")
         self._qaic_enabled = True
 
     # ----- worker-side lifecycle overrides -----
@@ -56,6 +68,10 @@ class QaicMooncakeStoreConnector(MooncakeStoreConnector):
         # on-card tensors (which are not host-addressable).
         if self._arena is not None:
             return super().register_kv_caches(self._arena.as_kv_caches())
+        if kv_caches is None:
+            raise ValueError(
+                "QaicMooncakeStoreConnector.register_kv_caches needs an attached staging "
+                "arena (attach_staging_arena) or an explicit kv_caches dict.")
         return super().register_kv_caches(kv_caches)
 
     def wait_for_save(self):
