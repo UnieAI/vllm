@@ -263,6 +263,8 @@ class QaicModelRunner(GPUModelRunner):
             return self.kv_connector_no_forward(scheduler_output,
                                                 self.vllm_config)
 
+        if self.qaic_profile:
+            t_pack_start = time.perf_counter()
         num_reqs = self.input_batch.num_reqs
         req_ids = self.input_batch.req_ids
         num_scheduled_tokens_np = np.array(
@@ -372,6 +374,8 @@ class QaicModelRunner(GPUModelRunner):
             if decode_input_ids.size > 0
             else None
         )
+        if self.qaic_profile:
+            t_decode_end = time.perf_counter()
         hidden_states_prefill = (
             self.model(
                 input_ids=prefill_input_ids,
@@ -390,7 +394,7 @@ class QaicModelRunner(GPUModelRunner):
             else None
         )
         if self.qaic_profile:
-            t_card_end = time.perf_counter()
+            t_prefill_end = time.perf_counter()
 
         hidden_states = self._qaic_merge_model_outputs(
             hidden_states_decode,
@@ -399,6 +403,8 @@ class QaicModelRunner(GPUModelRunner):
             prefill_req_indices,
             decode_token_counts,
         )
+        if self.qaic_profile:
+            t_merge_end = time.perf_counter()
 
         logits = self.model.compute_logits(
             hidden_states,
@@ -451,15 +457,21 @@ class QaicModelRunner(GPUModelRunner):
         )
         if self.qaic_profile:
             t_bookkeeping_end = time.perf_counter()
+            # `mixed`=1 means this step ran BOTH the decode and prefill QPC (the
+            # TPOT-inflating case). Aggregate mixed across steps for the mixed-step
+            # ratio; decode_qpc/prefill_qpc show the per-QPC split that drives TPOT.
+            mixed = int(decode_req_indices.size > 0 and prefill_req_indices.size > 0)
             logger.info(
-                "QAIC-PROF reqs=%d decodes=%d prefills=%d decode_tokens=%d "
-                "prefill_tokens=%d logits_shape=%s | card=%.1fms "
-                "logits=%.1fms sample=%.1fms bookkeeping=%.1fms",
-                num_reqs, int(decode_req_indices.size),
-                int(prefill_req_indices.size), int(decode_token_counts.sum()),
-                int(prefill_token_counts.sum()), tuple(logits.shape),
-                (t_card_end - t_card_start) * 1e3,
-                (t_logits_end - t_card_end) * 1e3,
+                "QAIC-PROF reqs=%d decodes=%d prefills=%d mixed=%d decode_tokens=%d "
+                "prefill_tokens=%d | pack=%.1fms decode_qpc=%.1fms prefill_qpc=%.1fms "
+                "merge=%.1fms logits=%.1fms sample=%.1fms bookkeeping=%.1fms",
+                num_reqs, int(decode_req_indices.size), int(prefill_req_indices.size),
+                mixed, int(decode_token_counts.sum()), int(prefill_token_counts.sum()),
+                (t_card_start - t_pack_start) * 1e3,
+                (t_decode_end - t_card_start) * 1e3 if decode_input_ids.size > 0 else 0.0,
+                (t_prefill_end - t_decode_end) * 1e3 if prefill_input_ids.size > 0 else 0.0,
+                (t_merge_end - t_prefill_end) * 1e3,
+                (t_logits_end - t_merge_end) * 1e3,
                 (t_sample_end - t_logits_end) * 1e3,
                 (t_bookkeeping_end - t_sample_end) * 1e3,
             )
