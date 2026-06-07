@@ -58,8 +58,18 @@ def register():
         return
     from vllm_qaic.quant import register_qaic_quant
     register_qaic_quant()
-    # TODO(port): KV connector + custom models, if you need them:
-    #   from vllm.distributed.kv_transfer.kv_connector.factory import (
-    #       KVConnectorFactory)
-    #   KVConnectorFactory.register_connector(
-    #       "QaicConnector", "vllm_qaic.kv_connector", "QaicConnector")
+    # QAIC Mooncake bridge: a host-staging subclass of the stock MooncakeStoreConnector
+    # (cross-instance KV reuse). Lazy registration; only imported when selected via
+    # --kv-transfer-config '{"kv_connector":"QaicMooncakeStoreConnector",...}'.
+    try:
+        from vllm.distributed.kv_transfer.kv_connector.factory import (
+            KVConnectorFactory,
+        )
+
+        KVConnectorFactory.register_connector(
+            "QaicMooncakeStoreConnector",
+            "vllm_qaic.kv_connector.qaic_mooncake_store_connector",
+            "QaicMooncakeStoreConnector",
+        )
+    except Exception:  # pragma: no cover - core may not expose the factory
+        pass
