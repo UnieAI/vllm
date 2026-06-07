@@ -449,6 +449,17 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
         if cur == n:
             return bt
         if cur > n:
+            # Only safe to drop columns that are the null block (0) — i.e. alignment
+            # padding. If the extra columns hold REAL blocks, the request genuinely
+            # exceeds the compiled context capacity; truncating would corrupt KV / read
+            # OOB, so fail fast instead.
+            dropped = bt[:, n:]
+            if np.any(dropped != 0):
+                raise RuntimeError(
+                    f"block_table has {cur} columns but the QPC was compiled for "
+                    f"max_num_blocks={n}, and the extra columns reference real blocks "
+                    f"{dropped[dropped != 0][:8].tolist()} — the request exceeds the "
+                    f"compiled context capacity. Recompile with larger ctx_len/num_blocks.")
             return bt[:, :n].copy()
         pad = np.zeros((bt.shape[0], n - cur), dtype=np.int64)  # 0 = null block
         return np.concatenate([bt, pad], axis=1)
