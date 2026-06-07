@@ -69,15 +69,25 @@ class QaicDecodePriorityScheduler(Scheduler):
             "Disable with QAIC_DISABLE_DECODE_PRIORITY_SCHEDULER=1.",
             self._qaic_prefill_every_n, self._qaic_resume_frac)
 
+    def _qaic_num_decode_running(self) -> int:
+        # `self.running` can also hold requests still PREFILLING (chunked). A request
+        # is in the decode phase once it has consumed all prompt tokens. Only decodes
+        # are a reason to protect the step from new prefills.
+        return sum(
+            1 for r in self.running
+            if r.num_computed_tokens >= r.num_prompt_tokens)
+
     def _qaic_should_defer_prefill(self) -> bool:
-        # No decodes to protect -> let prefills flow.
-        if not self.running:
+        # No decodes to protect -> let prefills flow (don't delay waiting prefills
+        # just because other prefills are in flight).
+        num_decode = self._qaic_num_decode_running()
+        if num_decode == 0:
             return False
         # Cadence backstop: allow a prefill step at least every N deferred steps.
         if self._qaic_steps_since_prefill >= self._qaic_prefill_every_n:
             return False
-        # Decode headroom: few running reqs -> prefilling now costs little TPOT.
-        if len(self.running) < self._qaic_resume_frac * self.max_num_running_reqs:
+        # Decode headroom: few decodes running -> prefilling now costs little TPOT.
+        if num_decode < self._qaic_resume_frac * self.max_num_running_reqs:
             return False
         # Otherwise there is a decode backlog -> defer new prefills.
         return True
@@ -87,18 +97,22 @@ class QaicDecodePriorityScheduler(Scheduler):
             self._qaic_steps_since_prefill = 0
             return super().schedule()
 
-        # Budget exactly the running (decode) needs so the waiting-admission loop
-        # admits no new prefill this step. Never raise the budget above the configured
-        # value. If there are no decode tokens to schedule, fall back to a normal step.
-        decode_budget = sum(
-            max(0, r.num_tokens_with_spec - r.num_computed_tokens)
+        # Cap the per-step token budget to exactly what the RUNNING requests need so
+        # the stock waiting-admission loop admits no new prefill this step. Must cover
+        # ALL running reqs (decodes + any in-flight prefill chunks) or they'd be cut.
+        # Use the stock running-token formula (scheduler.py): num_tokens_with_spec +
+        # num_output_placeholders - num_computed_tokens (placeholders/spec matter, or
+        # the cap would be too small and starve decode itself). Never raise the budget.
+        running_budget = sum(
+            max(0, r.num_tokens_with_spec + r.num_output_placeholders
+                - r.num_computed_tokens)
             for r in self.running)
-        if decode_budget <= 0:
+        if running_budget <= 0:
             self._qaic_steps_since_prefill = 0
             return super().schedule()
 
         saved = self.max_num_scheduled_tokens
-        self.max_num_scheduled_tokens = min(saved, decode_budget)
+        self.max_num_scheduled_tokens = min(saved, running_budget)
         try:
             output = super().schedule()
         finally:
