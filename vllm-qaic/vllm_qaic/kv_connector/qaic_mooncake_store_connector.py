@@ -36,6 +36,18 @@ class QaicMooncakeStoreConnector(MooncakeStoreConnector):
     """MooncakeStoreConnector that mirrors the on-card paged KV pool to host."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        import os
+
+        # Fail-fast against silent misuse: this is a box-side WIP skeleton. The staging
+        # arena is NOT yet wired into the QAIC runner (QaicModelRunner.initialize_kv_cache
+        # does not attach it / enable transfers), so selecting this connector would move
+        # no KV. Require an explicit opt-in so nobody assumes Mooncake e2e works here.
+        if os.environ.get("QAIC_MOONCAKE_EXPERIMENTAL") != "1":
+            raise NotImplementedError(
+                "QaicMooncakeStoreConnector is a box-side WIP skeleton: card<->store "
+                "transfer is not wired into the QAIC runner yet. Set "
+                "QAIC_MOONCAKE_EXPERIMENTAL=1 to construct it for development. "
+                "See MOONCAKE_QAIC_HANDOFF.md Phase 2.")
         super().__init__(*args, **kwargs)
         self._arena: Optional["QaicKVStagingArena"] = None
         self._qaic_enabled: bool = False

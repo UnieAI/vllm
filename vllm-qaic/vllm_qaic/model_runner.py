@@ -836,6 +836,19 @@ class QaicModelRunner(GPUModelRunner):
                 self.model = self.load_lora_model(
                     self.model, self.model_config, self.scheduler_config,
                     self.lora_config, self.device)
+        # Fail-fast: the runtime paged_kv intent MUST match the loaded QPC. A legacy
+        # QPC silently ignores block_table (set_buffers only warns) and would run with
+        # wrong KV addressing; a paged QPC without paged_kv would be starved of
+        # block_table. Either mismatch is a misconfiguration.
+        qpc_paged = bool(getattr(self.model, "paged_kv", False))
+        if self._qaic_paged_kv and not qpc_paged:
+            raise RuntimeError(
+                "additional_config paged_kv=true but the loaded QPC has no 'block_table' "
+                "input (legacy/non-paged QPC). Re-export+compile with paged_kv=True.")
+        if qpc_paged and not self._qaic_paged_kv:
+            raise RuntimeError(
+                "The loaded QPC expects a 'block_table' input (paged) but additional_config "
+                "paged_kv is not set. Add '{\"paged_kv\":true,\"page_size\":...,\"num_blocks\":...}'.")
         logger.info("Model loading took %.6f seconds", time.perf_counter() - t0)
 
     def get_model(self) -> nn.Module:
