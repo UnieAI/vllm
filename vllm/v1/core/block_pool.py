@@ -494,6 +494,23 @@ class BlockPool:
 
         return True
 
+    def get_cached_block_hashes(self) -> set[int]:
+        """Get the set of block hashes currently in the prefix cache.
+
+        Returns the unique ``BlockHash`` values (without the group ID
+        suffix) converted to integers.  This is used by the adaptive
+        warmup worker to determine which prefixes are already cached.
+
+        Returns:
+            A set of integer representations of cached block hashes.
+        """
+        cached: set[int] = set()
+        for key in self.cached_block_hash_to_block._cache:
+            # Strip the 4-byte group_id suffix to get the BlockHash
+            block_hash_bytes = key[:-4]
+            cached.add(int.from_bytes(block_hash_bytes, byteorder="big"))
+        return cached
+
     def get_num_free_blocks(self) -> int:
         """Get the number of free blocks in the pool.
 

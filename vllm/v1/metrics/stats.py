@@ -168,6 +168,23 @@ class KVCacheEvictionEvent:
 
 
 @dataclass
+class AdaptiveServingStats:
+    """Stats for adaptive speculative serving metrics."""
+
+    prefix_cache_hit_rate: float = 0.0
+    """Percentage (0-100) of requests with prefix cache hits."""
+
+    prefix_warmup_entries_count: int = 0
+    """Number of actively warmed prefix cache entries."""
+
+    self_speculation_skip_rate: float = 0.0
+    """Percentage (0-100) of decode steps skipped via speculation."""
+
+    confidence_tracker_mean_threshold: float = 0.0
+    """Average confidence threshold across all tracked patterns."""
+
+
+@dataclass
 class SchedulerStats:
     """Stats associated with the scheduler."""
 
@@ -196,6 +213,8 @@ class SchedulerStats:
     cudagraph_stats: CUDAGraphStat | None = None
 
     perf_stats: PerfStats | None = None
+
+    adaptive_serving_stats: AdaptiveServingStats | None = None
 
 
 @dataclass

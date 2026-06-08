@@ -5,7 +5,7 @@ import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
@@ -59,6 +59,11 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
+if TYPE_CHECKING:
+    from vllm.v1.core.adaptive.prefix_frequency_tracker import (
+        PrefixFrequencyTracker,
+    )
+
 logger = init_logger(__name__)
 
 
@@ -73,6 +78,7 @@ class Scheduler(SchedulerInterface):
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
         include_finished_set: bool = False,
         log_stats: bool = False,
+        prefix_frequency_tracker: "PrefixFrequencyTracker | None" = None,
     ) -> None:
         self.vllm_config = vllm_config
         self.scheduler_config = vllm_config.scheduler_config
@@ -83,6 +89,7 @@ class Scheduler(SchedulerInterface):
         self.parallel_config = vllm_config.parallel_config
         self.log_stats = log_stats
         self.observability_config = vllm_config.observability_config
+        self.prefix_frequency_tracker = prefix_frequency_tracker
         self.kv_metrics_collector: KVCacheMetricsCollector | None = None
         if self.observability_config.kv_cache_metrics:
             self.kv_metrics_collector = KVCacheMetricsCollector(
@@ -607,6 +614,12 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks, num_new_local_computed_tokens = (
                         self.kv_cache_manager.get_computed_blocks(request)
                     )
+
+                    # Emit prefix lookup events to the frequency
+                    # tracker for adaptive warmup.
+                    if self.prefix_frequency_tracker is not None:
+                        for blk_hash in request.block_hashes:
+                            self.prefix_frequency_tracker.update(hash(blk_hash))
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:

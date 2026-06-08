@@ -17,6 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 )
 from vllm.logger import init_logger
 from vllm.plugins import STAT_LOGGER_PLUGINS_GROUP, load_plugins_by_group
+from vllm.v1.core.adaptive.metrics import AdaptiveServingProm
 from vllm.v1.engine import FinishReason
 from vllm.v1.metrics.perf import PerfMetricsLogging, PerfMetricsProm
 from vllm.v1.metrics.prometheus import unregister_vllm_metrics
@@ -443,6 +444,18 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
         self.perf_metrics_prom = self._perf_metrics_cls(
             vllm_config, labelnames, per_engine_labelvalues
+        )
+
+        # Adaptive serving metrics
+        adaptive_enabled = (
+            hasattr(vllm_config, "adaptive_serving")
+            and vllm_config.adaptive_serving is not None
+            and vllm_config.adaptive_serving.enable_adaptive_warmup
+        )
+        self.adaptive_serving_prom = AdaptiveServingProm(
+            enabled=adaptive_enabled,
+            labelnames=labelnames,
+            per_engine_labelvalues=per_engine_labelvalues,
         )
 
         #
@@ -1107,6 +1120,18 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
 
             if scheduler_stats.perf_stats is not None:
                 self.perf_metrics_prom.observe(scheduler_stats.perf_stats, engine_idx)
+
+            if scheduler_stats.adaptive_serving_stats is not None:
+                stats = scheduler_stats.adaptive_serving_stats
+                self.adaptive_serving_prom.observe(
+                    prefix_cache_hit_rate=stats.prefix_cache_hit_rate,
+                    prefix_warmup_entries_count=(stats.prefix_warmup_entries_count),
+                    self_speculation_skip_rate=(stats.self_speculation_skip_rate),
+                    confidence_tracker_mean_threshold=(
+                        stats.confidence_tracker_mean_threshold
+                    ),
+                    engine_idx=engine_idx,
+                )
 
             if (
                 self.kv_cache_metrics_enabled

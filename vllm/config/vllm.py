@@ -29,6 +29,7 @@ from vllm.triton_utils import HAS_TRITON
 from vllm.utils import random_uuid
 from vllm.utils.hashing import safe_hash
 
+from .adaptive_serving import AdaptiveServingConfig
 from .attention import AttentionConfig
 from .cache import CacheConfig
 from .compilation import CompilationConfig, CompilationMode, CUDAGraphMode
@@ -378,6 +379,12 @@ class VllmConfig:
 
     weight_transfer_config: WeightTransferConfig | None = None
     """The configurations for weight transfer during RL training."""
+
+    adaptive_serving: AdaptiveServingConfig = Field(
+        default_factory=AdaptiveServingConfig
+    )
+    """Configuration for Adaptive Speculative Serving (prefix warmup
+    and self-speculation)."""
 
     shutdown_timeout: int = Field(default=0, ge=0)
     """Shutdown grace period for in-flight requests. Shutdown will be delayed for
@@ -1332,6 +1339,17 @@ class VllmConfig:
                 "Modify KVEventsConfig.enable_kv_cache_events "
                 "to True to enable."
             )
+
+        # Auto-enable prefix caching when adaptive warmup is enabled
+        if (
+            self.adaptive_serving.enable_adaptive_warmup
+            and not self.cache_config.enable_prefix_caching
+        ):
+            self.cache_config.enable_prefix_caching = True
+            logger.info(
+                "Prefix caching auto-enabled because adaptive warmup is active."
+            )
+
         current_platform.check_and_update_config(self)
 
         if self.use_v2_model_runner:

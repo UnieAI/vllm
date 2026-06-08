@@ -42,6 +42,12 @@ from vllm.utils.gc_utils import (
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.utils.system_utils import decorate_logs, set_process_title
+from vllm.v1.core.adaptive.confidence_tracker import ConfidenceTracker
+from vllm.v1.core.adaptive.prefix_frequency_tracker import (
+    PrefixFrequencyTracker,
+)
+from vllm.v1.core.adaptive.prefix_warmup_worker import PrefixWarmupWorker
+from vllm.v1.core.adaptive.state_persister import StatePersister
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     generate_scheduler_kv_cache_config,
@@ -223,6 +229,9 @@ class EngineCore:
 
         self._idle_state_callbacks: list[Callable] = []
 
+        # Initialize adaptive serving components if configured.
+        self._init_adaptive_serving(vllm_config)
+
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
         freeze_gc_heap()
@@ -231,6 +240,188 @@ class EngineCore:
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
         enable_envs_cache()
+
+    def _init_adaptive_serving(self, vllm_config: VllmConfig) -> None:
+        """Initialize adaptive serving components if enabled.
+
+        Sets up PrefixFrequencyTracker, PrefixWarmupWorker,
+        ConfidenceTracker, and StatePersister when adaptive warmup
+        is enabled. Loads persisted state if available.
+        """
+        adaptive_config = vllm_config.adaptive_serving
+        self._adaptive_config = adaptive_config
+        self._warmup_worker: PrefixWarmupWorker | None = None
+        self._frequency_tracker: PrefixFrequencyTracker | None = None
+        self._confidence_tracker: ConfidenceTracker | None = None
+        self._state_persister: StatePersister | None = None
+        self._last_persist_time: float = 0.0
+        self._block_pool_ref: Any = None
+
+        if not adaptive_config.enable_adaptive_warmup:
+            return
+
+        # Initialize PrefixFrequencyTracker
+        assert adaptive_config.warmup_ema_decay is not None
+        self._frequency_tracker = PrefixFrequencyTracker(
+            max_entries=adaptive_config.warmup_max_prefixes,
+            ema_decay=adaptive_config.warmup_ema_decay,
+        )
+
+        # Initialize ConfidenceTracker
+        self._confidence_tracker = ConfidenceTracker(
+            ema_decay=adaptive_config.warmup_ema_decay,
+            min_hit_rate=adaptive_config.self_spec_min_hit_rate,
+            activation_hit_rate=adaptive_config.self_spec_activation_hit_rate,
+        )
+
+        # Initialize StatePersister if path is configured
+        if adaptive_config.self_spec_stats_persist_path is not None:
+            self._state_persister = StatePersister(
+                path=adaptive_config.self_spec_stats_persist_path,
+                interval_seconds=adaptive_config.persist_interval_seconds,
+            )
+            # Load persisted state
+            freq_data, conf_data = self._state_persister.load()
+            if freq_data is not None:
+                self._frequency_tracker = PrefixFrequencyTracker.from_dict(
+                    freq_data,
+                    max_entries=adaptive_config.warmup_max_prefixes,
+                    ema_decay=adaptive_config.warmup_ema_decay,
+                )
+                logger.info(
+                    "Loaded persisted prefix frequency data from %s",
+                    adaptive_config.self_spec_stats_persist_path,
+                )
+            if conf_data is not None:
+                self._confidence_tracker = ConfidenceTracker.from_dict(
+                    conf_data,
+                    ema_decay=adaptive_config.warmup_ema_decay,
+                    min_hit_rate=adaptive_config.self_spec_min_hit_rate,
+                    activation_hit_rate=adaptive_config.self_spec_activation_hit_rate,
+                )
+                logger.info(
+                    "Loaded persisted confidence data from %s",
+                    adaptive_config.self_spec_stats_persist_path,
+                )
+
+        # Initialize PrefixWarmupWorker
+        # Access block_pool and kv_cache_manager from the scheduler
+        block_pool = self.scheduler.kv_cache_manager.block_pool
+        kv_cache_manager = self.scheduler.kv_cache_manager
+        self._block_pool_ref = block_pool
+
+        # Pass KV cache dtype and head size for TurboQuant-aware
+        # VRAM budget calculations.
+        kv_cache_dtype = getattr(
+            getattr(vllm_config, "cache_config", None), "cache_dtype", "auto"
+        )
+        # Ensure we have a valid string (handles MagicMock in tests)
+        if not isinstance(kv_cache_dtype, str):
+            kv_cache_dtype = "auto"
+        head_size_val = getattr(
+            getattr(vllm_config, "model_config", None), "get_head_size", None
+        )
+        head_size = head_size_val() if callable(head_size_val) else 128
+        if not isinstance(head_size, int):
+            head_size = 128
+        self._warmup_worker = PrefixWarmupWorker(
+            config=adaptive_config,
+            frequency_tracker=self._frequency_tracker,
+            block_pool=block_pool,
+            kv_cache_manager=kv_cache_manager,
+            model_executor=self.model_executor,
+            kv_cache_dtype=kv_cache_dtype,
+            head_size=head_size,
+        )
+
+        # Register warmup_worker.on_idle as idle state callback
+        self._idle_state_callbacks.append(self._adaptive_warmup_idle_callback)
+
+        # Initialize persistence timer
+        self._last_persist_time = time.monotonic()
+
+        logger.info(
+            "Adaptive serving initialized: profile=%s, "
+            "warmup_budget_ms=%s, warmup_max_prefixes=%d",
+            adaptive_config.adaptive_profile,
+            adaptive_config.warmup_budget_ms,
+            adaptive_config.warmup_max_prefixes,
+        )
+
+    def _adaptive_warmup_idle_callback(self, engine_core: "EngineCore") -> None:
+        """Idle state callback wrapper for adaptive warmup.
+
+        Invokes the warmup worker's on_idle method.
+        Also handles periodic state persistence.
+
+        Note: This callback does NOT re-register itself because
+        _notify_idle_state_callbacks() uses a while-drain loop.
+        Instead, we re-add after the drain completes (see below).
+        """
+        assert self._warmup_worker is not None
+        self._warmup_worker.on_idle(engine_core)
+
+        # Check if periodic persistence is due
+        self._maybe_persist_state()
+
+    def _maybe_persist_state(self) -> None:
+        """Persist adaptive serving state if the interval has elapsed."""
+        if self._state_persister is None:
+            return
+
+        now = time.monotonic()
+        elapsed = now - self._last_persist_time
+        if elapsed >= self._adaptive_config.persist_interval_seconds:
+            assert self._frequency_tracker is not None
+            assert self._confidence_tracker is not None
+            self._state_persister.save(
+                self._frequency_tracker,
+                self._confidence_tracker,
+            )
+            self._last_persist_time = now
+
+    def _attach_adaptive_serving_stats(
+        self, engine_core_outputs: dict[int, "EngineCoreOutputs"]
+    ) -> None:
+        """Attach adaptive serving metrics to scheduler stats.
+
+        Called after update_from_output produces the engine core
+        outputs. If adaptive serving is enabled and a scheduler_stats
+        object exists in the outputs, this attaches the current
+        adaptive serving metrics to it.
+        """
+        if self._warmup_worker is None:
+            return
+
+        from vllm.v1.metrics.stats import AdaptiveServingStats
+
+        # Compute current metric values
+        assert self._frequency_tracker is not None
+        assert self._confidence_tracker is not None
+
+        # Prefix cache hit rate: use the block pool's cached entries
+        # as a proxy (percentage of known prefixes that are cached)
+        total_tracked = len(self._frequency_tracker)
+        if total_tracked > 0 and self._block_pool_ref is not None:
+            cached = len(self._block_pool_ref.get_cached_block_hashes())
+            hit_rate = min(100.0, cached / total_tracked * 100.0)
+        else:
+            hit_rate = 0.0
+
+        stats = AdaptiveServingStats(
+            prefix_cache_hit_rate=hit_rate,
+            prefix_warmup_entries_count=(self._warmup_worker.total_entries_warmed),
+            self_speculation_skip_rate=0.0,  # Updated by proposer
+            confidence_tracker_mean_threshold=(
+                self._confidence_tracker.mean_threshold()
+            ),
+        )
+
+        # Find the first output with scheduler_stats and attach
+        for eco in engine_core_outputs.values():
+            if eco.scheduler_stats is not None:
+                eco.scheduler_stats.adaptive_serving_stats = stats
+                break
 
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
@@ -344,6 +535,10 @@ class EngineCore:
         `request_wave`: indicate which wave of requests this is expected to
         belong to in DP case
         """
+        # Abort any active warmup to yield GPU resources to the request.
+        if self._warmup_worker is not None:
+            self._warmup_worker.abort()
+
         # Validate the request_id type.
         if not isinstance(request.request_id, str):
             raise TypeError(
@@ -468,6 +663,9 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+
+        # Attach adaptive serving stats if enabled
+        self._attach_adaptive_serving_stats(engine_core_outputs)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -1284,6 +1482,13 @@ class EngineCoreProc(EngineCore):
         while self._idle_state_callbacks:
             callback = self._idle_state_callbacks.pop()
             callback(self)
+        # Re-register the adaptive warmup callback for the next idle
+        # window if it was drained above. Cannot re-register inside
+        # the callback itself (while-drain causes infinite loop).
+        if self._warmup_worker is not None:
+            self._idle_state_callbacks.append(
+                self._adaptive_warmup_idle_callback
+            )
 
     def _handle_shutdown(self) -> bool:
         # Check if shutdown was requested and handle it

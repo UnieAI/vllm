@@ -188,6 +188,7 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
     update_ngram_gpu_tensors_incremental,
     update_scheduler_for_invalid_drafts,
 )
+from vllm.v1.spec_decode.self_speculation import SelfSpeculationProposer
 from vllm.v1.spec_decode.step3p5 import Step3p5MTPProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
@@ -551,6 +552,7 @@ class GPUModelRunner(
                 | ExtractHiddenStatesProposer
                 | Gemma4Proposer
                 | Step3p5MTPProposer
+                | SelfSpeculationProposer
             )
             if self.speculative_config.method == "custom_class":
                 self.drafter = create_custom_proposer(  # type: ignore[assignment]
@@ -607,6 +609,8 @@ class GPUModelRunner(
                     vllm_config=self.vllm_config, device=self.device
                 )
                 self.use_aux_hidden_state_outputs = True
+            elif self.speculative_config.method == "self_speculation":
+                self.drafter = SelfSpeculationProposer(vllm_config=self.vllm_config)
             else:
                 raise ValueError(
                     "Unknown speculative decoding method: "
@@ -4828,6 +4832,15 @@ class GPUModelRunner(
         elif spec_config.method == "custom_class":
             assert isinstance(sampled_token_ids, list)
             draft_token_ids = cast(Any, self.drafter).propose(
+                sampled_token_ids,
+                self.input_batch.num_tokens_no_spec,
+                self.input_batch.token_ids_cpu,
+                slot_mappings=slot_mappings,
+            )
+        elif spec_config.method == "self_speculation":
+            assert isinstance(sampled_token_ids, list)
+            assert isinstance(self.drafter, SelfSpeculationProposer)
+            draft_token_ids = self.drafter.propose(
                 sampled_token_ids,
                 self.input_batch.num_tokens_no_spec,
                 self.input_batch.token_ids_cpu,

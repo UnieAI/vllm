@@ -63,6 +63,7 @@ SpeculativeMethod = Literal[
     "draft_model",
     "suffix",
     "custom_class",
+    "self_speculation",
     EagleModelTypes,
     NgramGPUTypes,
 ]
@@ -575,6 +576,8 @@ class SpeculativeConfig:
                 self.model = "suffix"
             elif self.method == "extract_hidden_states":
                 self.model = "extract_hidden_states"
+            elif self.method == "self_speculation":
+                self.model = "self_speculation"
             elif self.method == "custom_class":
                 # method was set explicitly, but model should already contain the
                 # custom module path. If not, this is a configuration error.
@@ -664,6 +667,14 @@ class SpeculativeConfig:
                 self.draft_model_config.hf_config, **hf_config
             )
             self.update_arch_()
+            self.draft_parallel_config = self.target_parallel_config
+        elif self.method == "self_speculation":
+            # Self-speculation uses the target model itself — no draft model
+            # needed. Uses idle compute to speculatively pre-compute next
+            # token's KV cache and logits based on confidence gating.
+            self.prompt_lookup_max = 0
+            self.prompt_lookup_min = 0
+            self.draft_model_config = self.target_model_config
             self.draft_parallel_config = self.target_parallel_config
 
         else:
@@ -1092,6 +1103,7 @@ class SpeculativeConfig:
                 "suffix",
                 "extract_hidden_states",
                 "custom_class",
+                "self_speculation",
             )
             else self.draft_model_config.model
         )
