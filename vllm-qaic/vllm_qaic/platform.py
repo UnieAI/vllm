@@ -12,6 +12,7 @@ releases. After ``pip install vllm==<target>``, open the installed
 (the README PART 1 tells you exactly how). Where unsure, a TODO marks it.
 """
 
+import os
 import shlex
 from typing import TYPE_CHECKING, Optional
 
@@ -113,6 +114,16 @@ class QaicPlatform(Platform):
         if scheduler_config is not None:
             scheduler_config.async_scheduling = False
 
+            # Decode-priority scheduling: QAIC runs decode and prefill as separate
+            # sequential QPC graphs, so vLLM's default prefill/decode mixing
+            # (chunked prefill) adds the prefill QPC latency to every decode token's
+            # TPOT at high concurrency. Install a scheduler that keeps decode steps
+            # pure unless a user opts out or set their own scheduler_cls.
+            if (os.environ.get("QAIC_DISABLE_DECODE_PRIORITY_SCHEDULER") != "1"
+                    and scheduler_config.scheduler_cls in (None, "")):
+                scheduler_config.scheduler_cls = (
+                    "vllm_qaic.scheduler.QaicDecodePriorityScheduler")
+
         # QAIC knobs come from --additional-config '{"num_cores":16, ...}'
         # (replaces the fork's --override-qaic-config / --device-group).
         qaic_cfg = cls._normalize_qaic_config(
@@ -129,15 +140,30 @@ class QaicPlatform(Platform):
             and not hasattr(model_config, "max_seq_len_to_capture")
         ):
             model_config.max_seq_len_to_capture = model_config.max_model_len
+        # Paged (block-table) KV mode. Requires a QPC compiled with paged KV
+        # (QEfficient export(paged_kv=True)). When on: one logical block == one
+        # page (block_size = page_size), and prefix caching is allowed (paging
+        # supports shared/reused blocks); the runner feeds the full block_table
+        # to the QPC. When off: the legacy QAIC layout (one block == full ctx,
+        # prefix caching disabled).
+        paged_kv = bool(qaic_cfg.get("paged_kv", False))
         if cache_config is not None:
-            if (
-                getattr(envs, "VLLM_USE_V1", True)
-                and cache_config.enable_prefix_caching
-            ):
-                cache_config.enable_prefix_caching = False
+            if paged_kv:
+                page_size = int(qaic_cfg.get("page_size", 128))
+                cache_config.block_size = page_size
                 logger.warning_once(
-                    "Prefix caching is not supported on QAIC V1; disabling.")
-            cache_config.block_size = model_config.max_model_len
+                    "QAIC paged KV enabled: block_size(page_size)=%d, "
+                    "prefix_caching=%s", page_size, cache_config.enable_prefix_caching)
+            else:
+                if (
+                    getattr(envs, "VLLM_USE_V1", True)
+                    and cache_config.enable_prefix_caching
+                ):
+                    cache_config.enable_prefix_caching = False
+                    logger.warning_once(
+                        "Prefix caching is not supported on QAIC V1 (non-paged); "
+                        "disabling. Set additional_config paged_kv=true to enable.")
+                cache_config.block_size = model_config.max_model_len
 
         # Pass QAIC knobs through verbatim. NORMALIZATION IS NOT DONE HERE:
         # the fork normalizes keys (num_cores/aic_num_cores, mxfp6->mxfp6_matmul,

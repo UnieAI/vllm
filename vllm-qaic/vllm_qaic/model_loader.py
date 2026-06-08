@@ -110,6 +110,7 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
         prefill_is_partial: Optional[List[bool]] = None,
         prefill_cum_sum: Optional[np.ndarray] = None,
         decode_lengths: Optional[np.ndarray] = None,
+        block_table: Optional[np.ndarray] = None,
     ) -> torch.Tensor:
         if is_prompt and (self.disagg_producer_en or self.disagg_serving_en):
             assert kv_caches is not None and logits_mem_buffs is not None
@@ -133,12 +134,14 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
             ):  # TODO: Re-evaluate if it's needed for for MultiProcExecutor on a single machine
                 if is_prompt:
                     logits = self._run_prefill(
-                        input_ids, positions, batch_indices, prefill_cum_sum, lora_ids
+                        input_ids, positions, batch_indices, prefill_cum_sum, lora_ids,
+                        block_table=block_table,
                     )
                 else:
                     logits = self._run_decode(
                         input_ids, positions, batch_indices, lora_ids,
                         decode_lengths,
+                        block_table=block_table,
                     )
                     # logits is a non-writable array. pytorch needs to have a
                     # writable array to work properyly (else, behavior is undefined)
@@ -291,6 +294,19 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
             self.ignore_batch_index = True
             self.decode_batch_inputs.pop("batch_index", None)
 
+        # Paged (block-table) QPC auto-detection + the compiled max_num_blocks.
+        # block_table is exported as [batch, max_num_blocks]; the runtime must feed
+        # exactly max_num_blocks columns (vLLM block tables can be wider/narrower).
+        self.paged_kv = "block_table" in self.session.input_names
+        self.max_num_blocks = None
+        if self.paged_kv:
+            bt_binding = self.session.bindings[self.session.binding_index_map["block_table"]]
+            self.max_num_blocks = int(bt_binding.dims[-1])
+            if not self.ignore_batch_index:
+                logger.warning(
+                    "Paged QPC unexpectedly also has a batch_index input; the paged "
+                    "graph should be compiled without continuous_batching.")
+
         input_ids_binding = self.session.bindings[
             self.session.binding_index_map["input_ids"]]
         qpc_input_width = input_ids_binding.dims[1]
@@ -420,6 +436,34 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
 
         return logits.squeeze(1)
 
+    def _fit_block_table(self, bt: np.ndarray) -> np.ndarray:
+        """Align block_table columns to the compiled max_num_blocks.
+
+        vLLM's block table width need not equal the QPC's compiled max_num_blocks
+        (alignment / ctx_len rounding). Pad with the null block (0) or truncate so the
+        QPC binding shape matches and the gather width = max_num_blocks * page_size.
+        """
+        bt = np.asarray(bt, dtype=np.int64)
+        n = self.max_num_blocks
+        cur = bt.shape[-1]
+        if cur == n:
+            return bt
+        if cur > n:
+            # Only safe to drop columns that are the null block (0) — i.e. alignment
+            # padding. If the extra columns hold REAL blocks, the request genuinely
+            # exceeds the compiled context capacity; truncating would corrupt KV / read
+            # OOB, so fail fast instead.
+            dropped = bt[:, n:]
+            if np.any(dropped != 0):
+                raise RuntimeError(
+                    f"block_table has {cur} columns but the QPC was compiled for "
+                    f"max_num_blocks={n}, and the extra columns reference real blocks "
+                    f"{dropped[dropped != 0][:8].tolist()} — the request exceeds the "
+                    f"compiled context capacity. Recompile with larger ctx_len/num_blocks.")
+            return bt[:, :n].copy()
+        pad = np.zeros((bt.shape[0], n - cur), dtype=np.int64)  # 0 = null block
+        return np.concatenate([bt, pad], axis=1)
+
     def _run_prefill(
         self,
         input_ids: np.ndarray,
@@ -427,6 +471,7 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
         batch_indices: np.ndarray,
         prefill_cum_sum: np.ndarray,
         lora_ids: Optional[np.ndarray] = None,
+        block_table: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         # set qpc prefill state
         if self.last_decode:
@@ -456,6 +501,10 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
             if not self.ignore_batch_index:
                 batch_index = batch_indices[i:i+1].reshape(1,1)
                 chunk_inputs["batch_index"] = batch_index
+            if block_table is not None and self.paged_kv:
+                # Paged: this request's logical->physical block map, aligned to the
+                # compiled max_num_blocks, shape [1, max_num_blocks].
+                chunk_inputs["block_table"] = self._fit_block_table(block_table[i:i + 1])
             if lora_ids is not None:
                 lora_index = lora_ids[i:i+1].reshape(1,1)
                 chunk_inputs["lora_ids"] = lora_index
@@ -486,6 +535,7 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
         batch_indices: np.ndarray,
         lora_ids: Optional[np.ndarray] = None,
         decode_lengths: Optional[np.ndarray] = None,
+        block_table: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         if input_ids.ndim == 1:
             num_decodes = input_ids.shape[-1]
@@ -516,6 +566,14 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
             self.decode_batch_inputs["lora_ids"][:num_decodes,0] = lora_ids
             if num_decodes < self.decode_bsz:
                 self.decode_batch_inputs["lora_ids"][num_decodes:] = -1
+
+        if block_table is not None and self.paged_kv:
+            # Paged: assemble the decode-batch block map [decode_bsz, max_num_blocks],
+            # aligned to the compiled width; inactive rows stay 0 (null block).
+            fitted = self._fit_block_table(block_table)  # [num_decodes, max_num_blocks]
+            bt = np.zeros((self.decode_bsz, self.max_num_blocks), dtype=np.int64)
+            bt[:num_decodes] = fitted
+            self.decode_batch_inputs["block_table"] = bt
 
         if not self.last_decode:
             # set qpc sesstion state to decode phase
