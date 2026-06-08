@@ -66,6 +66,23 @@ VLLM_QAIC_PROFILE=1 vllm serve <模型> --additional-config '{...}'
 
 > **已知殘留**:若某次放行的 prefill 是長 prompt、沒在那一步跑完,它會留到下一步、仍可能和 decode 同步。請在 profiler log 裡特別看「強制放行 prefill 之後的幾個 step 是否還有 `mixed=1`」,順便回報。緩解方向:把 `max_num_batched_tokens` 設大到讓 prompt 在一個放行步內做完。
 
+## 三之二、一鍵 A/B 工具(box 上跑)
+
+- **`vllm-qaic/tools/run_tpot_ab.sh`**:對每個並行度,分別用 scheduler OFF / ON 各 serve 一次(都開 `VLLM_QAIC_PROFILE=1`)、跑 bench、最後自動彙總。用前改兩個 TODO(serve 參數、bench client 換成你產出 0529/0602 那張表的同一支)。
+  ```bash
+  MODEL=Qwen/Qwen2.5-7B-Instruct ADDITIONAL_CONFIG='{"num_cores":16}' \
+    CONCURRENCIES="16 32 64" vllm-qaic/tools/run_tpot_ab.sh
+  ```
+- **`vllm-qaic/tools/parse_qaic_prof.py`**:把 `QAIC-PROF` log 變成判讀指標——
+  ```
+  mixed-step ratio、mean step time(~ TPOT)、pure-decode 步 vs mixed 步的 step time、
+  mean decode_qpc、mean prefill_qpc(每個 mixed step 的懲罰)
+  ```
+  ```bash
+  python3 vllm-qaic/tools/parse_qaic_prof.py off_c64.server.log on_c64.server.log
+  ```
+- **GO 判準**:ON 相對 OFF → mixed-ratio 下降、mean step time 趨近 pure-decode 值、client TPOT 逼近 0529 基準、TTFT 退化可接受、無 starvation/hang。
+
 ## 四、相關程式碼
 - profiler:`vllm-qaic/vllm_qaic/model_runner.py`(`execute_model`,`VLLM_QAIC_PROFILE` 區段)
 - 排程器:`vllm-qaic/vllm_qaic/scheduler.py`(`QaicDecodePriorityScheduler`)
