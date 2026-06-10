@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Warmup runner: sends requests from neural-bridge/rag-dataset-12000 to vLLM.
 
 Downloads the dataset from HuggingFace (cached after first run), formats
@@ -8,9 +10,7 @@ concurrently using asyncio + aiohttp.
 
 import argparse
 import asyncio
-import json
 import time
-from pathlib import Path
 
 try:
     import aiohttp
@@ -80,10 +80,9 @@ async def run_warmup(
     """Send all prompts concurrently with bounded concurrency."""
     # Discover model name from the server
     models_url = f"{base_url}/v1/models"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(models_url) as resp:
-            models_data = await resp.json()
-            model = models_data["data"][0]["id"]
+    async with aiohttp.ClientSession() as session, session.get(models_url) as resp:
+        models_data = await resp.json()
+        model = models_data["data"][0]["id"]
     print(f"Using model: {model}")
 
     completions_url = f"{base_url}/v1/completions"
@@ -99,7 +98,9 @@ async def run_warmup(
         tasks = []
         for prompt in prompts:
             task = asyncio.create_task(
-                send_request(session, completions_url, prompt, model, max_tokens, semaphore)
+                send_request(
+                    session, completions_url, prompt, model, max_tokens, semaphore
+                )
             )
             tasks.append(task)
 
@@ -116,12 +117,12 @@ async def run_warmup(
         pbar.close()
 
     elapsed = time.monotonic() - start_time
-    print(f"\nSummary:")
+    print("\nSummary:")
     print(f"  Total requests:  {total}")
     print(f"  Successful:      {total - errors}")
     print(f"  Errors:          {errors}")
     print(f"  Duration:        {elapsed:.1f}s")
-    print(f"  Throughput:      {total/elapsed:.1f} req/s")
+    print(f"  Throughput:      {total / elapsed:.1f} req/s")
 
 
 def main():

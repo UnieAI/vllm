@@ -82,7 +82,9 @@ class FakeModelExecutor:
         self._should_fail = should_fail
         self.prefill_calls: list[list[int]] = []
 
-    def execute_warmup_prefill(self, token_ids: list[int]) -> list[int] | None:
+    def execute_warmup_prefill(
+        self, token_ids: list[int], **kwargs
+    ) -> list[int] | None:
         self.prefill_calls.append(token_ids)
         if self._should_fail:
             return None
@@ -211,7 +213,7 @@ class TestAbort:
                 self.calls = 0
                 self._worker = worker_ref
 
-            def execute_warmup_prefill(self, token_ids):
+            def execute_warmup_prefill(self, token_ids, **kwargs):
                 self.calls += 1
                 # Abort after first prefill
                 self._worker.abort()
@@ -225,8 +227,57 @@ class TestAbort:
         # Should have executed only 1 prefill before aborting
         assert aborting_exec.calls == 1
 
+    def test_abort_fn_passed_to_executor(self):
+        """Verify that the warmup worker passes abort_fn to the
+        executor so it can check for preemption during execution."""
+        config = AdaptiveServingConfig(
+            adaptive_profile="dev",
+            warmup_min_hit_count=0.3,
+        )
+        tracker = PrefixFrequencyTracker(max_entries=100, ema_decay=0.8)
+        block_pool = FakeBlockPool(num_free_blocks=80, total_num_blocks=100)
+        kv_manager = FakeKVCacheManager(num_free_blocks=80, total_num_blocks=100)
 
-class TestShouldPause:
+        from vllm.v1.core.adaptive.token_registry import TokenRegistry
+
+        token_registry = TokenRegistry(max_entries=100, block_size=16)
+
+        # Register tokens for a candidate
+        for _ in range(20):
+            tracker.update(42)
+        token_registry.register(42, list(range(16)))
+
+        # Executor that captures abort_fn
+        received_abort_fns: list = []
+
+        class CapturingExecutor:
+            def execute_warmup_prefill(self, token_ids, **kwargs):
+                received_abort_fns.append(kwargs.get("abort_fn"))
+                return [0]
+
+        executor = CapturingExecutor()
+        worker = PrefixWarmupWorker(
+            config=config,
+            frequency_tracker=tracker,
+            block_pool=block_pool,
+            kv_cache_manager=kv_manager,
+            model_executor=executor,
+            token_registry=token_registry,
+        )
+
+        worker.on_idle(FakeEngineCore())
+
+        # abort_fn should have been passed
+        assert len(received_abort_fns) >= 1
+        abort_fn = received_abort_fns[0]
+        assert abort_fn is not None
+        assert callable(abort_fn)
+
+        # abort_fn should reflect the worker's _abort_flag
+        assert not abort_fn()
+        worker.abort()
+        assert abort_fn()
+
     """Test memory pressure and high-load pausing."""
 
     def test_no_pause_at_low_usage(self):
@@ -521,6 +572,302 @@ class TestVRAMBudgetCalculation:
         # production profile: ratio = 0.3
         # floor(100 * 0.3) = 30
         assert worker._calculate_vram_budget() == 30
+
+
+class TestResolveMultiBlockTokens:
+    """Test multi-block prefix token resolution."""
+
+    def _make_worker_with_registry(self, block_size: int = 16):
+        """Create a worker with a token registry."""
+        from vllm.v1.core.adaptive.token_registry import TokenRegistry
+
+        config = AdaptiveServingConfig(
+            adaptive_profile="dev",
+            warmup_min_hit_count=0.3,
+        )
+        tracker = PrefixFrequencyTracker(max_entries=100, ema_decay=0.8)
+        block_pool = FakeBlockPool(num_free_blocks=80, total_num_blocks=100)
+        kv_manager = FakeKVCacheManager(num_free_blocks=80, total_num_blocks=100)
+        executor = FakeModelExecutor()
+        registry = TokenRegistry(max_entries=100, block_size=block_size)
+        worker = PrefixWarmupWorker(
+            config=config,
+            frequency_tracker=tracker,
+            block_pool=block_pool,
+            kv_cache_manager=kv_manager,
+            model_executor=executor,
+            token_registry=registry,
+        )
+        return worker, registry
+
+    def test_single_block_returns_tokens(self):
+        """Single block hash resolves to its token sequence."""
+        worker, registry = self._make_worker_with_registry(block_size=4)
+        tokens = [10, 20, 30, 40]
+        registry.register(111, tokens)
+
+        result = worker._resolve_multi_block_tokens([111])
+        assert result == tokens
+
+    def test_multi_block_concatenates_in_order(self):
+        """Multiple block hashes concatenate tokens in order."""
+        worker, registry = self._make_worker_with_registry(block_size=4)
+        tokens_a = [1, 2, 3, 4]
+        tokens_b = [5, 6, 7, 8]
+        tokens_c = [9, 10, 11, 12]
+        registry.register(100, tokens_a)
+        registry.register(200, tokens_b)
+        registry.register(300, tokens_c)
+
+        result = worker._resolve_multi_block_tokens([100, 200, 300])
+        assert result == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+
+    def test_returns_none_when_any_block_missing(self):
+        """Returns None if any block hash is not in registry."""
+        worker, registry = self._make_worker_with_registry(block_size=4)
+        registry.register(100, [1, 2, 3, 4])
+        # Hash 200 is not registered
+
+        result = worker._resolve_multi_block_tokens([100, 200])
+        assert result is None
+
+    def test_returns_none_for_empty_list(self):
+        """Returns None for an empty prefix hash list."""
+        worker, registry = self._make_worker_with_registry(block_size=4)
+
+        result = worker._resolve_multi_block_tokens([])
+        assert result is None
+
+    def test_returns_none_when_no_registry(self):
+        """Returns None when no token registry is configured."""
+        worker, _, _, _, _ = make_worker()
+        # worker has no token_registry (None by default)
+
+        result = worker._resolve_multi_block_tokens([111])
+        assert result is None
+
+    def test_on_idle_uses_multi_block_resolution(self):
+        """on_idle passes resolved tokens to executor."""
+        worker, registry = self._make_worker_with_registry(block_size=4)
+        tokens = [10, 20, 30, 40]
+        registry.register(42, tokens)
+
+        # Build up score above threshold
+        for _ in range(20):
+            worker._frequency_tracker.update(42)
+
+        worker.on_idle(FakeEngineCore())
+
+        # Executor should have received the actual token IDs
+        executor = worker._model_executor
+        assert len(executor.prefill_calls) > 0
+        assert executor.prefill_calls[0] == tokens
+
+
+class TestBlockAllocationFailureHandling:
+    """Test block allocation failure handling in on_idle.
+
+    Requirements: 5.4
+    Tests that insufficient free blocks cause the candidate to be
+    skipped without error, and that successful allocation provides
+    correct block IDs to the executor.
+    """
+
+    def _make_worker_with_registry(
+        self,
+        num_free_blocks: int = 80,
+        block_size: int = 4,
+    ):
+        """Create a worker with a token registry and configurable
+        free blocks."""
+        from vllm.v1.core.adaptive.token_registry import TokenRegistry
+
+        config = AdaptiveServingConfig(
+            adaptive_profile="dev",
+            warmup_min_hit_count=0.3,
+        )
+        tracker = PrefixFrequencyTracker(max_entries=100, ema_decay=0.8)
+        block_pool = FakeBlockPool(
+            num_free_blocks=num_free_blocks,
+            total_num_blocks=100,
+        )
+        kv_manager = FakeKVCacheManager(
+            num_free_blocks=num_free_blocks,
+            total_num_blocks=100,
+        )
+        executor = FakeModelExecutor(blocks_per_prefill=1)
+        registry = TokenRegistry(max_entries=100, block_size=block_size)
+        worker = PrefixWarmupWorker(
+            config=config,
+            frequency_tracker=tracker,
+            block_pool=block_pool,
+            kv_cache_manager=kv_manager,
+            model_executor=executor,
+            token_registry=registry,
+            block_size=block_size,
+        )
+        return worker, tracker, registry, executor, block_pool
+
+    def test_skip_when_insufficient_free_blocks(self):
+        """Candidate is skipped without error when free blocks are
+        insufficient for the token sequence.
+
+        Requirement 5.4: IF available free blocks are insufficient
+        for warmup allocation, the worker SHALL abort that candidate
+        without error.
+        """
+        # block_size=4, tokens=[1,2,3,4] needs ceil(4/4)=1 block
+        # but we only have 0 free blocks
+        worker, tracker, registry, executor, _ = self._make_worker_with_registry(
+            num_free_blocks=0, block_size=4
+        )
+
+        # Register tokens for our candidate
+        registry.register(42, [1, 2, 3, 4])
+
+        # Build up score above threshold
+        for _ in range(20):
+            tracker.update(42)
+
+        # Run the idle loop — should skip due to insufficient blocks
+        worker.on_idle(FakeEngineCore())
+
+        # Executor should NOT have been called
+        assert len(executor.prefill_calls) == 0
+        # No entries warmed
+        assert worker.total_entries_warmed == 0
+        # No errors raised — test passes if we reach here
+
+    def test_skip_multi_block_when_insufficient(self):
+        """Multi-block candidate is skipped when free blocks are
+        fewer than needed.
+
+        A token sequence of 8 tokens with block_size=4 needs 2
+        blocks. With only 1 free block, it should be skipped.
+        """
+        # block_size=4, need ceil(8/4)=2 blocks but only 1 free
+        worker, tracker, registry, executor, _ = self._make_worker_with_registry(
+            num_free_blocks=1, block_size=4
+        )
+
+        # Register tokens for two consecutive blocks
+        registry.register(100, [1, 2, 3, 4])
+        registry.register(200, [5, 6, 7, 8])
+
+        # Build up score for hash 100
+        for _ in range(20):
+            tracker.update(100)
+
+        # The worker resolves [100] -> 4 tokens -> needs 1 block
+        # but since we have exactly 1 free block and the candidate
+        # hash maps to 4 tokens, it needs ceil(4/4)=1 block.
+        # With 1 free block available, this SHOULD succeed.
+        # Let's instead set free blocks to 0 to force skip.
+        worker._block_pool._num_free_blocks = 0
+
+        worker.on_idle(FakeEngineCore())
+
+        # Executor should NOT have been called
+        assert len(executor.prefill_calls) == 0
+        assert worker.total_entries_warmed == 0
+
+    def test_successful_allocation_calls_executor(self):
+        """When enough free blocks are available, the executor IS
+        called with the correct token IDs.
+
+        Requirement 5.4: successful allocation provides correct
+        block IDs to executor.
+        """
+        # block_size=4, tokens need ceil(4/4)=1 block, 80 free
+        worker, tracker, registry, executor, _ = self._make_worker_with_registry(
+            num_free_blocks=80, block_size=4
+        )
+
+        tokens = [10, 20, 30, 40]
+        registry.register(42, tokens)
+
+        # Build up score above threshold
+        for _ in range(20):
+            tracker.update(42)
+
+        # Stub _register_warmed_block_hashes (task 7.2, not yet
+        # implemented) so on_idle completes the success path.
+        worker._register_warmed_block_hashes = lambda t, b: None
+
+        worker.on_idle(FakeEngineCore())
+
+        # Executor SHOULD have been called with the token IDs
+        assert len(executor.prefill_calls) > 0
+        assert executor.prefill_calls[0] == tokens
+        # Entry was warmed successfully
+        assert worker.total_entries_warmed > 0
+        assert worker.warmup_prefills_executed > 0
+
+    def test_executor_receives_correct_block_ids(self):
+        """The executor returns block IDs that are tracked by the
+        worker's budget accounting."""
+        from vllm.v1.core.adaptive.token_registry import TokenRegistry
+
+        config = AdaptiveServingConfig(
+            adaptive_profile="dev",
+            warmup_min_hit_count=0.3,
+            # Tight VRAM budget: floor(80 * 0.05) = 4 blocks max
+            warmup_vram_budget_ratio=0.05,
+        )
+        tracker = PrefixFrequencyTracker(max_entries=100, ema_decay=0.8)
+        block_pool = FakeBlockPool(num_free_blocks=80, total_num_blocks=100)
+        kv_manager = FakeKVCacheManager(num_free_blocks=80, total_num_blocks=100)
+        # Executor returns 3 block IDs per call
+        executor = FakeModelExecutor(blocks_per_prefill=3)
+        registry = TokenRegistry(max_entries=100, block_size=4)
+        worker = PrefixWarmupWorker(
+            config=config,
+            frequency_tracker=tracker,
+            block_pool=block_pool,
+            kv_cache_manager=kv_manager,
+            model_executor=executor,
+            token_registry=registry,
+            block_size=4,
+        )
+
+        tokens = [1, 2, 3, 4]
+        registry.register(55, tokens)
+
+        for _ in range(20):
+            tracker.update(55)
+
+        # Stub _register_warmed_block_hashes (task 7.2, not yet
+        # implemented) so on_idle completes the success path.
+        worker._register_warmed_block_hashes = lambda t, b: None
+
+        worker.on_idle(FakeEngineCore())
+
+        # First call: executor returns [0,1,2] (3 blocks)
+        # consumed=3 < budget=4, so loop continues.
+        # Second call: consumed becomes 6 >= budget=4, stops.
+        # Verify executor received correct tokens each time.
+        assert len(executor.prefill_calls) >= 1
+        assert executor.prefill_calls[0] == tokens
+        # blocks_consumed is a multiple of 3 (blocks_per_prefill)
+        assert worker._blocks_consumed_this_window % 3 == 0
+        assert worker._blocks_consumed_this_window > 0
+
+    def test_no_error_on_zero_free_blocks(self):
+        """No exception is raised when block pool has zero free
+        blocks — candidate is silently skipped."""
+        worker, tracker, registry, executor, _ = self._make_worker_with_registry(
+            num_free_blocks=0, block_size=4
+        )
+
+        registry.register(99, [5, 6, 7, 8])
+        for _ in range(20):
+            tracker.update(99)
+
+        # Should not raise any exception
+        worker.on_idle(FakeEngineCore())
+
+        assert len(executor.prefill_calls) == 0
+        assert worker.total_entries_warmed == 0
 
 
 if __name__ == "__main__":

@@ -16,10 +16,10 @@ from statistics import mean, median
 import pytest
 import soundfile
 import torch
-from datasets import load_dataset
 from evaluate import load
 from transformers.models.whisper.english_normalizer import EnglishTextNormalizer
 
+from datasets import load_dataset
 from vllm.multimodal.audio import get_audio_duration
 from vllm.tokenizers import get_tokenizer
 

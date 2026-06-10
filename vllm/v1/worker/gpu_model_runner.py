@@ -4364,6 +4364,250 @@ class GPUModelRunner(
 
         return None
 
+    @torch.inference_mode()
+    def execute_warmup_prefill(
+        self,
+        token_ids: list[int],
+        abort_fn: Callable[[], bool] | None = None,
+    ) -> list[int] | None:
+        """Execute warmup prefill forward pass.
+
+        Build minimal prefill input, execute forward pass,
+        store KV cache into pre-allocated blocks. No sampling.
+
+        For multi-block sequences, each block is processed as a
+        separate forward pass. Between blocks, the abort flag is
+        checked — if set, the completed blocks are returned and
+        remaining blocks are skipped.
+
+        Args:
+            token_ids: Token ID sequence to warm up.
+            abort_fn: Optional callable returning True if warmup
+                should be aborted. Checked after each block's
+                forward pass completes (GPU kernels cannot be
+                interrupted mid-execution).
+
+        Returns:
+            List of block IDs where KV was stored, or None on failure.
+        """
+        if not token_ids:
+            return None
+
+        # Ensure KV cache is initialized.
+        if not hasattr(self, "kv_cache_config") or not self.kv_cache_config:
+            logger.warning("Warmup prefill skipped: KV cache not initialized.")
+            return None
+
+        kv_cache_groups = self.kv_cache_config.kv_cache_groups
+        if not kv_cache_groups:
+            logger.warning("Warmup prefill skipped: no KV cache groups configured.")
+            return None
+
+        # Get block size from the first non-encoder-only KV cache group.
+        block_size: int | None = None
+        for group in kv_cache_groups:
+            if not isinstance(group.kv_cache_spec, EncoderOnlyAttentionSpec):
+                block_size = group.kv_cache_spec.block_size
+                break
+
+        if block_size is None:
+            logger.warning("Warmup prefill skipped: could not determine block size.")
+            return None
+
+        num_tokens = len(token_ids)
+        num_blocks_needed = cdiv(num_tokens, block_size)
+        total_blocks = self.kv_cache_config.num_blocks
+
+        if num_blocks_needed > total_blocks:
+            logger.warning(
+                "Warmup prefill skipped: need %d blocks but only %d "
+                "available in KV cache.",
+                num_blocks_needed,
+                total_blocks,
+            )
+            return None
+
+        # Allocate block IDs from the end of the block pool to minimize
+        # conflicts with normal serving (block 0 is reserved as NULL).
+        # In the full implementation, block allocation is managed by
+        # KVCacheManager at the scheduler level before calling this method.
+        #
+        # Block cleanup on abort (Requirement 6.3):
+        # These block IDs are allocated from a fixed range at the top of
+        # the KV cache address space and are NOT claimed from the free
+        # pool. On abort mid-sequence, only completed_block_ids (blocks
+        # that received a valid forward pass) are returned to the caller.
+        # Unprocessed block IDs are simply not returned — they were never
+        # removed from the free pool, so no explicit freeing is needed
+        # and no block leak occurs. The caller (PrefixWarmupWorker) only
+        # registers and commits the returned (completed) blocks.
+        block_ids = list(
+            range(
+                total_blocks - num_blocks_needed,
+                total_blocks,
+            )
+        )
+
+        try:
+            # For multi-block sequences, process one block at a time
+            # so we can check the abort flag between forward passes.
+            # For single-block sequences, this loop runs exactly once.
+            completed_block_ids: list[int] = []
+
+            for block_idx in range(num_blocks_needed):
+                # Determine token range for this block.
+                start_tok = block_idx * block_size
+                end_tok = min(start_tok + block_size, num_tokens)
+                block_token_ids = token_ids[start_tok:end_tok]
+                block_num_tokens = len(block_token_ids)
+                current_block_id = block_ids[block_idx]
+
+                # Build input tensors for this block's forward pass.
+                token_ids_tensor = torch.tensor(
+                    block_token_ids, dtype=torch.int32, device=self.device
+                )
+                # Positions are absolute within the full sequence.
+                positions_tensor = torch.arange(
+                    start_tok,
+                    start_tok + block_num_tokens,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+
+                # Build slot mapping for this block.
+                slot_mapping_list = []
+                for i in range(block_num_tokens):
+                    offset = i % block_size
+                    slot = current_block_id * block_size + offset
+                    slot_mapping_list.append(slot)
+
+                slot_mapping_tensor = torch.tensor(
+                    slot_mapping_list, dtype=torch.int64, device=self.device
+                )
+
+                # Build slot mappings by layer name.
+                slot_mappings_by_layer: dict[str, torch.Tensor] = {}
+                for group in kv_cache_groups:
+                    for layer_name in group.layer_names:
+                        slot_mappings_by_layer[layer_name] = slot_mapping_tensor
+
+                # Block table includes all blocks up to and including
+                # the current one (for causal attention over the full
+                # prefix computed so far).
+                blocks_so_far = block_ids[: block_idx + 1]
+                block_table_tensor = torch.tensor(
+                    [blocks_so_far], dtype=torch.int32, device=self.device
+                )
+
+                # Sequence length is the cumulative length up to this
+                # block (the model needs to attend over all prior KV).
+                cumulative_seq_len = start_tok + block_num_tokens
+                query_start_loc = torch.tensor(
+                    [0, block_num_tokens],
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                seq_lens = torch.tensor(
+                    [cumulative_seq_len],
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+
+                common_attn_meta = CommonAttentionMetadata(
+                    query_start_loc=query_start_loc,
+                    query_start_loc_cpu=query_start_loc.cpu(),
+                    seq_lens=seq_lens,
+                    _seq_lens_cpu=seq_lens.cpu(),
+                    _num_computed_tokens_cpu=torch.tensor(
+                        [start_tok], dtype=torch.int32
+                    ),
+                    seq_lens_cpu_upper_bound=seq_lens.cpu(),
+                    num_reqs=1,
+                    num_actual_tokens=block_num_tokens,
+                    max_query_len=block_num_tokens,
+                    max_seq_len=cumulative_seq_len,
+                    block_table_tensor=block_table_tensor,
+                    slot_mapping=slot_mapping_tensor,
+                )
+
+                attn_metadata: dict[str, Any] = {}
+                for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):
+                    if isinstance(
+                        kv_cache_group.kv_cache_spec,
+                        EncoderOnlyAttentionSpec,
+                    ):
+                        continue
+                    for attn_group in self.attn_groups[kv_cache_gid]:
+                        builder = attn_group.get_metadata_builder(0)
+                        layer_metadata = builder.build(
+                            common_prefix_len=0,
+                            common_attn_metadata=common_attn_meta,
+                        )
+                        for layer_name in attn_group.layer_names:
+                            attn_metadata[layer_name] = layer_metadata
+
+                # Execute the forward pass for this block.
+                with set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=block_num_tokens,
+                    num_tokens_across_dp=None,
+                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                    slot_mapping=slot_mappings_by_layer,
+                ):
+                    self._model_forward(
+                        input_ids=token_ids_tensor,
+                        positions=positions_tensor,
+                        intermediate_tensors=None,
+                        inputs_embeds=None,
+                    )
+
+                completed_block_ids.append(current_block_id)
+
+                # Check abort flag after forward pass completes.
+                # GPU kernels cannot be interrupted, but we can stop
+                # before starting the next block.
+                #
+                # On abort, only the blocks that completed their forward
+                # pass are returned (completed_block_ids). This ensures:
+                # - Completed blocks have valid KV cache and can be
+                #   committed by the caller (Requirement 6.3).
+                # - Unprocessed blocks are not in completed_block_ids
+                #   and were never claimed from the free pool, so no
+                #   explicit release is needed — no block leak.
+                # - No locks are held during warmup execution, so
+                #   normal scheduling is never blocked (Requirement 6.4).
+                if abort_fn is not None and abort_fn():
+                    logger.debug(
+                        "Warmup prefill aborted after block %d/%d "
+                        "(completed %d blocks)",
+                        block_idx + 1,
+                        num_blocks_needed,
+                        len(completed_block_ids),
+                    )
+                    return completed_block_ids if completed_block_ids else None
+
+            logger.debug(
+                "Warmup prefill completed: %d tokens, %d blocks (block_ids=%s)",
+                num_tokens,
+                num_blocks_needed,
+                block_ids,
+            )
+            return completed_block_ids
+
+        except torch.cuda.OutOfMemoryError:
+            logger.warning(
+                "Warmup prefill failed: GPU OOM for %d tokens. "
+                "Freeing blocks and returning None.",
+                num_tokens,
+            )
+            # Let PyTorch reclaim cached memory.
+            torch.accelerator.empty_cache()
+            return None
+        except Exception as e:
+            logger.warning("Warmup prefill failed with error: %s", e)
+            return None
+
     def _input_fits_in_drafter(
         self, common_attn_metadata: CommonAttentionMetadata | None
     ) -> bool:

@@ -39,6 +39,7 @@ class TestInitAdaptiveServing:
 
         mock_scheduler = MagicMock()
         mock_scheduler.kv_cache_manager = mock_kv_cache_manager
+        mock_scheduler.block_size = 16
         stub.scheduler = mock_scheduler
 
         # Mock model executor
@@ -158,9 +159,7 @@ class TestInitAdaptiveServing:
             callback(stub)
         # 2. Re-register adaptive callback (done by the method)
         if stub._warmup_worker is not None:
-            stub._idle_state_callbacks.append(
-                stub._adaptive_warmup_idle_callback
-            )
+            stub._idle_state_callbacks.append(stub._adaptive_warmup_idle_callback)
 
         # Should be re-registered for next idle window
         assert len(stub._idle_state_callbacks) == 1
@@ -245,10 +244,11 @@ class TestInitAdaptiveServing:
         stub._maybe_persist_state()
 
         # File should still have original content (or be empty from
-        # a failed JSON load, but persister.load() would return None, None
-        # so the tracker stays fresh)
+        # a failed JSON load, but persister.load() would return
+        # None, None, None so the tracker stays fresh)
         # Actually the file was overwritten with "original" text which
-        # isn't valid JSON, so persister.load() returns None, None.
+        # isn't valid JSON, so persister.load() returns
+        # None, None, None.
         # The point is that _maybe_persist_state should not write because
         # the interval hasn't elapsed yet.
 
@@ -265,3 +265,61 @@ class TestInitAdaptiveServing:
         assert stub._frequency_tracker is not None
         assert stub._frequency_tracker.ema_decay == 0.8
         assert stub._adaptive_config.warmup_budget_ms == 200.0
+
+    def test_tracker_injected_when_enabled(self):
+        """When warmup is enabled, scheduler.prefix_frequency_tracker
+        is set to the frequency tracker instance."""
+        stub = self._make_engine_core_stub()
+        vllm_config = self._make_vllm_config(
+            enable_adaptive_warmup=True,
+        )
+
+        stub._init_adaptive_serving(vllm_config)
+
+        assert stub._frequency_tracker is not None
+        assert stub.scheduler.prefix_frequency_tracker is stub._frequency_tracker
+
+    def test_token_registry_injected_when_enabled(self):
+        """When warmup is enabled, scheduler.token_registry is set
+        to a TokenRegistry instance."""
+        from vllm.v1.core.adaptive.token_registry import TokenRegistry
+
+        stub = self._make_engine_core_stub()
+        vllm_config = self._make_vllm_config(
+            enable_adaptive_warmup=True,
+        )
+
+        stub._init_adaptive_serving(vllm_config)
+
+        assert isinstance(stub.scheduler.token_registry, TokenRegistry)
+        assert stub.scheduler.token_registry is stub._token_registry
+
+    def test_tracker_none_when_disabled(self):
+        """When warmup is disabled, scheduler.prefix_frequency_tracker
+        remains None (no injection occurs)."""
+        stub = self._make_engine_core_stub()
+        # Ensure initial state: scheduler mock attributes not set
+        stub.scheduler.prefix_frequency_tracker = None
+        vllm_config = self._make_vllm_config(
+            enable_adaptive_warmup=False,
+        )
+
+        stub._init_adaptive_serving(vllm_config)
+
+        assert stub.scheduler.prefix_frequency_tracker is None
+
+    def test_injection_logs_info_message(self):
+        """INFO log is emitted when tracker is injected."""
+        from unittest.mock import patch
+
+        stub = self._make_engine_core_stub()
+        vllm_config = self._make_vllm_config(
+            enable_adaptive_warmup=True,
+        )
+
+        with patch("vllm.v1.engine.core.logger") as mock_logger:
+            stub._init_adaptive_serving(vllm_config)
+
+        # Check that logger.info was called with the injection message
+        info_calls = [str(call) for call in mock_logger.info.call_args_list]
+        assert any("injected frequency tracker" in call for call in info_calls)

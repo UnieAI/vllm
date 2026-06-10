@@ -4,9 +4,9 @@
 from typing import cast
 
 import torch
-from datasets import load_dataset
 
 import tests.ci_envs as ci_envs
+from datasets import load_dataset
 from tests.models.utils import (
     GenerateModelInfo,
     TokensTextLogprobsPromptLogprobs,

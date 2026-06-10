@@ -113,7 +113,9 @@ class SelfSpeculationProposer:
         sampled_token_ids: list[list[int]],
         num_tokens_no_spec: np.ndarray,
         token_ids_cpu: np.ndarray,
-        slot_mappings: dict[str, torch.Tensor] | None = None,
+        slot_mappings: (
+            dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+        ) = None,
     ) -> list[list[int]]:
         """Propose speculative tokens based on confidence.
 

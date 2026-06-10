@@ -946,6 +946,15 @@ class Worker(WorkerBase):
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
         self.model_runner._dummy_run(num_tokens, uniform_decode=True)
 
+    @torch.inference_mode()
+    def execute_warmup_prefill(
+        self,
+        token_ids: list[int],
+        abort_fn: Callable[[], bool] | None = None,
+    ) -> list[int] | None:
+        """Delegate warmup prefill to model runner."""
+        return self.model_runner.execute_warmup_prefill(token_ids, abort_fn)
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)
 

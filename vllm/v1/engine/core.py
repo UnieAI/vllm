@@ -22,6 +22,7 @@ import zmq
 
 import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
+from vllm.config.cache import CacheDType
 from vllm.distributed import (
     cleanup_dist_env_and_memory,
     stateless_destroy_torch_distributed_process_group,
@@ -254,6 +255,7 @@ class EngineCore:
         self._frequency_tracker: PrefixFrequencyTracker | None = None
         self._confidence_tracker: ConfidenceTracker | None = None
         self._state_persister: StatePersister | None = None
+        self._token_registry: Any = None
         self._last_persist_time: float = 0.0
         self._block_pool_ref: Any = None
 
@@ -275,13 +277,14 @@ class EngineCore:
         )
 
         # Initialize StatePersister if path is configured
+        _registry_data: dict | None = None
         if adaptive_config.self_spec_stats_persist_path is not None:
             self._state_persister = StatePersister(
                 path=adaptive_config.self_spec_stats_persist_path,
                 interval_seconds=adaptive_config.persist_interval_seconds,
             )
             # Load persisted state
-            freq_data, conf_data = self._state_persister.load()
+            freq_data, conf_data, _registry_data = self._state_persister.load()
             if freq_data is not None:
                 self._frequency_tracker = PrefixFrequencyTracker.from_dict(
                     freq_data,
@@ -304,10 +307,40 @@ class EngineCore:
                     adaptive_config.self_spec_stats_persist_path,
                 )
 
+        # Inject frequency tracker into Scheduler so it receives
+        # prefix lookup events at runtime.
+        self.scheduler.prefix_frequency_tracker = self._frequency_tracker  # type: ignore[attr-defined]
+
+        # Create and inject TokenRegistry into Scheduler for
+        # block hash → token ID reverse mapping.
+        from vllm.v1.core.adaptive.token_registry import TokenRegistry
+
+        token_registry = TokenRegistry(
+            max_entries=adaptive_config.warmup_max_prefixes,
+            block_size=self.scheduler.block_size,  # type: ignore[attr-defined]
+        )
+
+        # Load TokenRegistry from persisted state if available
+        if _registry_data is not None:
+            token_registry = self._load_token_registry_state(
+                token_registry,
+                _registry_data,
+                adaptive_config.warmup_max_prefixes,
+                self.scheduler.block_size,  # type: ignore[attr-defined]
+            )
+
+        self.scheduler.token_registry = token_registry  # type: ignore[attr-defined]
+        self._token_registry = token_registry
+
+        logger.info(
+            "Adaptive serving: injected frequency tracker and "
+            "token registry into Scheduler"
+        )
+
         # Initialize PrefixWarmupWorker
         # Access block_pool and kv_cache_manager from the scheduler
-        block_pool = self.scheduler.kv_cache_manager.block_pool
-        kv_cache_manager = self.scheduler.kv_cache_manager
+        block_pool = self.scheduler.kv_cache_manager.block_pool  # type: ignore[attr-defined]
+        kv_cache_manager = self.scheduler.kv_cache_manager  # type: ignore[attr-defined]
         self._block_pool_ref = block_pool
 
         # Pass KV cache dtype and head size for TurboQuant-aware
@@ -318,6 +351,7 @@ class EngineCore:
         # Ensure we have a valid string (handles MagicMock in tests)
         if not isinstance(kv_cache_dtype, str):
             kv_cache_dtype = "auto"
+        kv_cache_dtype_typed = cast(CacheDType, kv_cache_dtype)
         head_size_val = getattr(
             getattr(vllm_config, "model_config", None), "get_head_size", None
         )
@@ -330,8 +364,11 @@ class EngineCore:
             block_pool=block_pool,
             kv_cache_manager=kv_cache_manager,
             model_executor=self.model_executor,
-            kv_cache_dtype=kv_cache_dtype,
+            kv_cache_dtype=kv_cache_dtype_typed,
             head_size=head_size,
+            token_registry=token_registry,
+            block_size=block_pool.hash_block_size,
+            caching_hash_fn=self._resolve_caching_hash_fn(vllm_config),
         )
 
         # Register warmup_worker.on_idle as idle state callback
@@ -377,8 +414,60 @@ class EngineCore:
             self._state_persister.save(
                 self._frequency_tracker,
                 self._confidence_tracker,
+                token_registry=self._token_registry,
             )
             self._last_persist_time = now
+
+    def _resolve_caching_hash_fn(self, vllm_config: Any) -> Any:
+        """Resolve the caching hash function for block hash computation.
+
+        Returns the hash function used for prefix caching block hashes,
+        or None if prefix caching is not enabled or the config is not
+        properly set (e.g., in tests using MagicMock).
+        """
+        try:
+            cache_config = vllm_config.cache_config
+            enable = getattr(cache_config, "enable_prefix_caching", False)
+            if enable is True:
+                algo = cache_config.prefix_caching_hash_algo
+                if isinstance(algo, str):
+                    return get_hash_fn_by_name(algo)
+        except (AttributeError, TypeError, ValueError):
+            pass
+        return None
+
+    def _load_token_registry_state(
+        self,
+        token_registry: Any,
+        registry_data: dict,
+        max_entries: int,
+        block_size: int,
+    ) -> Any:
+        """Load TokenRegistry state from persisted data.
+
+        Uses the ``token_registry`` dict extracted by
+        ``StatePersister.load()``.  If the data is malformed, logs a
+        WARNING and returns the original (empty) registry unchanged.
+        """
+        from vllm.v1.core.adaptive.token_registry import TokenRegistry
+
+        if not isinstance(registry_data, dict):
+            logger.warning(
+                "Persisted token registry data has invalid type. "
+                "Creating empty registry."
+            )
+            return token_registry
+
+        restored = TokenRegistry.from_dict(
+            registry_data,
+            max_entries=max_entries,
+            block_size=block_size,
+        )
+        logger.info(
+            "Loaded persisted token registry data (%d entries)",
+            len(restored),
+        )
+        return restored
 
     def _attach_adaptive_serving_stats(
         self, engine_core_outputs: dict[int, "EngineCoreOutputs"]
@@ -1486,9 +1575,7 @@ class EngineCoreProc(EngineCore):
         # window if it was drained above. Cannot re-register inside
         # the callback itself (while-drain causes infinite loop).
         if self._warmup_worker is not None:
-            self._idle_state_callbacks.append(
-                self._adaptive_warmup_idle_callback
-            )
+            self._idle_state_callbacks.append(self._adaptive_warmup_idle_callback)
 
     def _handle_shutdown(self) -> bool:
         # Check if shutdown was requested and handle it

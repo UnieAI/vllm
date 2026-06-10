@@ -7,10 +7,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-import datasets
 import pytest
 import torch
 
+import datasets
 from tests.utils import create_new_process_for_each_test
 from vllm import LLM, SamplingParams, TokensPrompt
 from vllm.config import CacheConfig

@@ -211,7 +211,7 @@ class TestPersistenceRoundTrip:
             persister.save(freq_tracker, conf_tracker)
 
             # Load back
-            freq_data, conf_data = persister.load()
+            freq_data, conf_data, _registry_data = persister.load()
 
         # Verify data was loaded successfully
         assert freq_data is not None
@@ -351,7 +351,7 @@ class TestCorruptedDataGracefulFallback:
 
             persister = StatePersister(path=path, interval_seconds=60.0)
             result = persister.load()
-            assert result == (None, None)
+            assert result == (None, None, None)
 
     @given(truncated=truncated_json_strategy())
     @settings(max_examples=100)
@@ -367,7 +367,7 @@ class TestCorruptedDataGracefulFallback:
 
             persister = StatePersister(path=path, interval_seconds=60.0)
             result = persister.load()
-            assert result == (None, None)
+            assert result == (None, None, None)
 
     @given(content=wrong_schema_version_strategy())
     @settings(max_examples=100)
@@ -383,7 +383,7 @@ class TestCorruptedDataGracefulFallback:
 
             persister = StatePersister(path=path, interval_seconds=60.0)
             result = persister.load()
-            assert result == (None, None)
+            assert result == (None, None, None)
 
     @given(content=missing_required_fields_strategy())
     @settings(max_examples=100)
@@ -399,4 +399,4 @@ class TestCorruptedDataGracefulFallback:
 
             persister = StatePersister(path=path, interval_seconds=60.0)
             result = persister.load()
-            assert result == (None, None)
+            assert result == (None, None, None)

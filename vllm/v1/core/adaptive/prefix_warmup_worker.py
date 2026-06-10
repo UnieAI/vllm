@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import math
 import time
-from typing import Any, Protocol
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, Protocol
 
 from vllm.config.adaptive_serving import AdaptiveServingConfig
 from vllm.config.cache import CacheDType
@@ -21,6 +22,14 @@ from vllm.v1.core.adaptive.metrics import AdaptiveServingLogging
 from vllm.v1.core.adaptive.prefix_frequency_tracker import (
     PrefixFrequencyTracker,
 )
+from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
+    hash_block_tokens,
+    make_block_hash_with_group_id,
+)
+
+if TYPE_CHECKING:
+    from vllm.v1.core.adaptive.token_registry import TokenRegistry
 
 logger = init_logger(__name__)
 
@@ -80,6 +89,10 @@ class BlockPoolProtocol(Protocol):
         """Return number of free (unallocated) KV cache blocks."""
         ...
 
+    def free_blocks(self, ordered_blocks: Any) -> None:
+        """Free blocks back to the pool."""
+        ...
+
 
 class KVCacheManagerProtocol(Protocol):
     """Protocol for the KV cache manager interface.
@@ -106,8 +119,18 @@ class ModelExecutorProtocol(Protocol):
     This protocol defines the minimal interface for warmup prefill.
     """
 
-    def execute_warmup_prefill(self, token_ids: list[int]) -> list[int] | None:
+    def execute_warmup_prefill(
+        self,
+        token_ids: list[int],
+        abort_fn: Callable[[], bool] | None = None,
+    ) -> list[int] | None:
         """Execute a warmup prefill for the given token IDs.
+
+        Args:
+            token_ids: Token IDs to execute prefill for.
+            abort_fn: Optional callable returning True if warmup
+                should be aborted. Checked after each block's
+                forward pass for multi-block sequences.
 
         Returns a list of block IDs where KV cache was stored,
         or None if the prefill failed or was aborted.
@@ -152,12 +175,18 @@ class PrefixWarmupWorker:
         model_executor: Any,
         kv_cache_dtype: CacheDType = "auto",
         head_size: int = 128,
+        token_registry: TokenRegistry | None = None,
+        block_size: int = 16,
+        caching_hash_fn: Callable[[Any], bytes] | None = None,
     ) -> None:
         self._config = config
         self._frequency_tracker = frequency_tracker
         self._block_pool: BlockPoolProtocol = block_pool
         self._kv_cache_manager: KVCacheManagerProtocol = kv_cache_manager
         self._model_executor: ModelExecutorProtocol = model_executor
+        self._token_registry = token_registry
+        self._block_size = block_size
+        self._caching_hash_fn = caching_hash_fn
 
         # KV cache dtype configuration for TurboQuant compatibility.
         # Used to compute compressed block sizes in VRAM budget
@@ -191,6 +220,8 @@ class PrefixWarmupWorker:
         # Metrics / counters
         self._total_entries_warmed: int = 0
         self._blocks_consumed_this_window: int = 0
+        self.warmup_prefills_executed: int = 0
+        self.warmup_prefills_skipped_no_tokens: int = 0
 
         # Periodic logging (every 60s)
         self._logging = AdaptiveServingLogging()
@@ -278,12 +309,68 @@ class PrefixWarmupWorker:
 
             prefix_hash, _score = candidate
 
-            # Submit prefill via model executor
-            result_blocks = self._model_executor.execute_warmup_prefill([prefix_hash])
+            # Resolve token IDs from registry if available
+            if self._token_registry is not None:
+                token_ids = self._resolve_multi_block_tokens([prefix_hash])
+                if token_ids is None:
+                    self.warmup_prefills_skipped_no_tokens += 1
+                    logger.debug(
+                        "Warmup skipped: no tokens in registry for hash=%d",
+                        prefix_hash,
+                    )
+                    continue
+            else:
+                # Fallback: pass hash as single-element list
+                # (legacy behavior when no registry configured)
+                token_ids = [prefix_hash]
+
+            # Check if enough free blocks are available before
+            # attempting the prefill to avoid wasting GPU computation.
+            num_blocks_needed = math.ceil(len(token_ids) / self._block_size)
+            if self._block_pool.get_num_free_blocks() < num_blocks_needed:
+                logger.debug(
+                    "Warmup skipped: insufficient free blocks "
+                    "(need=%d, free=%d) for hash=%d",
+                    num_blocks_needed,
+                    self._block_pool.get_num_free_blocks(),
+                    prefix_hash,
+                )
+                continue
+
+            # Submit prefill via model executor, passing abort_fn so
+            # the execution path can check for preemption between
+            # per-block forward passes in multi-block sequences.
+            start_time = time.monotonic()
+            result_blocks = self._model_executor.execute_warmup_prefill(
+                token_ids, abort_fn=lambda: self._abort_flag
+            )
+            elapsed_ms = (time.monotonic() - start_time) * 1000
 
             if result_blocks is not None:
+                # Register block hashes in the block pool so that
+                # subsequent requests with matching prefixes find them
+                # in the prefix cache.
+                #
+                # Block cleanup on abort (Requirement 6.3):
+                # The executor returns ONLY block IDs for blocks that
+                # completed their forward pass (valid KV cache). On
+                # abort mid-sequence, this list is shorter than
+                # num_blocks_needed — we only commit the completed
+                # blocks. Unprocessed blocks were never claimed from
+                # the free pool (the model runner allocates from a
+                # fixed range), so no explicit freeing is required.
+                # This guarantees: all blocks are either committed
+                # (hash registered) or never-allocated — no leaks.
+                self._register_warmed_block_hashes(token_ids, result_blocks)
                 self._blocks_consumed_this_window += len(result_blocks)
                 self._total_entries_warmed += 1
+                self.warmup_prefills_executed += 1
+                logger.debug(
+                    "Warmup prefill: hash=%d, tokens=%d, elapsed_ms=%.2f",
+                    prefix_hash,
+                    len(token_ids),
+                    elapsed_ms,
+                )
 
         # Periodic logging (every 60s)
         self._maybe_log_progress()
@@ -384,9 +471,7 @@ class PrefixWarmupWorker:
         free_blocks = self._block_pool.get_num_free_blocks()
         # Estimate total blocks from free + cached (approximate)
         total_est = free_blocks + cached_count
-        hit_rate = (
-            (cached_count / total_est * 100.0) if total_est > 0 else 0.0
-        )
+        hit_rate = (cached_count / total_est * 100.0) if total_est > 0 else 0.0
 
         self._logging.maybe_log(
             total_entries_warmed=self._total_entries_warmed,
@@ -444,6 +529,108 @@ class PrefixWarmupWorker:
         # However, we expose the compression_ratio for external callers
         # (metrics, budget estimation) that work in byte terms.
         return max(0, budget)
+
+    def _resolve_multi_block_tokens(self, prefix_hashes: list[int]) -> list[int] | None:
+        """Resolve and concatenate token sequences from multiple
+        block hashes.
+
+        For multi-block prefixes, each block hash maps to a
+        fixed-size token sequence in the TokenRegistry. This method
+        looks up each hash in prefix order and concatenates the
+        resulting token sequences into a single list suitable for
+        passing to ``execute_warmup_prefill``.
+
+        Args:
+            prefix_hashes: Ordered list of block hashes forming a
+                multi-block prefix. Must contain at least one hash.
+
+        Returns:
+            Concatenated token IDs from all blocks in prefix order,
+            or None if any block hash is missing from the registry.
+        """
+        if self._token_registry is None:
+            return None
+
+        if not prefix_hashes:
+            return None
+
+        concatenated: list[int] = []
+        for block_hash in prefix_hashes:
+            tokens = self._token_registry.get_tokens(block_hash)
+            if tokens is None:
+                return None
+            concatenated.extend(tokens)
+
+        return concatenated
+
+    def _register_warmed_block_hashes(
+        self,
+        token_ids: list[int],
+        block_ids: list[int],
+    ) -> None:
+        """Register warmed blocks in the block pool prefix cache.
+
+        Computes block hashes using the same algorithm as the normal
+        request path (``hash_block_tokens``) and registers them in
+        the block pool's ``cached_block_hash_to_block`` map. After
+        registration, blocks are freed so they have the same eviction
+        priority as blocks produced by normal user requests.
+
+        Args:
+            token_ids: The full token sequence that was warmed.
+            block_ids: Block IDs returned by execute_warmup_prefill.
+        """
+        if self._caching_hash_fn is None:
+            # Cannot register without a hash function — this means
+            # prefix caching is not enabled.
+            return
+
+        # Verify block pool supports hash registration.
+        block_pool = self._block_pool
+        if not hasattr(block_pool, "blocks") or not hasattr(
+            block_pool, "cached_block_hash_to_block"
+        ):
+            return
+
+        # Compute block hashes matching the normal request path.
+        # The algorithm chains hashes: each block's hash depends on
+        # its parent (previous block's hash).
+        parent_hash: BlockHash | None = None
+        block_size = self._block_size
+
+        for i, block_id in enumerate(block_ids):
+            start = i * block_size
+            end = start + block_size
+            block_tokens = token_ids[start:end]
+
+            if len(block_tokens) < block_size:
+                # Incomplete final block — skip hash registration.
+                break
+
+            block_hash = hash_block_tokens(
+                self._caching_hash_fn,
+                parent_hash,
+                block_tokens,
+                extra_keys=None,
+            )
+
+            # Register in block pool (group_id=0 for standard
+            # single-group KV cache).
+            block_hash_with_group = make_block_hash_with_group_id(block_hash, 0)
+
+            # Access the KVCacheBlock object and set its hash.
+            block = block_pool.blocks[block_id]
+            if block.block_hash is None:
+                block.block_hash = block_hash_with_group
+                block_pool.cached_block_hash_to_block.insert(
+                    block_hash_with_group, block
+                )
+
+            # Free the block so it becomes an eviction candidate
+            # with the same priority as normal cached blocks.
+            block_pool.free_blocks([block])
+
+            parent_hash = block_hash
 
     def get_estimated_block_size_bytes(self, block_size: int, num_kv_heads: int) -> int:
         """Estimate the VRAM size of a single KV block in bytes.

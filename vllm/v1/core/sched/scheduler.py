@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.adaptive.prefix_frequency_tracker import (
         PrefixFrequencyTracker,
     )
+    from vllm.v1.core.adaptive.token_registry import TokenRegistry
 
 logger = init_logger(__name__)
 
@@ -90,6 +91,7 @@ class Scheduler(SchedulerInterface):
         self.log_stats = log_stats
         self.observability_config = vllm_config.observability_config
         self.prefix_frequency_tracker = prefix_frequency_tracker
+        self.token_registry: TokenRegistry | None = None
         self.kv_metrics_collector: KVCacheMetricsCollector | None = None
         if self.observability_config.kv_cache_metrics:
             self.kv_metrics_collector = KVCacheMetricsCollector(
@@ -618,8 +620,16 @@ class Scheduler(SchedulerInterface):
                     # Emit prefix lookup events to the frequency
                     # tracker for adaptive warmup.
                     if self.prefix_frequency_tracker is not None:
-                        for blk_hash in request.block_hashes:
-                            self.prefix_frequency_tracker.update(hash(blk_hash))
+                        for idx, blk_hash in enumerate(request.block_hashes):
+                            h = hash(blk_hash)
+                            self.prefix_frequency_tracker.update(h)
+                            # Register token sequence to registry
+                            if self.token_registry is not None:
+                                start = idx * self.block_size
+                                end = start + self.block_size
+                                tokens = request.all_token_ids[start:end]
+                                if len(tokens) == self.block_size:
+                                    self.token_registry.register(h, list(tokens))
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:

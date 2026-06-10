@@ -131,6 +131,33 @@ class UniProcExecutor(Executor):
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.collective_rpc("take_draft_token_ids", single_value=True)
 
+    def execute_warmup_prefill(
+        self,
+        token_ids: list[int],
+        abort_fn: Callable[[], bool] | None = None,
+    ) -> list[int] | None:
+        """Execute warmup prefill forward pass.
+
+        Synchronous blocking execution. Returns block IDs on success,
+        None on failure.
+
+        Args:
+            token_ids: Token IDs to execute prefill for.
+            abort_fn: Optional callable returning True if warmup
+                should be aborted. Passed to the worker/model runner
+                for checking between per-block forward passes.
+        """
+        try:
+            result = self.collective_rpc(
+                "execute_warmup_prefill",
+                args=(token_ids, abort_fn),
+                single_value=True,
+            )
+            return result
+        except Exception as e:
+            logger.warning("Warmup prefill failed: %s", e)
+            return None
+
     def check_health(self) -> None:
         # UniProcExecutor will always be healthy as long as
         # it's running.

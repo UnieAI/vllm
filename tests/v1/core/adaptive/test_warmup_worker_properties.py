@@ -65,7 +65,9 @@ class FakeKVCacheManager:
 class FakeModelExecutor:
     """Minimal fake for ModelExecutorProtocol."""
 
-    def execute_warmup_prefill(self, token_ids: list[int]) -> list[int] | None:
+    def execute_warmup_prefill(
+        self, token_ids: list[int], **kwargs
+    ) -> list[int] | None:
         return None
 
 
@@ -76,7 +78,9 @@ class FakeModelExecutorWithBlocks:
         self._blocks_per_prefill = blocks_per_prefill
         self.prefill_calls: list[list[int]] = []
 
-    def execute_warmup_prefill(self, token_ids: list[int]) -> list[int] | None:
+    def execute_warmup_prefill(
+        self, token_ids: list[int], **kwargs
+    ) -> list[int] | None:
         self.prefill_calls.append(token_ids)
         return list(range(self._blocks_per_prefill))
 

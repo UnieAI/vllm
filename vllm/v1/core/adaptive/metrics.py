@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import time
 
-from prometheus_client import Gauge
+from prometheus_client import Counter, Gauge
 
 from vllm.logger import init_logger
 from vllm.v1.metrics.utils import create_metric_per_engine
@@ -31,6 +31,7 @@ class AdaptiveServingProm:
     """
 
     _gauge_cls = Gauge
+    _counter_cls = Counter
 
     def __init__(
         self,
@@ -91,6 +92,31 @@ class AdaptiveServingProm:
             gauge_confidence_tracker_mean_threshold, per_engine_labelvalues
         )
 
+        counter_warmup_prefills_executed = self._counter_cls(
+            name="vllm:warmup_prefills_executed",
+            documentation=(
+                "Total number of successful GPU warmup prefill "
+                "operations since startup (adaptive serving)."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_warmup_prefills_executed = create_metric_per_engine(
+            counter_warmup_prefills_executed, per_engine_labelvalues
+        )
+
+        counter_warmup_prefills_skipped_no_tokens = self._counter_cls(
+            name="vllm:warmup_prefills_skipped_no_tokens",
+            documentation=(
+                "Total warmup candidates skipped due to missing "
+                "token registry entries (adaptive serving)."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_warmup_prefills_skipped_no_tokens = create_metric_per_engine(
+            counter_warmup_prefills_skipped_no_tokens,
+            per_engine_labelvalues,
+        )
+
     def observe(
         self,
         prefix_cache_hit_rate: float,
@@ -125,6 +151,32 @@ class AdaptiveServingProm:
         self.gauge_confidence_tracker_mean_threshold[engine_idx].set(
             confidence_tracker_mean_threshold
         )
+
+    def observe_warmup_counters(
+        self,
+        prefills_executed: int,
+        prefills_skipped_no_tokens: int,
+        engine_idx: int = 0,
+    ) -> None:
+        """Increment warmup counter metrics.
+
+        Args:
+            prefills_executed: Number of new successful warmup
+                prefills since last call.
+            prefills_skipped_no_tokens: Number of new warmup
+                candidates skipped due to missing tokens since
+                last call.
+            engine_idx: Engine index for labeled metrics.
+        """
+        if not self.enabled:
+            return
+
+        if prefills_executed > 0:
+            self.counter_warmup_prefills_executed[engine_idx].inc(prefills_executed)
+        if prefills_skipped_no_tokens > 0:
+            self.counter_warmup_prefills_skipped_no_tokens[engine_idx].inc(
+                prefills_skipped_no_tokens
+            )
 
 
 class AdaptiveServingLogging:

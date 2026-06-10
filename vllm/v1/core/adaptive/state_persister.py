@@ -40,6 +40,7 @@ class StatePersister:
         self,
         frequency_tracker: _Serializable,
         confidence_tracker: _Serializable,
+        token_registry: _Serializable | None = None,
     ) -> None:
         """Atomically write state to disk (write tmp -> rename).
 
@@ -53,6 +54,9 @@ class StatePersister:
             "prefix_frequencies": frequency_tracker.to_dict(),
             "confidence_thresholds": confidence_tracker.to_dict(),
         }
+
+        if token_registry is not None:
+            state["token_registry"] = token_registry.to_dict()
 
         tmp_path = f"{self.path}.tmp"
         try:
@@ -84,16 +88,18 @@ class StatePersister:
             with contextlib.suppress(OSError):
                 os.unlink(tmp_path)
 
-    def load(self) -> tuple[dict | None, dict | None]:
+    def load(self) -> tuple[dict | None, dict | None, dict | None]:
         """Load and validate persisted state.
 
         Returns:
-            A tuple of (freq_data, conf_data). Returns (None, None)
-            if the file doesn't exist, is corrupted, has a wrong
-            schema version, or is missing required fields.
+            A tuple of (freq_data, conf_data, token_registry_data).
+            Returns (None, None, None) if the file doesn't exist, is
+            corrupted, has a wrong schema version, or is missing
+            required fields.  token_registry_data may be None even
+            when the other fields are valid (backward compatibility).
         """
         if not os.path.exists(self.path):
-            return (None, None)
+            return (None, None, None)
 
         try:
             with open(self.path) as f:
@@ -105,7 +111,7 @@ class StatePersister:
                 self.path,
                 e,
             )
-            return (None, None)
+            return (None, None, None)
 
         # Validate top-level structure
         if not isinstance(data, dict):
@@ -113,7 +119,7 @@ class StatePersister:
                 "Persisted state at %s has invalid format. Starting with fresh state.",
                 self.path,
             )
-            return (None, None)
+            return (None, None, None)
 
         # Validate schema version
         schema_version = data.get("schema_version")
@@ -125,7 +131,7 @@ class StatePersister:
                 schema_version,
                 self.SCHEMA_VERSION,
             )
-            return (None, None)
+            return (None, None, None)
 
         # Validate required fields
         freq_data = data.get("prefix_frequencies")
@@ -137,7 +143,7 @@ class StatePersister:
                 "Starting with fresh state.",
                 self.path,
             )
-            return (None, None)
+            return (None, None, None)
 
         if not isinstance(freq_data, dict) or not isinstance(conf_data, dict):
             logger.info(
@@ -145,6 +151,16 @@ class StatePersister:
                 "Starting with fresh state.",
                 self.path,
             )
-            return (None, None)
+            return (None, None, None)
 
-        return (freq_data, conf_data)
+        # Extract token_registry data (optional for backward compat)
+        registry_data = data.get("token_registry")
+        if registry_data is not None and not isinstance(registry_data, dict):
+            logger.warning(
+                "Persisted state at %s has invalid token_registry "
+                "format. Ignoring token registry data.",
+                self.path,
+            )
+            registry_data = None
+
+        return (freq_data, conf_data, registry_data)
