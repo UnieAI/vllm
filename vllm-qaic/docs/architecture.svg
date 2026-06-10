@@ -1,0 +1,304 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 1660" font-family="Segoe UI, Arial, sans-serif" font-size="12">
+  <!-- Background -->
+  <rect width="1200" height="1660" fill="#1e1e2e"/>
+  
+  <!-- Title -->
+  <text x="600" y="30" text-anchor="middle" font-size="20" font-weight="bold" fill="#ffffff">vLLM Architecture — CUDA vs QAIC Backend</text>
+  
+  <!-- Legend -->
+  <rect x="30" y="50" width="16" height="16" rx="3" fill="#3a3a4a" stroke="#888"/>
+  <text x="52" y="63" fill="#ffffff" font-size="12">vLLM Core (shared base)</text>
+  <rect x="250" y="50" width="16" height="16" rx="3" fill="#1a3a5c" stroke="#4a9eff"/>
+  <text x="272" y="63" fill="#ffffff" font-size="12">QAIC Backend</text>
+  <rect x="420" y="50" width="16" height="16" rx="3" fill="#2d1a3a" stroke="#b47aff"/>
+  <text x="442" y="63" fill="#ffffff" font-size="12">CUDA Backend</text>
+  <rect x="590" y="50" width="16" height="16" rx="3" fill="#3d3520" stroke="#d4a843"/>
+  <text x="612" y="63" fill="#ffffff" font-size="12">Qualcomm Runtime</text>
+  <rect x="790" y="50" width="16" height="16" rx="3" fill="#173d31" stroke="#55c998"/>
+  <text x="812" y="63" fill="#ffffff" font-size="12">Plugin / Config / Flow</text>
+  <rect x="990" y="50" width="16" height="16" rx="3" fill="#4a2f14" stroke="#ffb86c"/>
+  <text x="1012" y="63" fill="#ffffff" font-size="12">QEfficient compile-time</text>
+  <!-- Override legend -->
+  <rect x="30" y="72" width="16" height="16" rx="3" fill="none" stroke="#ff4444" stroke-width="1.5"/>
+  <text x="52" y="85" fill="#ff4444" font-size="12" font-weight="bold">Red text = override function (overrides parent class)</text>
+
+  <!-- ==================== WORKER LAYER ==================== -->
+  <text x="30" y="110" font-size="14" font-weight="bold" fill="#aaaaaa">WORKER LAYER</text>
+
+  <!-- WorkerBase (center) -->
+  <rect x="450" y="125" width="240" height="70" rx="6" fill="#3a3a4a" stroke="#888" stroke-width="1.5"/>
+  <text x="570" y="145" text-anchor="middle" font-weight="bold" fill="#ffffff">WorkerBase</text>
+  <text x="570" y="160" text-anchor="middle" font-size="10" fill="#cccccc">vllm.v1.worker.worker_base</text>
+  <text x="465" y="177" font-size="10" fill="#999">• init_device / load_model interface</text>
+  <text x="465" y="190" font-size="10" fill="#999">• execute_model interface</text>
+
+  <!-- QaicWorker (left) -->
+  <rect x="100" y="230" width="280" height="135" rx="6" fill="#1a3a5c" stroke="#4a9eff" stroke-width="1.5"/>
+  <text x="240" y="248" text-anchor="middle" font-weight="bold" fill="#ffffff">QaicWorker</text>
+  <text x="240" y="263" text-anchor="middle" font-size="10" fill="#7fbfff">vllm_qaic.worker</text>
+  <text x="115" y="280" font-size="10" fill="#aadcff">• initialize_cache() — block count config</text>
+  <text x="115" y="293" font-size="10" fill="#ff4444" font-weight="bold">• init_device() — gloo init, device check [override]</text>
+  <text x="115" y="306" font-size="10" fill="#ff4444" font-weight="bold">• determine_available_memory() — fixed slots [override]</text>
+  <text x="115" y="319" font-size="10" fill="#aadcff">• _configure_thread_parallelism()</text>
+  <text x="115" y="332" font-size="10" fill="#ff4444" font-weight="bold">• execute_model() → model_runner [override]</text>
+  <text x="115" y="345" font-size="10" fill="#ff4444" font-weight="bold">• sleep()/wake_up()/profile() — no-op [override]</text>
+  <text x="115" y="358" font-size="10" fill="#ff4444" font-weight="bold">• compile_or_warm_up_model() — dummy run [override]</text>
+
+  <!-- GpuWorker (right) -->
+  <rect x="760" y="230" width="310" height="135" rx="6" fill="#2d1a3a" stroke="#b47aff" stroke-width="1.5"/>
+  <text x="915" y="248" text-anchor="middle" font-weight="bold" fill="#ffffff">GpuWorker</text>
+  <text x="915" y="263" text-anchor="middle" font-size="10" fill="#d4a8ff">vllm.v1.worker.gpu_worker</text>
+  <text x="775" y="280" font-size="10" fill="#ff4444" font-weight="bold">• init_device() — NCCL init, set CUDA device [override]</text>
+  <text x="775" y="293" font-size="10" fill="#ff4444" font-weight="bold">• determine_available_memory() — GPU profiling [override]</text>
+  <text x="775" y="306" font-size="10" fill="#d4a8ff">• initialize_from_config() — alloc KV tensors</text>
+  <text x="775" y="319" font-size="10" fill="#ff4444" font-weight="bold">• compile_or_warm_up_model() — CUDAGraph [override]</text>
+  <text x="775" y="332" font-size="10" fill="#ff4444" font-weight="bold">• execute_model() → model_runner [override]</text>
+  <text x="775" y="345" font-size="10" fill="#ff4444" font-weight="bold">• sleep()/wake_up() — memory offload [override]</text>
+  <text x="775" y="358" font-size="10" fill="#ff4444" font-weight="bold">• profile() — torch profiler integration [override]</text>
+
+  <!-- Arrows from WorkerBase -->
+  <line x1="470" y1="195" x2="340" y2="230" stroke="#aaa" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+  <line x1="670" y1="195" x2="800" y2="230" stroke="#aaa" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+
+  <!-- ==================== MODEL RUNNER LAYER ==================== -->
+  <text x="30" y="385" font-size="14" font-weight="bold" fill="#aaaaaa">MODEL RUNNER LAYER</text>
+
+  <!-- GPUModelRunner (center) -->
+  <rect x="420" y="400" width="300" height="85" rx="6" fill="#3a3a4a" stroke="#888" stroke-width="1.5"/>
+  <text x="570" y="420" text-anchor="middle" font-weight="bold" fill="#ffffff">GPUModelRunner</text>
+  <text x="570" y="435" text-anchor="middle" font-size="10" fill="#cccccc">vllm.v1.worker.gpu_model_runner (7400 lines)</text>
+  <text x="435" y="452" font-size="10" fill="#999">• InputBatch / CpuGpuBuffer management</text>
+  <text x="435" y="465" font-size="10" fill="#999">• _update_states, _prepare_inputs</text>
+  <text x="435" y="478" font-size="10" fill="#999">• Sampling metadata, _bookkeeping_sync</text>
+
+  <!-- QaicModelRunner (left) -->
+  <rect x="60" y="520" width="340" height="165" rx="6" fill="#1a3a5c" stroke="#4a9eff" stroke-width="1.5"/>
+  <text x="230" y="538" text-anchor="middle" font-weight="bold" fill="#ffffff">QaicModelRunner</text>
+  <text x="230" y="553" text-anchor="middle" font-size="10" fill="#7fbfff">vllm_qaic.model_runner</text>
+  <text x="75" y="570" font-size="10" fill="#aadcff">• _postprocess_host_tensors() — GPU→CPU buf</text>
+  <text x="75" y="583" font-size="10" fill="#aadcff">• _postprocess_cpu_kernels() — replace Triton</text>
+  <text x="75" y="596" font-size="10" fill="#ff4444" font-weight="bold">• execute_model() — full sync path [override]</text>
+  <text x="75" y="609" font-size="10" fill="#aadcff">• _pack_decode_batch() — 2D spec packing</text>
+  <text x="75" y="622" font-size="10" fill="#aadcff">• _qaic_merge_model_outputs()</text>
+  <text x="75" y="635" font-size="10" fill="#aadcff">• _qaic_rejection_sample() — CPU ngram</text>
+  <text x="75" y="648" font-size="10" fill="#ff4444" font-weight="bold">• get_kv_cache_spec() — FullAttentionSpec [override]</text>
+  <text x="75" y="661" font-size="10" fill="#ff4444" font-weight="bold">• initialize_kv_cache() — store config only [override]</text>
+  <text x="75" y="674" font-size="10" fill="#ff4444" font-weight="bold">• load_model() → load_qaic_model() [override]</text>
+
+  <!-- CUDA GPUModelRunner (right, used directly) -->
+  <rect x="760" y="520" width="340" height="165" rx="6" fill="#2d1a3a" stroke="#b47aff" stroke-width="1.5"/>
+  <text x="930" y="538" text-anchor="middle" font-weight="bold" fill="#ffffff">GPUModelRunner (CUDA path)</text>
+  <text x="930" y="553" text-anchor="middle" font-size="10" fill="#d4a8ff">used directly without subclass</text>
+  <text x="775" y="570" font-size="10" fill="#d4a8ff">• execute_model() — async, returns None</text>
+  <text x="775" y="583" font-size="10" fill="#d4a8ff">• sample_tokens() — deferred sampling</text>
+  <text x="775" y="596" font-size="10" fill="#d4a8ff">• capture_model() — CUDAGraph capture</text>
+  <text x="775" y="609" font-size="10" fill="#d4a8ff">• initialize_kv_cache() — alloc GPU tensors</text>
+  <text x="775" y="622" font-size="10" fill="#d4a8ff">• get_kv_cache_spec() — from model layers</text>
+  <text x="775" y="635" font-size="10" fill="#d4a8ff">• load_model() — HF weights → GPU</text>
+  <text x="775" y="648" font-size="10" fill="#d4a8ff">• propose_draft_token_ids() — all methods</text>
+  <text x="775" y="661" font-size="10" fill="#d4a8ff">• _dummy_run() / profile_run() — warmup</text>
+  <text x="775" y="674" font-size="10" fill="#d4a8ff">• _model_forward() — Triton + FlashAttn</text>
+
+  <!-- Arrows from GPUModelRunner -->
+  <line x1="450" y1="485" x2="300" y2="520" stroke="#aaa" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+  <text x="360" y="498" font-size="9" fill="#aaa">inherits</text>
+  <line x1="690" y1="485" x2="840" y2="520" stroke="#aaa" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+  <text x="750" y="498" font-size="9" fill="#aaa">is (same class)</text>
+
+  <!-- ==================== MODEL LAYER ==================== -->
+  <text x="30" y="705" font-size="14" font-weight="bold" fill="#aaaaaa">MODEL LAYER</text>
+
+  <!-- nn.Module + SupportsLoRA (center) -->
+  <rect x="370" y="720" width="140" height="50" rx="6" fill="#3a3a4a" stroke="#888" stroke-width="1.5"/>
+  <text x="440" y="740" text-anchor="middle" font-weight="bold" fill="#ffffff">nn.Module</text>
+  <text x="440" y="755" text-anchor="middle" font-size="10" fill="#cccccc">torch.nn</text>
+
+  <rect x="530" y="720" width="220" height="50" rx="6" fill="#3a3a4a" stroke="#888" stroke-width="1.5"/>
+  <text x="640" y="740" text-anchor="middle" font-weight="bold" fill="#ffffff">SupportsLoRA</text>
+  <text x="640" y="755" text-anchor="middle" font-size="10" fill="#cccccc">vllm.model_executor.models.interfaces</text>
+
+  <!-- QaicCausalLM (left) -->
+  <rect x="60" y="810" width="340" height="130" rx="6" fill="#1a3a5c" stroke="#4a9eff" stroke-width="1.5"/>
+  <text x="230" y="828" text-anchor="middle" font-weight="bold" fill="#ffffff">QaicCausalLM</text>
+  <text x="230" y="843" text-anchor="middle" font-size="10" fill="#7fbfff">vllm_qaic.model_loader</text>
+  <text x="75" y="860" font-size="10" fill="#aadcff">• load_model() — QPC session init</text>
+  <text x="75" y="873" font-size="10" fill="#ff4444" font-weight="bold">• forward() → _run_prefill / _run_decode [override]</text>
+  <text x="75" y="886" font-size="10" fill="#aadcff">• _run_prefill() — chunked, bs=1, session.run</text>
+  <text x="75" y="899" font-size="10" fill="#aadcff">• _run_decode() — full batch, session.run</text>
+  <text x="75" y="912" font-size="10" fill="#aadcff">• compute_logits() — LogitsProcessor passthrough</text>
+  <text x="75" y="925" font-size="10" fill="#aadcff">• sample() — CPU Sampler</text>
+
+  <!-- LlamaForCausalLM (right) -->
+  <rect x="760" y="810" width="340" height="130" rx="6" fill="#2d1a3a" stroke="#b47aff" stroke-width="1.5"/>
+  <text x="930" y="828" text-anchor="middle" font-weight="bold" fill="#ffffff">LlamaForCausalLM (example)</text>
+  <text x="930" y="843" text-anchor="middle" font-size="10" fill="#d4a8ff">vllm.model_executor.models</text>
+  <text x="775" y="860" font-size="10" fill="#ff4444" font-weight="bold">• forward() — full PyTorch on GPU [override]</text>
+  <text x="775" y="873" font-size="10" fill="#d4a8ff">• Attention.forward() — PagedAttention kernel</text>
+  <text x="775" y="886" font-size="10" fill="#d4a8ff">• MLP / Linear — quantized (AWQ/GPTQ/FP8)</text>
+  <text x="775" y="899" font-size="10" fill="#d4a8ff">• embed_tokens() + lm_head() on GPU</text>
+  <text x="775" y="912" font-size="10" fill="#d4a8ff">• compute_logits() — GPU matmul</text>
+  <text x="775" y="925" font-size="10" fill="#d4a8ff">• LoRA merge via Punica kernels</text>
+
+  <!-- Arrows from nn.Module/SupportsLoRA to models -->
+  <line x1="400" y1="770" x2="260" y2="810" stroke="#aaa" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+  <line x1="580" y1="770" x2="300" y2="810" stroke="#aaa" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+  <line x1="480" y1="770" x2="860" y2="810" stroke="#aaa" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+  <line x1="700" y1="770" x2="900" y2="810" stroke="#aaa" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+
+  <!-- ==================== PLATFORM (expanded with responsibilities) ==================== -->
+  <text x="430" y="955" font-size="13" font-weight="bold" fill="#aaaaaa">PLATFORM LAYER</text>
+
+  <!-- Platform base -->
+  <rect x="420" y="968" width="260" height="60" rx="6" fill="#3a3a4a" stroke="#888" stroke-width="1.5"/>
+  <text x="550" y="986" text-anchor="middle" font-weight="bold" fill="#ffffff">Platform</text>
+  <text x="550" y="1001" text-anchor="middle" font-size="10" fill="#cccccc">vllm.platforms.interface</text>
+  <text x="435" y="1018" font-size="10" fill="#999">• verify_quantization • device_name • dispatch_key</text>
+
+  <!-- QaicPlatform -->
+  <rect x="60" y="1060" width="340" height="100" rx="6" fill="#1a3a5c" stroke="#4a9eff" stroke-width="1.5"/>
+  <text x="230" y="1078" text-anchor="middle" font-weight="bold" fill="#ffffff">QaicPlatform</text>
+  <text x="230" y="1093" text-anchor="middle" font-size="10" fill="#7fbfff">vllm_qaic.platform</text>
+  <text x="75" y="1110" font-size="10" fill="#aadcff">• supported_quantization: mxfp6/4, awq, gptq, fp8</text>
+  <text x="75" y="1123" font-size="10" fill="#ff4444" font-weight="bold">• check_and_update_config() — block_size=ctx_len [override]</text>
+  <text x="75" y="1136" font-size="10" fill="#ff4444" font-weight="bold">• is_async_output_supported() → False [override]</text>
+  <text x="75" y="1149" font-size="10" fill="#ff4444" font-weight="bold">• get_punica_wrapper() → PunicaWrapperCPU [override]</text>
+
+  <!-- CudaPlatform -->
+  <rect x="760" y="1060" width="340" height="100" rx="6" fill="#2d1a3a" stroke="#b47aff" stroke-width="1.5"/>
+  <text x="930" y="1078" text-anchor="middle" font-weight="bold" fill="#ffffff">CudaPlatform</text>
+  <text x="930" y="1093" text-anchor="middle" font-size="10" fill="#d4a8ff">vllm.platforms.cuda</text>
+  <text x="775" y="1110" font-size="10" fill="#d4a8ff">• supported_quantization: awq, gptq, fp8, bnb...</text>
+  <text x="775" y="1123" font-size="10" fill="#ff4444" font-weight="bold">• check_and_update_config() — GPU heuristics [override]</text>
+  <text x="775" y="1136" font-size="10" fill="#ff4444" font-weight="bold">• is_async_output_supported() → True [override]</text>
+  <text x="775" y="1149" font-size="10" fill="#ff4444" font-weight="bold">• get_punica_wrapper() → PunicaWrapperGPU [override]</text>
+
+  <!-- Arrows from Platform -->
+  <line x1="470" y1="1028" x2="300" y2="1060" stroke="#aaa" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+  <line x1="630" y1="1028" x2="840" y2="1060" stroke="#aaa" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+
+  <!-- ==================== RUNTIME (inline with QaicCausalLM) ==================== -->
+  <rect x="60" y="950" width="320" height="40" rx="6" fill="#3d3520" stroke="#d4a843" stroke-width="1.5"/>
+  <text x="220" y="968" text-anchor="middle" font-weight="bold" fill="#ffd966">QAICInferenceSession → qaicrt (C++)</text>
+  <text x="220" y="983" text-anchor="middle" font-size="10" fill="#c9a84c">session.run() • DMA • QPC on card • async queue</text>
+
+  <!-- Arrow QaicCausalLM -> session -->
+  <line x1="220" y1="940" x2="220" y2="950" stroke="#d4a843" stroke-width="1.2" stroke-dasharray="4,3" marker-end="url(#arrowhead-yellow)"/>
+
+  <!-- ==================== PLUGIN ENTRY + CONFIG ==================== -->
+  <text x="30" y="1195" font-size="14" font-weight="bold" fill="#aaaaaa">PLUGIN ENTRY + QAIC EXECUTION FLOW</text>
+
+  <!-- Entry points -->
+  <rect x="60" y="1215" width="315" height="105" rx="6" fill="#173d31" stroke="#55c998" stroke-width="1.5"/>
+  <text x="217" y="1233" text-anchor="middle" font-weight="bold" fill="#ffffff">Out-of-tree plugin entry points</text>
+  <text x="217" y="1248" text-anchor="middle" font-size="10" fill="#9be7c3">vllm-qaic/pyproject.toml + vllm_qaic.__init__</text>
+  <text x="75" y="1265" font-size="10" fill="#b5f0d2">• vllm.platform_plugins → register_platform()</text>
+  <text x="75" y="1278" font-size="10" fill="#b5f0d2">• detects qaicrt + QAicApi_pb2 availability</text>
+  <text x="75" y="1291" font-size="10" fill="#b5f0d2">• returns vllm_qaic.platform.QaicPlatform</text>
+  <text x="75" y="1304" font-size="10" fill="#b5f0d2">• vllm.general_plugins → register_qaic_quant()</text>
+
+  <!-- Config/model load -->
+  <rect x="435" y="1215" width="315" height="105" rx="6" fill="#173d31" stroke="#55c998" stroke-width="1.5"/>
+  <text x="592" y="1233" text-anchor="middle" font-weight="bold" fill="#ffffff">QAIC config + QPC selection</text>
+  <text x="592" y="1248" text-anchor="middle" font-size="10" fill="#9be7c3">platform.py + compile_config.py + model_loader.py</text>
+  <text x="450" y="1265" font-size="10" fill="#b5f0d2">• --additional-config replaces core QAIC args</text>
+  <text x="450" y="1278" font-size="10" fill="#b5f0d2">• env: VLLM_QAIC_QPC_PATH / *_SPEC_* / QID</text>
+  <text x="450" y="1291" font-size="10" fill="#b5f0d2">• normalize legacy keys; set block_size=max_model_len</text>
+  <text x="450" y="1304" font-size="10" fill="#b5f0d2">• precompiled QPC or QEfficient compile path</text>
+
+  <!-- Session internals -->
+  <rect x="810" y="1215" width="315" height="105" rx="6" fill="#173d31" stroke="#55c998" stroke-width="1.5"/>
+  <text x="967" y="1233" text-anchor="middle" font-weight="bold" fill="#ffffff">QAIC session/runtime state</text>
+  <text x="967" y="1248" text-anchor="middle" font-size="10" fill="#9be7c3">session.py + Cloud AI SDK</text>
+  <text x="825" y="1265" font-size="10" fill="#b5f0d2">• qaicrt Context / Queue / Program / ExecObj</text>
+  <text x="825" y="1278" font-size="10" fill="#b5f0d2">• QPC binding metadata drives shapes and dtypes</text>
+  <text x="825" y="1291" font-size="10" fill="#b5f0d2">• skip/unskip retained-state buffers by mode</text>
+  <text x="825" y="1304" font-size="10" fill="#b5f0d2">• KV cache retained on AIC; host exchanges numpy</text>
+
+  <!-- Arrows between plugin/config/session boxes -->
+  <line x1="375" y1="1268" x2="435" y2="1268" stroke="#55c998" stroke-width="1.4" marker-end="url(#arrowhead-green)"/>
+  <line x1="750" y1="1268" x2="810" y2="1268" stroke="#55c998" stroke-width="1.4" marker-end="url(#arrowhead-green)"/>
+
+  <!-- QEfficient compile-time path -->
+  <rect x="60" y="1340" width="205" height="76" rx="6" fill="#4a2f14" stroke="#ffb86c" stroke-width="1.5"/>
+  <text x="162" y="1362" text-anchor="middle" font-weight="bold" fill="#ffe0b3">HF model + config</text>
+  <text x="162" y="1378" text-anchor="middle" font-size="10" fill="#ffd19a">Qwen/Qwen2.5</text>
+  <text x="162" y="1392" text-anchor="middle" font-size="10" fill="#ffd19a">weights, tokenizer, shapes</text>
+
+  <rect x="305" y="1340" width="230" height="76" rx="6" fill="#4a2f14" stroke="#ffb86c" stroke-width="1.5"/>
+  <text x="420" y="1362" text-anchor="middle" font-weight="bold" fill="#ffe0b3">QEfficient export()</text>
+  <text x="420" y="1378" text-anchor="middle" font-size="10" fill="#ffd19a">paged_kv=True adds block_table</text>
+  <text x="420" y="1392" text-anchor="middle" font-size="10" fill="#ffd19a">KV pool axes: num_blocks/page_size</text>
+
+  <rect x="575" y="1340" width="230" height="76" rx="6" fill="#4a2f14" stroke="#ffb86c" stroke-width="1.5"/>
+  <text x="690" y="1362" text-anchor="middle" font-weight="bold" fill="#ffe0b3">QEfficient compile()</text>
+  <text x="690" y="1378" text-anchor="middle" font-size="10" fill="#ffd19a">binds ctx_len + max_num_blocks</text>
+  <text x="690" y="1392" text-anchor="middle" font-size="10" fill="#ffd19a">runs qaic-compile → QPC</text>
+
+  <rect x="845" y="1340" width="230" height="76" rx="6" fill="#3d3520" stroke="#d4a843" stroke-width="1.5"/>
+  <text x="960" y="1362" text-anchor="middle" font-weight="bold" fill="#ffd966">Precompiled QPC</text>
+  <text x="960" y="1378" text-anchor="middle" font-size="10" fill="#c9a84c">loaded by QaicCausalLM</text>
+  <text x="960" y="1392" text-anchor="middle" font-size="10" fill="#c9a84c">runtime only feeds tensors</text>
+
+  <line x1="265" y1="1378" x2="305" y2="1378" stroke="#ffb86c" stroke-width="1.5" marker-end="url(#arrowhead-orange)"/>
+  <line x1="535" y1="1378" x2="575" y2="1378" stroke="#ffb86c" stroke-width="1.5" marker-end="url(#arrowhead-orange)"/>
+  <line x1="805" y1="1378" x2="845" y2="1378" stroke="#d4a843" stroke-width="1.5" marker-end="url(#arrowhead-yellow)"/>
+  <line x1="960" y1="1416" x2="775" y2="1500" stroke="#d4a843" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#arrowhead-yellow)"/>
+
+  <!-- Execution flow -->
+  <rect x="60" y="1500" width="165" height="70" rx="6" fill="#3a3a4a" stroke="#888" stroke-width="1.5"/>
+  <text x="142" y="1522" text-anchor="middle" font-weight="bold" fill="#ffffff">SchedulerOutput</text>
+  <text x="142" y="1538" text-anchor="middle" font-size="10" fill="#cccccc">requests + token budget</text>
+  <text x="142" y="1552" text-anchor="middle" font-size="10" fill="#cccccc">InputBatch state</text>
+
+  <rect x="260" y="1500" width="175" height="70" rx="6" fill="#1a3a5c" stroke="#4a9eff" stroke-width="1.5"/>
+  <text x="347" y="1522" text-anchor="middle" font-weight="bold" fill="#ffffff">prepare host tensors</text>
+  <text x="347" y="1538" text-anchor="middle" font-size="10" fill="#aadcff">_prepare_inputs()</text>
+  <text x="347" y="1552" text-anchor="middle" font-size="10" fill="#aadcff">block_table + CPU tensors</text>
+
+  <rect x="470" y="1500" width="175" height="70" rx="6" fill="#1a3a5c" stroke="#4a9eff" stroke-width="1.5"/>
+  <text x="557" y="1522" text-anchor="middle" font-weight="bold" fill="#ffffff">split + pack</text>
+  <text x="557" y="1538" text-anchor="middle" font-size="10" fill="#aadcff">decode/prefill masks</text>
+  <text x="557" y="1552" text-anchor="middle" font-size="10" fill="#aadcff">paged block-table rows</text>
+
+  <rect x="680" y="1500" width="175" height="70" rx="6" fill="#3d3520" stroke="#d4a843" stroke-width="1.5"/>
+  <text x="767" y="1522" text-anchor="middle" font-weight="bold" fill="#ffd966">QPC execution</text>
+  <text x="767" y="1538" text-anchor="middle" font-size="10" fill="#c9a84c">_run_decode / _run_prefill</text>
+  <text x="767" y="1552" text-anchor="middle" font-size="10" fill="#c9a84c">session.run() on AIC</text>
+
+  <rect x="890" y="1500" width="175" height="70" rx="6" fill="#1a3a5c" stroke="#4a9eff" stroke-width="1.5"/>
+  <text x="977" y="1522" text-anchor="middle" font-weight="bold" fill="#ffffff">merge + sample</text>
+  <text x="977" y="1538" text-anchor="middle" font-size="10" fill="#aadcff">scatter rows to vLLM order</text>
+  <text x="977" y="1552" text-anchor="middle" font-size="10" fill="#aadcff">CPU sampler / rejection</text>
+
+  <line x1="225" y1="1535" x2="260" y2="1535" stroke="#aaa" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+  <line x1="435" y1="1535" x2="470" y2="1535" stroke="#aaa" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+  <line x1="645" y1="1535" x2="680" y2="1535" stroke="#d4a843" stroke-width="1.5" marker-end="url(#arrowhead-yellow)"/>
+  <line x1="855" y1="1535" x2="890" y2="1535" stroke="#aaa" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+
+  <rect x="440" y="1590" width="320" height="28" rx="6" fill="#1a3a5c" stroke="#4a9eff" stroke-width="1.2"/>
+  <text x="600" y="1608" text-anchor="middle" font-size="10" fill="#aadcff">returns ModelRunnerOutput directly; sample_tokens() is bypassed on QAIC</text>
+  <line x1="977" y1="1570" x2="760" y2="1604" stroke="#4a9eff" stroke-width="1.2" stroke-dasharray="4,3" marker-end="url(#arrowhead-blue)"/>
+
+  <!-- ==================== Footer ==================== -->
+  <text x="30" y="1642" font-size="11" fill="#666">▽ = inherits from     ─ ─ = wraps/uses     green = plugin/runtime flow     orange = QEfficient compile-time path</text>
+  <text x="30" y="1655" font-size="11" fill="#ff4444">Red text with [override] = function overrides parent class method</text>
+
+  <!-- Arrow marker definitions -->
+  <defs>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#aaa"/>
+    </marker>
+    <marker id="arrowhead-yellow" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#d4a843"/>
+    </marker>
+    <marker id="arrowhead-green" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#55c998"/>
+    </marker>
+    <marker id="arrowhead-blue" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#4a9eff"/>
+    </marker>
+    <marker id="arrowhead-orange" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#ffb86c"/>
+    </marker>
+  </defs>
+</svg>

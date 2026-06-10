@@ -1,0 +1,147 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1260" height="760" viewBox="0 0 1260 760">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<style>text{font-family:Inter,Segoe UI,Arial,sans-serif;fill:#111827}.title{font-size:28px;font-weight:700}.axis{font-size:15px;fill:#374151}.tick{font-size:12px;fill:#4b5563}.legend{font-size:14px;fill:#111827}.value{font-size:12px;font-weight:700;paint-order:stroke;stroke:#fff;stroke-width:3px;stroke-linejoin:round}.grid-major{stroke:#d1d5db;stroke-width:1}.grid-minor{stroke:#eef2f7;stroke-width:.7}.axisline{stroke:#111827;stroke-width:1.5}.line{fill:none;stroke-width:3;stroke-linejoin:round;stroke-linecap:round}.dot{stroke:#fff;stroke-width:2}</style>
+<text class="title" x="96" y="40">Concurrency vs Decoding Throughput</text>
+<text class="axis" x="535.0" y="724" text-anchor="middle">Concurrency</text>
+<text class="axis" transform="translate(26 364.0) rotate(-90)" text-anchor="middle">Output token throughput (tok/s)</text>
+<line class="grid-major" x1="96" y1="652.00" x2="974" y2="652.00"/>
+<line class="axisline" x1="88" y1="652.00" x2="96" y2="652.00" stroke-width="1.2"/>
+<text class="tick" x="82" y="656.00" text-anchor="end">0</text>
+<line class="grid-minor" x1="96" y1="623.20" x2="974" y2="623.20"/>
+<line class="axisline" x1="92" y1="623.20" x2="96" y2="623.20" stroke-width="0.8"/>
+<line class="grid-minor" x1="96" y1="594.40" x2="974" y2="594.40"/>
+<line class="axisline" x1="92" y1="594.40" x2="96" y2="594.40" stroke-width="0.8"/>
+<line class="grid-minor" x1="96" y1="565.60" x2="974" y2="565.60"/>
+<line class="axisline" x1="92" y1="565.60" x2="96" y2="565.60" stroke-width="0.8"/>
+<line class="grid-minor" x1="96" y1="536.80" x2="974" y2="536.80"/>
+<line class="axisline" x1="92" y1="536.80" x2="96" y2="536.80" stroke-width="0.8"/>
+<line class="grid-major" x1="96" y1="508.00" x2="974" y2="508.00"/>
+<line class="axisline" x1="88" y1="508.00" x2="96" y2="508.00" stroke-width="1.2"/>
+<text class="tick" x="82" y="512.00" text-anchor="end">50</text>
+<line class="grid-minor" x1="96" y1="479.20" x2="974" y2="479.20"/>
+<line class="axisline" x1="92" y1="479.20" x2="96" y2="479.20" stroke-width="0.8"/>
+<line class="grid-minor" x1="96" y1="450.40" x2="974" y2="450.40"/>
+<line class="axisline" x1="92" y1="450.40" x2="96" y2="450.40" stroke-width="0.8"/>
+<line class="grid-minor" x1="96" y1="421.60" x2="974" y2="421.60"/>
+<line class="axisline" x1="92" y1="421.60" x2="96" y2="421.60" stroke-width="0.8"/>
+<line class="grid-minor" x1="96" y1="392.80" x2="974" y2="392.80"/>
+<line class="axisline" x1="92" y1="392.80" x2="96" y2="392.80" stroke-width="0.8"/>
+<line class="grid-major" x1="96" y1="364.00" x2="974" y2="364.00"/>
+<line class="axisline" x1="88" y1="364.00" x2="96" y2="364.00" stroke-width="1.2"/>
+<text class="tick" x="82" y="368.00" text-anchor="end">100</text>
+<line class="grid-minor" x1="96" y1="335.20" x2="974" y2="335.20"/>
+<line class="axisline" x1="92" y1="335.20" x2="96" y2="335.20" stroke-width="0.8"/>
+<line class="grid-minor" x1="96" y1="306.40" x2="974" y2="306.40"/>
+<line class="axisline" x1="92" y1="306.40" x2="96" y2="306.40" stroke-width="0.8"/>
+<line class="grid-minor" x1="96" y1="277.60" x2="974" y2="277.60"/>
+<line class="axisline" x1="92" y1="277.60" x2="96" y2="277.60" stroke-width="0.8"/>
+<line class="grid-minor" x1="96" y1="248.80" x2="974" y2="248.80"/>
+<line class="axisline" x1="92" y1="248.80" x2="96" y2="248.80" stroke-width="0.8"/>
+<line class="grid-major" x1="96" y1="220.00" x2="974" y2="220.00"/>
+<line class="axisline" x1="88" y1="220.00" x2="96" y2="220.00" stroke-width="1.2"/>
+<text class="tick" x="82" y="224.00" text-anchor="end">150</text>
+<line class="grid-minor" x1="96" y1="191.20" x2="974" y2="191.20"/>
+<line class="axisline" x1="92" y1="191.20" x2="96" y2="191.20" stroke-width="0.8"/>
+<line class="grid-minor" x1="96" y1="162.40" x2="974" y2="162.40"/>
+<line class="axisline" x1="92" y1="162.40" x2="96" y2="162.40" stroke-width="0.8"/>
+<line class="grid-minor" x1="96" y1="133.60" x2="974" y2="133.60"/>
+<line class="axisline" x1="92" y1="133.60" x2="96" y2="133.60" stroke-width="0.8"/>
+<line class="grid-minor" x1="96" y1="104.80" x2="974" y2="104.80"/>
+<line class="axisline" x1="92" y1="104.80" x2="96" y2="104.80" stroke-width="0.8"/>
+<line class="grid-major" x1="96" y1="76.00" x2="974" y2="76.00"/>
+<line class="axisline" x1="88" y1="76.00" x2="96" y2="76.00" stroke-width="1.2"/>
+<text class="tick" x="82" y="80.00" text-anchor="end">200</text>
+<line class="grid-minor" x1="96.00" y1="76" x2="96.00" y2="652"/>
+<text class="tick" x="96.00" y="676" text-anchor="middle">1</text>
+<line class="grid-minor" x1="105.24" y1="76" x2="105.24" y2="652"/>
+<text class="tick" x="105.24" y="676" text-anchor="middle">2</text>
+<line class="grid-minor" x1="123.73" y1="76" x2="123.73" y2="652"/>
+<text class="tick" x="123.73" y="676" text-anchor="middle">4</text>
+<line class="grid-minor" x1="160.69" y1="76" x2="160.69" y2="652"/>
+<text class="tick" x="160.69" y="676" text-anchor="middle">8</text>
+<line class="grid-minor" x1="234.63" y1="76" x2="234.63" y2="652"/>
+<text class="tick" x="234.63" y="676" text-anchor="middle">16</text>
+<line class="grid-minor" x1="382.51" y1="76" x2="382.51" y2="652"/>
+<text class="tick" x="382.51" y="676" text-anchor="middle">32</text>
+<line class="grid-minor" x1="530.38" y1="76" x2="530.38" y2="652"/>
+<text class="tick" x="530.38" y="676" text-anchor="middle">48</text>
+<line class="grid-minor" x1="678.25" y1="76" x2="678.25" y2="652"/>
+<text class="tick" x="678.25" y="676" text-anchor="middle">64</text>
+<line class="grid-minor" x1="974.00" y1="76" x2="974.00" y2="652"/>
+<text class="tick" x="974.00" y="676" text-anchor="middle">96</text>
+<line class="axisline" x1="96" y1="652" x2="974" y2="652"/>
+<line class="axisline" x1="96" y1="76" x2="96" y2="652"/>
+<polyline class="line" points="96.00,613.38 105.24,578.79 123.73,516.27 160.69,417.68 234.63,301.94 382.51,192.32 530.38,237.34 678.25,189.44 974.00,188.09" stroke="#2563eb"/>
+<circle class="dot" cx="96.00" cy="613.38" r="5.5" fill="#2563eb"/>
+<circle class="dot" cx="105.24" cy="578.79" r="5.5" fill="#2563eb"/>
+<circle class="dot" cx="123.73" cy="516.27" r="5.5" fill="#2563eb"/>
+<circle class="dot" cx="160.69" cy="417.68" r="5.5" fill="#2563eb"/>
+<circle class="dot" cx="234.63" cy="301.94" r="5.5" fill="#2563eb"/>
+<circle class="dot" cx="382.51" cy="192.32" r="5.5" fill="#2563eb"/>
+<circle class="dot" cx="530.38" cy="237.34" r="5.5" fill="#2563eb"/>
+<circle class="dot" cx="678.25" cy="189.44" r="5.5" fill="#2563eb"/>
+<circle class="dot" cx="974.00" cy="188.09" r="5.5" fill="#2563eb"/>
+<polyline class="line" points="96.00,597.77 105.24,558.54 123.73,503.82 160.69,436.03 234.63,369.59 382.51,335.11 530.38,348.45 678.25,335.29 974.00,335.23" stroke="#dc2626"/>
+<circle class="dot" cx="96.00" cy="597.77" r="5.5" fill="#dc2626"/>
+<circle class="dot" cx="105.24" cy="558.54" r="5.5" fill="#dc2626"/>
+<circle class="dot" cx="123.73" cy="503.82" r="5.5" fill="#dc2626"/>
+<circle class="dot" cx="160.69" cy="436.03" r="5.5" fill="#dc2626"/>
+<circle class="dot" cx="234.63" cy="369.59" r="5.5" fill="#dc2626"/>
+<circle class="dot" cx="382.51" cy="335.11" r="5.5" fill="#dc2626"/>
+<circle class="dot" cx="530.38" cy="348.45" r="5.5" fill="#dc2626"/>
+<circle class="dot" cx="678.25" cy="335.29" r="5.5" fill="#dc2626"/>
+<circle class="dot" cx="974.00" cy="335.23" r="5.5" fill="#dc2626"/>
+<polyline class="line" points="96.00,617.58 105.24,586.36 123.73,533.57 160.69,444.47 234.63,339.23 382.51,225.59 530.38,269.97 678.25,225.04 974.00,222.22" stroke="#059669"/>
+<circle class="dot" cx="96.00" cy="617.58" r="5.5" fill="#059669"/>
+<circle class="dot" cx="105.24" cy="586.36" r="5.5" fill="#059669"/>
+<circle class="dot" cx="123.73" cy="533.57" r="5.5" fill="#059669"/>
+<circle class="dot" cx="160.69" cy="444.47" r="5.5" fill="#059669"/>
+<circle class="dot" cx="234.63" cy="339.23" r="5.5" fill="#059669"/>
+<circle class="dot" cx="382.51" cy="225.59" r="5.5" fill="#059669"/>
+<circle class="dot" cx="530.38" cy="269.97" r="5.5" fill="#059669"/>
+<circle class="dot" cx="678.25" cy="225.04" r="5.5" fill="#059669"/>
+<circle class="dot" cx="974.00" cy="222.22" r="5.5" fill="#059669"/>
+<polyline class="line" points="96.00,607.85 105.24,571.42 123.73,519.89 160.69,451.61 234.63,389.60 382.51,350.38 530.38,364.84 678.25,345.97 974.00,348.91" stroke="#d97706"/>
+<circle class="dot" cx="96.00" cy="607.85" r="5.5" fill="#d97706"/>
+<circle class="dot" cx="105.24" cy="571.42" r="5.5" fill="#d97706"/>
+<circle class="dot" cx="123.73" cy="519.89" r="5.5" fill="#d97706"/>
+<circle class="dot" cx="160.69" cy="451.61" r="5.5" fill="#d97706"/>
+<circle class="dot" cx="234.63" cy="389.60" r="5.5" fill="#d97706"/>
+<circle class="dot" cx="382.51" cy="350.38" r="5.5" fill="#d97706"/>
+<circle class="dot" cx="530.38" cy="364.84" r="5.5" fill="#d97706"/>
+<circle class="dot" cx="678.25" cy="345.97" r="5.5" fill="#d97706"/>
+<circle class="dot" cx="974.00" cy="348.91" r="5.5" fill="#d97706"/>
+<text class="value" x="234.63" y="273.94" text-anchor="middle" fill="#2563eb">121.5</text>
+<text class="value" x="382.51" y="164.32" text-anchor="middle" fill="#2563eb">159.6</text>
+<text class="value" x="530.38" y="209.34" text-anchor="middle" fill="#2563eb">144.0</text>
+<text class="value" x="678.25" y="161.44" text-anchor="middle" fill="#2563eb">160.6</text>
+<text class="value" x="962.00" y="160.09" text-anchor="end" fill="#2563eb">161.1</text>
+<text class="value" x="224.63" y="397.59" text-anchor="middle" fill="#dc2626">98.1</text>
+<text class="value" x="372.51" y="363.11" text-anchor="middle" fill="#dc2626">110.0</text>
+<text class="value" x="520.38" y="376.45" text-anchor="middle" fill="#dc2626">105.4</text>
+<text class="value" x="668.25" y="363.29" text-anchor="middle" fill="#dc2626">110.0</text>
+<text class="value" x="962.00" y="363.23" text-anchor="end" fill="#dc2626">110.0</text>
+<text class="value" x="246.63" y="289.23" text-anchor="middle" fill="#059669">108.6</text>
+<text class="value" x="394.51" y="175.59" text-anchor="middle" fill="#059669">148.1</text>
+<text class="value" x="542.38" y="219.97" text-anchor="middle" fill="#059669">132.7</text>
+<text class="value" x="690.25" y="175.04" text-anchor="middle" fill="#059669">148.2</text>
+<text class="value" x="962.00" y="172.22" text-anchor="end" fill="#059669">149.2</text>
+<text class="value" x="244.63" y="441.60" text-anchor="middle" fill="#d97706">91.1</text>
+<text class="value" x="392.51" y="402.38" text-anchor="middle" fill="#d97706">104.7</text>
+<text class="value" x="540.38" y="416.84" text-anchor="middle" fill="#d97706">99.7</text>
+<text class="value" x="688.25" y="397.97" text-anchor="middle" fill="#d97706">106.3</text>
+<text class="value" x="962.00" y="400.91" text-anchor="end" fill="#d97706">105.2</text>
+<text class="axis" x="1014" y="64">Series</text>
+<line x1="1014" y1="92" x2="1042" y2="92" stroke="#2563eb" stroke-width="3" stroke-linecap="round"/>
+<circle cx="1028" cy="92" r="4" fill="#2563eb" stroke="#fff" stroke-width="2"/>
+<text class="legend" x="1054" y="97">no_ngram model_len128</text>
+<line x1="1014" y1="124" x2="1042" y2="124" stroke="#dc2626" stroke-width="3" stroke-linecap="round"/>
+<circle cx="1028" cy="124" r="4" fill="#dc2626" stroke="#fff" stroke-width="2"/>
+<text class="legend" x="1054" y="129">ngram model_len128</text>
+<line x1="1014" y1="156" x2="1042" y2="156" stroke="#059669" stroke-width="3" stroke-linecap="round"/>
+<circle cx="1028" cy="156" r="4" fill="#059669" stroke="#fff" stroke-width="2"/>
+<text class="legend" x="1054" y="161">no_ngram model_len2048</text>
+<line x1="1014" y1="188" x2="1042" y2="188" stroke="#d97706" stroke-width="3" stroke-linecap="round"/>
+<circle cx="1028" cy="188" r="4" fill="#d97706" stroke="#fff" stroke-width="2"/>
+<text class="legend" x="1054" y="193">ngram model_len2048</text>
+</svg>

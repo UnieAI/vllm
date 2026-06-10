@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="920" viewBox="0 0 1400 920">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<style>text{font-family:Arial,sans-serif;fill:#111827}.title{font-size:26px;font-weight:750}.axis{font-size:23px;font-weight:700}.tick{font-size:15px;fill:#374151}.legend{font-size:19px;font-weight:650}.footnote{font-size:20px;fill:#374151}.direction{font-size:24px;font-weight:650;fill:#8b8f97}.clabel{font-size:16px;font-weight:700;paint-order:stroke;stroke:#fff;stroke-width:4px;stroke-linejoin:round}.grid{stroke:#d1d5db;stroke-width:1.6}.axisline{stroke:#111827;stroke-width:2}.series{fill:none;stroke-width:3.5;stroke-linecap:round;stroke-linejoin:round}.arrow{stroke:#111827;stroke-width:2.2;marker-end:url(#arrow)}.mutedarrow{stroke:#111827;stroke-width:2.2;marker-end:url(#arrow);marker-start:url(#arrow-start)}</style>
+<defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#111827"/></marker><marker id="arrow-start" markerWidth="10" markerHeight="10" refX="1" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M9,0 L9,6 L0,3 z" fill="#111827"/></marker></defs>
+<line x1="237.00" y1="32.00" x2="249.00" y2="44.00" stroke="#4b5563" stroke-width="4" stroke-linecap="round"/>
+<line x1="237.00" y1="44.00" x2="249.00" y2="32.00" stroke="#4b5563" stroke-width="4" stroke-linecap="round"/>
+<text class="legend" x="267" y="44">Qwen2.5-7B-Instruct @vLLM-Qualcomm aic100 ultra</text>
+<circle cx="243.00" cy="65.00" r="6" fill="#f97316"/>
+<text class="legend" x="267" y="71">Qwen2.5-7B-Instruct @vLLM-Qualcomm aic100 ultra + Speculative Decode</text>
+<text class="title" x="1320" y="42" text-anchor="end">model_len = 128</text>
+<line class="grid" x1="165" y1="740.00" x2="1320" y2="740.00"/>
+<text class="tick" x="143" y="745.00" text-anchor="end">0</text>
+<line class="grid" x1="165" y1="618.40" x2="1320" y2="618.40"/>
+<text class="tick" x="143" y="623.40" text-anchor="end">40</text>
+<line class="grid" x1="165" y1="496.80" x2="1320" y2="496.80"/>
+<text class="tick" x="143" y="501.80" text-anchor="end">80</text>
+<line class="grid" x1="165" y1="375.20" x2="1320" y2="375.20"/>
+<text class="tick" x="143" y="380.20" text-anchor="end">120</text>
+<line class="grid" x1="165" y1="253.60" x2="1320" y2="253.60"/>
+<text class="tick" x="143" y="258.60" text-anchor="end">160</text>
+<line class="grid" x1="165" y1="132.00" x2="1320" y2="132.00"/>
+<text class="tick" x="143" y="137.00" text-anchor="end">200</text>
+<text class="tick" x="1320.00" y="770" text-anchor="middle">0</text>
+<text class="tick" x="1127.50" y="770" text-anchor="middle">1000</text>
+<text class="tick" x="935.00" y="770" text-anchor="middle">2000</text>
+<text class="tick" x="742.50" y="770" text-anchor="middle">3000</text>
+<text class="tick" x="550.00" y="770" text-anchor="middle">4000</text>
+<text class="tick" x="357.50" y="770" text-anchor="middle">5000</text>
+<text class="tick" x="165.00" y="770" text-anchor="middle">6000</text>
+<line class="axisline" x1="165" y1="740" x2="1320" y2="740"/>
+<line class="axisline" x1="165" y1="132" x2="165" y2="740"/>
+<text class="axis" transform="translate(83 436.0) rotate(-90)" text-anchor="middle">Throughput (TPS)</text>
+<text class="axis" x="742.5" y="816" text-anchor="middle">Time to first token (ms)</text>
+<text class="direction" x="37" y="194" text-anchor="middle">High</text>
+<text class="direction" x="37" y="702" text-anchor="middle">Low</text>
+<line class="mutedarrow" x1="47" y1="216" x2="47" y2="678"/>
+<text class="direction" x="285" y="832" text-anchor="end">Slow</text>
+<text class="direction" x="1218" y="832" text-anchor="start">Faster</text>
+<line class="arrow" x1="303" y1="825" x2="1194" y2="825"/>
+<polyline class="series" points="1285.19,699.23 1252.85,662.72 1187.68,596.72 1059.76,492.67 802.71,370.49 292.44,254.79" stroke="#4b5563" stroke-dasharray="7 7"/>
+<line x1="1278.19" y1="692.23" x2="1292.19" y2="706.23" stroke="#4b5563" stroke-width="4" stroke-linecap="round"/>
+<line x1="1278.19" y1="706.23" x2="1292.19" y2="692.23" stroke="#4b5563" stroke-width="4" stroke-linecap="round"/>
+<line x1="1245.85" y1="655.72" x2="1259.85" y2="669.72" stroke="#4b5563" stroke-width="4" stroke-linecap="round"/>
+<line x1="1245.85" y1="669.72" x2="1259.85" y2="655.72" stroke="#4b5563" stroke-width="4" stroke-linecap="round"/>
+<line x1="1180.68" y1="589.72" x2="1194.68" y2="603.72" stroke="#4b5563" stroke-width="4" stroke-linecap="round"/>
+<line x1="1180.68" y1="603.72" x2="1194.68" y2="589.72" stroke="#4b5563" stroke-width="4" stroke-linecap="round"/>
+<line x1="1052.76" y1="485.67" x2="1066.76" y2="499.67" stroke="#4b5563" stroke-width="4" stroke-linecap="round"/>
+<line x1="1052.76" y1="499.67" x2="1066.76" y2="485.67" stroke="#4b5563" stroke-width="4" stroke-linecap="round"/>
+<line x1="795.71" y1="363.49" x2="809.71" y2="377.49" stroke="#4b5563" stroke-width="4" stroke-linecap="round"/>
+<line x1="795.71" y1="377.49" x2="809.71" y2="363.49" stroke="#4b5563" stroke-width="4" stroke-linecap="round"/>
+<line x1="285.44" y1="247.79" x2="299.44" y2="261.79" stroke="#4b5563" stroke-width="4" stroke-linecap="round"/>
+<line x1="285.44" y1="261.79" x2="299.44" y2="247.79" stroke="#4b5563" stroke-width="4" stroke-linecap="round"/>
+<polyline class="series" points="1282.30,682.76 1246.82,641.35 1175.33,583.59 1034.16,512.03 748.02,441.90 179.82,405.51" stroke="#f97316"/>
+<circle cx="1282.30" cy="682.76" r="7" fill="#f97316"/>
+<circle cx="1246.82" cy="641.35" r="7" fill="#f97316"/>
+<circle cx="1175.33" cy="583.59" r="7" fill="#f97316"/>
+<circle cx="1034.16" cy="512.03" r="7" fill="#f97316"/>
+<circle cx="748.02" cy="441.90" r="7" fill="#f97316"/>
+<circle cx="179.82" cy="405.51" r="7" fill="#f97316"/>
+<text class="clabel" x="1263.19" y="683.23" text-anchor="end" fill="#4b5563">c=1</text>
+<text class="clabel" x="1230.85" y="646.72" text-anchor="end" fill="#4b5563">c=2</text>
+<text class="clabel" x="1165.68" y="580.72" text-anchor="end" fill="#4b5563">c=4</text>
+<text class="clabel" x="1037.76" y="476.67" text-anchor="end" fill="#4b5563">c=8</text>
+<text class="clabel" x="780.71" y="354.49" text-anchor="end" fill="#4b5563">c=16</text>
+<text class="clabel" x="270.44" y="238.79" text-anchor="end" fill="#4b5563">c=32</text>
+<text class="clabel" x="1302.30" y="700.76" text-anchor="start" fill="#f97316">c=1</text>
+<text class="clabel" x="1266.82" y="659.35" text-anchor="start" fill="#f97316">c=2</text>
+<text class="clabel" x="1195.33" y="601.59" text-anchor="start" fill="#f97316">c=4</text>
+<text class="clabel" x="1054.16" y="530.03" text-anchor="start" fill="#f97316">c=8</text>
+<text class="clabel" x="768.02" y="459.90" text-anchor="start" fill="#f97316">c=16</text>
+<text class="clabel" x="199.82" y="423.51" text-anchor="start" fill="#f97316">c=32</text>
+<text class="footnote" x="165" y="895">Qwen2.5-7B-Instruct @Qualcomm aic100 ultra *1, Benchmark by random data</text>
+</svg>

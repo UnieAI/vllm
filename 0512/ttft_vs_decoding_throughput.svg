@@ -1,0 +1,107 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="860" viewBox="0 0 1280 860">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<style>text{font-family:Inter,Segoe UI,Arial,sans-serif;fill:#111827}.axis{font-size:23px;font-weight:700}.tick{font-size:15px;fill:#374151}.legend{font-size:16px;font-weight:600}.small{font-size:16px;fill:#8b8f97}.clabel{font-size:15px;font-weight:700;paint-order:stroke;stroke:#fff;stroke-width:4px;stroke-linejoin:round}.grid{stroke:#d1d5db;stroke-width:1.6}.axisline{stroke:#111827;stroke-width:2}.series{fill:none;stroke-width:3.5;stroke-linecap:round;stroke-linejoin:round}.arrow{stroke:#111827;stroke-width:2.2;marker-end:url(#arrow)}.mutedarrow{stroke:#111827;stroke-width:2.2;marker-end:url(#arrow);marker-start:url(#arrow-start)}</style>
+<defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#111827"/></marker><marker id="arrow-start" markerWidth="10" markerHeight="10" refX="1" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M9,0 L9,6 L0,3 z" fill="#111827"/></marker></defs>
+<line x1="309" y1="22" x2="321" y2="34" stroke="#4b5563" stroke-width="3"/><line x1="309" y1="34" x2="321" y2="22" stroke="#4b5563" stroke-width="3"/>
+<text class="legend" x="339" y="33">no_ngram model_len128</text>
+<circle cx="315" cy="50" r="5.5" fill="#f97316"/>
+<text class="legend" x="339" y="55">ngram model_len128</text>
+<line x1="309" y1="66" x2="321" y2="78" stroke="#2563eb" stroke-width="3"/><line x1="309" y1="78" x2="321" y2="66" stroke="#2563eb" stroke-width="3"/>
+<text class="legend" x="339" y="77">no_ngram model_len2048</text>
+<circle cx="315" cy="94" r="5.5" fill="#16a34a"/>
+<text class="legend" x="339" y="99">ngram model_len2048</text>
+<line class="grid" x1="145" y1="725.00" x2="1210" y2="725.00"/>
+<text class="tick" x="123" y="730.00" text-anchor="end">0</text>
+<line class="grid" x1="145" y1="599.00" x2="1210" y2="599.00"/>
+<text class="tick" x="123" y="604.00" text-anchor="end">40</text>
+<line class="grid" x1="145" y1="473.00" x2="1210" y2="473.00"/>
+<text class="tick" x="123" y="478.00" text-anchor="end">80</text>
+<line class="grid" x1="145" y1="347.00" x2="1210" y2="347.00"/>
+<text class="tick" x="123" y="352.00" text-anchor="end">120</text>
+<line class="grid" x1="145" y1="221.00" x2="1210" y2="221.00"/>
+<text class="tick" x="123" y="226.00" text-anchor="end">160</text>
+<line class="grid" x1="145" y1="95.00" x2="1210" y2="95.00"/>
+<text class="tick" x="123" y="100.00" text-anchor="end">200</text>
+<text class="tick" x="1210.00" y="755" text-anchor="middle">0</text>
+<text class="tick" x="1057.86" y="755" text-anchor="middle">1000</text>
+<text class="tick" x="905.71" y="755" text-anchor="middle">2000</text>
+<text class="tick" x="753.57" y="755" text-anchor="middle">3000</text>
+<text class="tick" x="601.43" y="755" text-anchor="middle">4000</text>
+<text class="tick" x="449.29" y="755" text-anchor="middle">5000</text>
+<text class="tick" x="297.14" y="755" text-anchor="middle">6000</text>
+<text class="tick" x="145.00" y="755" text-anchor="middle">7000</text>
+<line class="axisline" x1="145" y1="725" x2="1210" y2="725"/>
+<line class="axisline" x1="145" y1="95" x2="145" y2="725"/>
+<text class="axis" transform="translate(48 410.0) rotate(-90)" text-anchor="middle">Throughput (TPS)</text>
+<text class="axis" x="677.5" y="808" text-anchor="middle">Time to first token (ms)</text>
+<text class="small" x="57" y="157" text-anchor="middle">High</text>
+<text class="small" x="57" y="687" text-anchor="middle">Low</text>
+<line class="mutedarrow" x1="43" y1="175" x2="43" y2="665"/>
+<text class="small" x="255" y="808" text-anchor="end">Slow</text>
+<text class="small" x="1105" y="808" text-anchor="start">Faster</text>
+<line class="arrow" x1="270" y1="802" x2="1082" y2="802"/>
+<polyline class="series" points="1182.48,682.76 1156.93,644.93 1105.42,576.54 1004.32,468.72 801.16,342.12 397.86,222.23" stroke="#4b5563" stroke-dasharray="7 7"/>
+<line x1="1175.48" y1="675.76" x2="1189.48" y2="689.76" stroke="#4b5563" stroke-width="4" stroke-linecap="round"/>
+<line x1="1175.48" y1="689.76" x2="1189.48" y2="675.76" stroke="#4b5563" stroke-width="4" stroke-linecap="round"/>
+<line x1="1149.93" y1="637.93" x2="1163.93" y2="651.93" stroke="#4b5563" stroke-width="4" stroke-linecap="round"/>
+<line x1="1149.93" y1="651.93" x2="1163.93" y2="637.93" stroke="#4b5563" stroke-width="4" stroke-linecap="round"/>
+<line x1="1098.42" y1="569.54" x2="1112.42" y2="583.54" stroke="#4b5563" stroke-width="4" stroke-linecap="round"/>
+<line x1="1098.42" y1="583.54" x2="1112.42" y2="569.54" stroke="#4b5563" stroke-width="4" stroke-linecap="round"/>
+<line x1="997.32" y1="461.72" x2="1011.32" y2="475.72" stroke="#4b5563" stroke-width="4" stroke-linecap="round"/>
+<line x1="997.32" y1="475.72" x2="1011.32" y2="461.72" stroke="#4b5563" stroke-width="4" stroke-linecap="round"/>
+<line x1="794.16" y1="335.12" x2="808.16" y2="349.12" stroke="#4b5563" stroke-width="4" stroke-linecap="round"/>
+<line x1="794.16" y1="349.12" x2="808.16" y2="335.12" stroke="#4b5563" stroke-width="4" stroke-linecap="round"/>
+<line x1="390.86" y1="215.23" x2="404.86" y2="229.23" stroke="#4b5563" stroke-width="4" stroke-linecap="round"/>
+<line x1="390.86" y1="229.23" x2="404.86" y2="215.23" stroke="#4b5563" stroke-width="4" stroke-linecap="round"/>
+<polyline class="series" points="1180.21,665.69 1152.17,622.78 1095.66,562.93 984.09,488.78 757.94,416.11 308.85,378.41" stroke="#f97316"/>
+<circle cx="1180.21" cy="665.69" r="7" fill="#f97316"/>
+<circle cx="1152.17" cy="622.78" r="7" fill="#f97316"/>
+<circle cx="1095.66" cy="562.93" r="7" fill="#f97316"/>
+<circle cx="984.09" cy="488.78" r="7" fill="#f97316"/>
+<circle cx="757.94" cy="416.11" r="7" fill="#f97316"/>
+<circle cx="308.85" cy="378.41" r="7" fill="#f97316"/>
+<polyline class="series" points="1179.53,687.36 1152.65,653.21 1099.32,595.47 994.93,498.01 780.21,382.91 355.39,258.61" stroke="#2563eb" stroke-dasharray="7 7"/>
+<line x1="1172.53" y1="680.36" x2="1186.53" y2="694.36" stroke="#2563eb" stroke-width="4" stroke-linecap="round"/>
+<line x1="1172.53" y1="694.36" x2="1186.53" y2="680.36" stroke="#2563eb" stroke-width="4" stroke-linecap="round"/>
+<line x1="1145.65" y1="646.21" x2="1159.65" y2="660.21" stroke="#2563eb" stroke-width="4" stroke-linecap="round"/>
+<line x1="1145.65" y1="660.21" x2="1159.65" y2="646.21" stroke="#2563eb" stroke-width="4" stroke-linecap="round"/>
+<line x1="1092.32" y1="588.47" x2="1106.32" y2="602.47" stroke="#2563eb" stroke-width="4" stroke-linecap="round"/>
+<line x1="1092.32" y1="602.47" x2="1106.32" y2="588.47" stroke="#2563eb" stroke-width="4" stroke-linecap="round"/>
+<line x1="987.93" y1="491.01" x2="1001.93" y2="505.01" stroke="#2563eb" stroke-width="4" stroke-linecap="round"/>
+<line x1="987.93" y1="505.01" x2="1001.93" y2="491.01" stroke="#2563eb" stroke-width="4" stroke-linecap="round"/>
+<line x1="773.21" y1="375.91" x2="787.21" y2="389.91" stroke="#2563eb" stroke-width="4" stroke-linecap="round"/>
+<line x1="773.21" y1="389.91" x2="787.21" y2="375.91" stroke="#2563eb" stroke-width="4" stroke-linecap="round"/>
+<line x1="348.39" y1="251.61" x2="362.39" y2="265.61" stroke="#2563eb" stroke-width="4" stroke-linecap="round"/>
+<line x1="348.39" y1="265.61" x2="362.39" y2="251.61" stroke="#2563eb" stroke-width="4" stroke-linecap="round"/>
+<polyline class="series" points="1178.68,676.71 1148.98,636.86 1090.39,580.51 973.67,505.82 741.73,438.00 270.70,395.10" stroke="#16a34a"/>
+<circle cx="1178.68" cy="676.71" r="7" fill="#16a34a"/>
+<circle cx="1148.98" cy="636.86" r="7" fill="#16a34a"/>
+<circle cx="1090.39" cy="580.51" r="7" fill="#16a34a"/>
+<circle cx="973.67" cy="505.82" r="7" fill="#16a34a"/>
+<circle cx="741.73" cy="438.00" r="7" fill="#16a34a"/>
+<circle cx="270.70" cy="395.10" r="7" fill="#16a34a"/>
+<text class="clabel" x="1162.48" y="666.76" text-anchor="end" fill="#4b5563">c=1</text>
+<text class="clabel" x="1136.93" y="628.93" text-anchor="end" fill="#4b5563">c=2</text>
+<text class="clabel" x="1085.42" y="560.54" text-anchor="end" fill="#4b5563">c=4</text>
+<text class="clabel" x="984.32" y="452.72" text-anchor="end" fill="#4b5563">c=8</text>
+<text class="clabel" x="781.16" y="326.12" text-anchor="end" fill="#4b5563">c=16</text>
+<text class="clabel" x="377.86" y="206.23" text-anchor="end" fill="#4b5563">c=32</text>
+<text class="clabel" x="1198.00" y="669.69" text-anchor="start" fill="#f97316">c=1</text>
+<text class="clabel" x="1170.17" y="626.78" text-anchor="start" fill="#f97316">c=2</text>
+<text class="clabel" x="1113.66" y="566.93" text-anchor="start" fill="#f97316">c=4</text>
+<text class="clabel" x="1002.09" y="492.78" text-anchor="start" fill="#f97316">c=8</text>
+<text class="clabel" x="775.94" y="420.11" text-anchor="start" fill="#f97316">c=16</text>
+<text class="clabel" x="326.85" y="382.41" text-anchor="start" fill="#f97316">c=32</text>
+<text class="clabel" x="1155.53" y="705.36" text-anchor="end" fill="#2563eb">c=1</text>
+<text class="clabel" x="1128.65" y="671.21" text-anchor="end" fill="#2563eb">c=2</text>
+<text class="clabel" x="1075.32" y="613.47" text-anchor="end" fill="#2563eb">c=4</text>
+<text class="clabel" x="970.93" y="516.01" text-anchor="end" fill="#2563eb">c=8</text>
+<text class="clabel" x="756.21" y="400.91" text-anchor="end" fill="#2563eb">c=16</text>
+<text class="clabel" x="331.39" y="276.61" text-anchor="end" fill="#2563eb">c=32</text>
+<text class="clabel" x="1198.00" y="698.71" text-anchor="start" fill="#16a34a">c=1</text>
+<text class="clabel" x="1168.98" y="658.86" text-anchor="start" fill="#16a34a">c=2</text>
+<text class="clabel" x="1110.39" y="602.51" text-anchor="start" fill="#16a34a">c=4</text>
+<text class="clabel" x="993.67" y="527.82" text-anchor="start" fill="#16a34a">c=8</text>
+<text class="clabel" x="761.73" y="460.00" text-anchor="start" fill="#16a34a">c=16</text>
+<text class="clabel" x="290.70" y="417.10" text-anchor="start" fill="#16a34a">c=32</text>
+</svg>

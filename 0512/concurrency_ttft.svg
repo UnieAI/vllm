@@ -1,0 +1,128 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="720" viewBox="0 0 1180 720">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<style>text{font-family:Inter,Segoe UI,Arial,sans-serif;fill:#111827}.title{font-size:26px;font-weight:700}.axis{font-size:14px;fill:#374151}.tick{font-size:12px;fill:#4b5563}.legend{font-size:14px;fill:#111827}.value{font-size:10px;font-weight:600}.grid{stroke:#e5e7eb;stroke-width:1}.axisline{stroke:#111827;stroke-width:1.5}.line{fill:none;stroke-width:3;stroke-linejoin:round;stroke-linecap:round}.dot{stroke:#fff;stroke-width:2}</style>
+<text class="title" x="92" y="38">Concurrency vs TTFT</text>
+<text class="axis" x="501.0" y="686" text-anchor="middle">Concurrency</text>
+<text class="axis" transform="translate(24 346.0) rotate(-90)" text-anchor="middle">Mean TTFT (ms)</text>
+<line class="grid" x1="92" y1="620.00" x2="910" y2="620.00"/>
+<text class="tick" x="80" y="624.00" text-anchor="end">0</text>
+<line class="grid" x1="92" y1="510.40" x2="910" y2="510.40"/>
+<text class="tick" x="80" y="514.40" text-anchor="end">10000</text>
+<line class="grid" x1="92" y1="400.80" x2="910" y2="400.80"/>
+<text class="tick" x="80" y="404.80" text-anchor="end">20000</text>
+<line class="grid" x1="92" y1="291.20" x2="910" y2="291.20"/>
+<text class="tick" x="80" y="295.20" text-anchor="end">30000</text>
+<line class="grid" x1="92" y1="181.60" x2="910" y2="181.60"/>
+<text class="tick" x="80" y="185.60" text-anchor="end">40000</text>
+<line class="grid" x1="92" y1="72.00" x2="910" y2="72.00"/>
+<text class="tick" x="80" y="76.00" text-anchor="end">50000</text>
+<line class="grid" x1="92.00" y1="72" x2="92.00" y2="620"/>
+<text class="tick" x="92.00" y="644" text-anchor="middle">1</text>
+<line class="grid" x1="100.61" y1="72" x2="100.61" y2="620"/>
+<text class="tick" x="100.61" y="644" text-anchor="middle">2</text>
+<line class="grid" x1="117.83" y1="72" x2="117.83" y2="620"/>
+<text class="tick" x="117.83" y="644" text-anchor="middle">4</text>
+<line class="grid" x1="152.27" y1="72" x2="152.27" y2="620"/>
+<text class="tick" x="152.27" y="644" text-anchor="middle">8</text>
+<line class="grid" x1="221.16" y1="72" x2="221.16" y2="620"/>
+<text class="tick" x="221.16" y="644" text-anchor="middle">16</text>
+<line class="grid" x1="358.93" y1="72" x2="358.93" y2="620"/>
+<text class="tick" x="358.93" y="644" text-anchor="middle">32</text>
+<line class="grid" x1="496.69" y1="72" x2="496.69" y2="620"/>
+<text class="tick" x="496.69" y="644" text-anchor="middle">48</text>
+<line class="grid" x1="634.46" y1="72" x2="634.46" y2="620"/>
+<text class="tick" x="634.46" y="644" text-anchor="middle">64</text>
+<line class="grid" x1="910.00" y1="72" x2="910.00" y2="620"/>
+<text class="tick" x="910.00" y="644" text-anchor="middle">96</text>
+<line class="axisline" x1="92" y1="620" x2="910" y2="620"/>
+<line class="axisline" x1="92" y1="72" x2="92" y2="620"/>
+<polyline class="line" points="92.00,618.02 100.61,616.18 117.83,612.47 152.27,605.18 221.16,590.55 358.93,561.50 496.69,534.08 634.46,506.33 910.00,450.78" stroke="#2563eb"/>
+<circle class="dot" cx="92.00" cy="618.02" r="4.5" fill="#2563eb"/>
+<circle class="dot" cx="100.61" cy="616.18" r="4.5" fill="#2563eb"/>
+<circle class="dot" cx="117.83" cy="612.47" r="4.5" fill="#2563eb"/>
+<circle class="dot" cx="152.27" cy="605.18" r="4.5" fill="#2563eb"/>
+<circle class="dot" cx="221.16" cy="590.55" r="4.5" fill="#2563eb"/>
+<circle class="dot" cx="358.93" cy="561.50" r="4.5" fill="#2563eb"/>
+<circle class="dot" cx="496.69" cy="534.08" r="4.5" fill="#2563eb"/>
+<circle class="dot" cx="634.46" cy="506.33" r="4.5" fill="#2563eb"/>
+<circle class="dot" cx="910.00" cy="450.78" r="4.5" fill="#2563eb"/>
+<text class="value" x="92.00" y="606.02" text-anchor="start" fill="#2563eb">181</text>
+<text class="value" x="100.61" y="604.18" text-anchor="start" fill="#2563eb">349</text>
+<text class="value" x="117.83" y="600.47" text-anchor="middle" fill="#2563eb">687</text>
+<text class="value" x="152.27" y="593.18" text-anchor="middle" fill="#2563eb">1352</text>
+<text class="value" x="221.16" y="578.55" text-anchor="middle" fill="#2563eb">2687</text>
+<text class="value" x="358.93" y="549.50" text-anchor="middle" fill="#2563eb">5338</text>
+<text class="value" x="496.69" y="522.08" text-anchor="middle" fill="#2563eb">7839</text>
+<text class="value" x="634.46" y="494.33" text-anchor="middle" fill="#2563eb">10372</text>
+<text class="value" x="910.00" y="438.78" text-anchor="end" fill="#2563eb">15440</text>
+<polyline class="line" points="92.00,617.85 100.61,615.83 117.83,611.76 152.27,603.73 221.16,587.43 358.93,555.08 496.69,511.64 634.46,473.87 910.00,392.47" stroke="#dc2626"/>
+<circle class="dot" cx="92.00" cy="617.85" r="4.5" fill="#dc2626"/>
+<circle class="dot" cx="100.61" cy="615.83" r="4.5" fill="#dc2626"/>
+<circle class="dot" cx="117.83" cy="611.76" r="4.5" fill="#dc2626"/>
+<circle class="dot" cx="152.27" cy="603.73" r="4.5" fill="#dc2626"/>
+<circle class="dot" cx="221.16" cy="587.43" r="4.5" fill="#dc2626"/>
+<circle class="dot" cx="358.93" cy="555.08" r="4.5" fill="#dc2626"/>
+<circle class="dot" cx="496.69" cy="511.64" r="4.5" fill="#dc2626"/>
+<circle class="dot" cx="634.46" cy="473.87" r="4.5" fill="#dc2626"/>
+<circle class="dot" cx="910.00" cy="392.47" r="4.5" fill="#dc2626"/>
+<text class="value" x="92.00" y="612.00" text-anchor="start" fill="#dc2626">196</text>
+<text class="value" x="100.61" y="612.00" text-anchor="start" fill="#dc2626">380</text>
+<text class="value" x="117.83" y="612.00" text-anchor="middle" fill="#dc2626">752</text>
+<text class="value" x="152.27" y="612.00" text-anchor="middle" fill="#dc2626">1485</text>
+<text class="value" x="221.16" y="605.43" text-anchor="middle" fill="#dc2626">2971</text>
+<text class="value" x="358.93" y="573.08" text-anchor="middle" fill="#dc2626">5923</text>
+<text class="value" x="496.69" y="529.64" text-anchor="middle" fill="#dc2626">9887</text>
+<text class="value" x="634.46" y="491.87" text-anchor="middle" fill="#dc2626">13333</text>
+<text class="value" x="910.00" y="410.47" text-anchor="end" fill="#dc2626">20760</text>
+<polyline class="line" points="92.00,617.80 100.61,615.87 117.83,612.03 152.27,604.51 221.16,589.04 358.93,558.44 496.69,528.64 634.46,498.06 910.00,438.47" stroke="#059669"/>
+<circle class="dot" cx="92.00" cy="617.80" r="4.5" fill="#059669"/>
+<circle class="dot" cx="100.61" cy="615.87" r="4.5" fill="#059669"/>
+<circle class="dot" cx="117.83" cy="612.03" r="4.5" fill="#059669"/>
+<circle class="dot" cx="152.27" cy="604.51" r="4.5" fill="#059669"/>
+<circle class="dot" cx="221.16" cy="589.04" r="4.5" fill="#059669"/>
+<circle class="dot" cx="358.93" cy="558.44" r="4.5" fill="#059669"/>
+<circle class="dot" cx="496.69" cy="528.64" r="4.5" fill="#059669"/>
+<circle class="dot" cx="634.46" cy="498.06" r="4.5" fill="#059669"/>
+<circle class="dot" cx="910.00" cy="438.47" r="4.5" fill="#059669"/>
+<text class="value" x="92.00" y="589.80" text-anchor="start" fill="#059669">200</text>
+<text class="value" x="100.61" y="587.87" text-anchor="start" fill="#059669">377</text>
+<text class="value" x="117.83" y="584.03" text-anchor="middle" fill="#059669">727</text>
+<text class="value" x="152.27" y="576.51" text-anchor="middle" fill="#059669">1414</text>
+<text class="value" x="221.16" y="561.04" text-anchor="middle" fill="#059669">2825</text>
+<text class="value" x="358.93" y="530.44" text-anchor="middle" fill="#059669">5617</text>
+<text class="value" x="496.69" y="500.64" text-anchor="middle" fill="#059669">8336</text>
+<text class="value" x="634.46" y="470.06" text-anchor="middle" fill="#059669">11126</text>
+<text class="value" x="910.00" y="410.47" text-anchor="end" fill="#059669">16563</text>
+<polyline class="line" points="92.00,617.74 100.61,615.60 117.83,611.38 152.27,602.98 221.16,586.27 358.93,552.34 496.69,506.30 634.46,468.02 910.00,383.11" stroke="#d97706"/>
+<circle class="dot" cx="92.00" cy="617.74" r="4.5" fill="#d97706"/>
+<circle class="dot" cx="100.61" cy="615.60" r="4.5" fill="#d97706"/>
+<circle class="dot" cx="117.83" cy="611.38" r="4.5" fill="#d97706"/>
+<circle class="dot" cx="152.27" cy="602.98" r="4.5" fill="#d97706"/>
+<circle class="dot" cx="221.16" cy="586.27" r="4.5" fill="#d97706"/>
+<circle class="dot" cx="358.93" cy="552.34" r="4.5" fill="#d97706"/>
+<circle class="dot" cx="496.69" cy="506.30" r="4.5" fill="#d97706"/>
+<circle class="dot" cx="634.46" cy="468.02" r="4.5" fill="#d97706"/>
+<circle class="dot" cx="910.00" cy="383.11" r="4.5" fill="#d97706"/>
+<text class="value" x="92.00" y="612.00" text-anchor="start" fill="#d97706">206</text>
+<text class="value" x="100.61" y="612.00" text-anchor="start" fill="#d97706">401</text>
+<text class="value" x="117.83" y="612.00" text-anchor="middle" fill="#d97706">786</text>
+<text class="value" x="152.27" y="612.00" text-anchor="middle" fill="#d97706">1553</text>
+<text class="value" x="221.16" y="612.00" text-anchor="middle" fill="#d97706">3078</text>
+<text class="value" x="358.93" y="586.34" text-anchor="middle" fill="#d97706">6174</text>
+<text class="value" x="496.69" y="540.30" text-anchor="middle" fill="#d97706">10374</text>
+<text class="value" x="634.46" y="502.02" text-anchor="middle" fill="#d97706">13867</text>
+<text class="value" x="910.00" y="417.11" text-anchor="end" fill="#d97706">21614</text>
+<text class="axis" x="948" y="60">Series</text>
+<line x1="948" y1="88" x2="976" y2="88" stroke="#2563eb" stroke-width="3" stroke-linecap="round"/>
+<circle cx="962" cy="88" r="4" fill="#2563eb" stroke="#fff" stroke-width="2"/>
+<text class="legend" x="988" y="93">no_ngram model_len128</text>
+<line x1="948" y1="120" x2="976" y2="120" stroke="#dc2626" stroke-width="3" stroke-linecap="round"/>
+<circle cx="962" cy="120" r="4" fill="#dc2626" stroke="#fff" stroke-width="2"/>
+<text class="legend" x="988" y="125">ngram model_len128</text>
+<line x1="948" y1="152" x2="976" y2="152" stroke="#059669" stroke-width="3" stroke-linecap="round"/>
+<circle cx="962" cy="152" r="4" fill="#059669" stroke="#fff" stroke-width="2"/>
+<text class="legend" x="988" y="157">no_ngram model_len2048</text>
+<line x1="948" y1="184" x2="976" y2="184" stroke="#d97706" stroke-width="3" stroke-linecap="round"/>
+<circle cx="962" cy="184" r="4" fill="#d97706" stroke="#fff" stroke-width="2"/>
+<text class="legend" x="988" y="189">ngram model_len2048</text>
+</svg>

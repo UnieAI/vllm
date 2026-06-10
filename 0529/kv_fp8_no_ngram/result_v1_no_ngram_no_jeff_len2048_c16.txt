@@ -1,0 +1,30 @@
+INFO 05-29 02:27:35 [__init__.py:272] Automatically detected platform qaic.
+Namespace(backend='openai', base_url=None, host='127.0.0.1', port=8000, endpoint='/v1/completions', dataset_name='custom', dataset_path='/workspace/weiminc/Unie/Benchmark-Autotest/datasets/rag-dataset-12000.jsonl', no_stream=False, max_concurrency=16, model='Qwen/Qwen2.5-7B-Instruct', tokenizer=None, use_beam_search=False, num_prompts=16, logprobs=None, request_rate=inf, burstiness=1.0, seed=1, trust_remote_code=False, disable_tqdm=True, profile=False, save_result=False, save_detailed=False, append_result=False, metadata=None, result_dir=None, result_filename=None, ignore_eos=True, percentile_metrics='ttft,tpot,itl', metric_percentiles='99', goodput=None, custom_output_len=51, custom_skip_chat_template=True, sonnet_input_len=550, sonnet_output_len=150, sonnet_prefix_len=200, sharegpt_output_len=None, sharegpt_max_input_len=1024, sharegpt_max_model_len=2048, random_input_len=1024, random_output_len=128, random_range_ratio=0.0, random_prefix_len=0, hf_subset=None, hf_split=None, hf_output_len=None, top_p=None, top_k=None, min_p=None, temperature=None, tokenizer_mode='auto', served_model_name=None, lora_modules=None, ramp_up_strategy=None, ramp_up_start_rps=None, ramp_up_end_rps=None)
+Starting initial single prompt test run...
+Initial test run completed. Starting main benchmark run...
+Traffic request rate: inf RPS.
+Burstiness factor: 1.0 (Poisson process)
+Maximum request concurrency: 16
+============ Serving Benchmark Result ============
+Successful requests:                     16        
+Maximum request concurrency:             16        
+Benchmark duration (s):                  39.43     
+Total input tokens:                      14405     
+Total generated tokens:                  816       
+Request throughput (req/s):              0.41      
+Output token throughput (tok/s):         20.70     
+Total Token throughput (tok/s):          386.06    
+---------------Time to First Token----------------
+Mean TTFT (ms):                          27797.92  
+Median TTFT (ms):                        29466.21  
+P99 TTFT (ms):                           29467.67  
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          232.26    
+Median TPOT (ms):                        199.14    
+P99 TPOT (ms):                           649.51    
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           232.26    
+Median ITL (ms):                         198.48    
+P99 ITL (ms):                            243.82    
+==================================================
+Loading "/opt/qti-aic/dev/lib/x86_64/libQAic.so"
