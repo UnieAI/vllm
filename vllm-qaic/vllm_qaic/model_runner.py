@@ -237,6 +237,12 @@ class QaicModelRunner(GPUModelRunner):
     #   and recompute the decode/prefill split locally (the fork relied on
     #   reorder_batch_to_split_decodes_and_prefills + self.num_decodes).
     # -------------------------------------------------------------------------
+    @property
+    def _qaic_paged_kv(self) -> bool:
+        """Paged (block-table) KV mode, from --additional-config paged_kv."""
+        cfg = getattr(self.vllm_config, "additional_config", None) or {}
+        return bool(isinstance(cfg, dict) and cfg.get("paged_kv", False))
+
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -257,6 +263,8 @@ class QaicModelRunner(GPUModelRunner):
             return self.kv_connector_no_forward(scheduler_output,
                                                 self.vllm_config)
 
+        if self.qaic_profile:
+            t_pack_start = time.perf_counter()
         num_reqs = self.input_batch.num_reqs
         req_ids = self.input_batch.req_ids
         num_scheduled_tokens_np = np.array(
@@ -296,12 +304,21 @@ class QaicModelRunner(GPUModelRunner):
         num_decodes = int(decode_req_indices.size)
 
         block_table = self.input_batch.block_table[0].get_numpy_array()
-        block_ids = block_table[:num_reqs, 0].astype(np.int64)
-        if np.any(block_ids < 1):
-            raise RuntimeError(
-                "QAIC expects allocated vLLM KV block ids to be >= 1; "
-                f"got {block_ids.tolist()}.")
-        batch_indices = block_ids - 1
+        paged_kv = self._qaic_paged_kv
+        if paged_kv:
+            # Paged: feed the FULL per-request logical->physical block map to the
+            # QPC (block_size == page_size, so each request spans many blocks).
+            # The paged QPC addresses the shared pool via block_table; batch_index
+            # is unused (the paged graph has no batch_index binding).
+            block_ids_full = block_table[:num_reqs, :].astype(np.int64)
+            batch_indices = np.arange(num_reqs, dtype=np.int64)
+        else:
+            block_ids = block_table[:num_reqs, 0].astype(np.int64)
+            if np.any(block_ids < 1):
+                raise RuntimeError(
+                    "QAIC expects allocated vLLM KV block ids to be >= 1; "
+                    f"got {block_ids.tolist()}.")
+            batch_indices = block_ids - 1
 
         token_starts = np.concatenate((
             np.array([0], dtype=cu_num_tokens.dtype),
@@ -352,10 +369,13 @@ class QaicModelRunner(GPUModelRunner):
                 is_prompt=False,
                 lora_ids=decode_lora_ids,
                 decode_lengths=decode_lengths,
+                block_table=(block_ids_full[decode_req_indices] if paged_kv else None),
             )
             if decode_input_ids.size > 0
             else None
         )
+        if self.qaic_profile:
+            t_decode_end = time.perf_counter()
         hidden_states_prefill = (
             self.model(
                 input_ids=prefill_input_ids,
@@ -368,12 +388,13 @@ class QaicModelRunner(GPUModelRunner):
                 prefill_is_partial=False,
                 lora_ids=prefill_lora_ids,
                 prefill_cum_sum=prefill_cum_sum,
+                block_table=(block_ids_full[prefill_req_indices] if paged_kv else None),
             )
             if prefill_input_ids.size > 0
             else None
         )
         if self.qaic_profile:
-            t_card_end = time.perf_counter()
+            t_prefill_end = time.perf_counter()
 
         hidden_states = self._qaic_merge_model_outputs(
             hidden_states_decode,
@@ -382,6 +403,8 @@ class QaicModelRunner(GPUModelRunner):
             prefill_req_indices,
             decode_token_counts,
         )
+        if self.qaic_profile:
+            t_merge_end = time.perf_counter()
 
         logits = self.model.compute_logits(
             hidden_states,
@@ -434,15 +457,21 @@ class QaicModelRunner(GPUModelRunner):
         )
         if self.qaic_profile:
             t_bookkeeping_end = time.perf_counter()
+            # `mixed`=1 means this step ran BOTH the decode and prefill QPC (the
+            # TPOT-inflating case). Aggregate mixed across steps for the mixed-step
+            # ratio; decode_qpc/prefill_qpc show the per-QPC split that drives TPOT.
+            mixed = int(decode_req_indices.size > 0 and prefill_req_indices.size > 0)
             logger.info(
-                "QAIC-PROF reqs=%d decodes=%d prefills=%d decode_tokens=%d "
-                "prefill_tokens=%d logits_shape=%s | card=%.1fms "
-                "logits=%.1fms sample=%.1fms bookkeeping=%.1fms",
-                num_reqs, int(decode_req_indices.size),
-                int(prefill_req_indices.size), int(decode_token_counts.sum()),
-                int(prefill_token_counts.sum()), tuple(logits.shape),
-                (t_card_end - t_card_start) * 1e3,
-                (t_logits_end - t_card_end) * 1e3,
+                "QAIC-PROF reqs=%d decodes=%d prefills=%d mixed=%d decode_tokens=%d "
+                "prefill_tokens=%d | pack=%.1fms decode_qpc=%.1fms prefill_qpc=%.1fms "
+                "merge=%.1fms logits=%.1fms sample=%.1fms bookkeeping=%.1fms",
+                num_reqs, int(decode_req_indices.size), int(prefill_req_indices.size),
+                mixed, int(decode_token_counts.sum()), int(prefill_token_counts.sum()),
+                (t_card_start - t_pack_start) * 1e3,
+                (t_decode_end - t_card_start) * 1e3 if decode_input_ids.size > 0 else 0.0,
+                (t_prefill_end - t_decode_end) * 1e3 if prefill_input_ids.size > 0 else 0.0,
+                (t_merge_end - t_prefill_end) * 1e3,
+                (t_logits_end - t_merge_end) * 1e3,
                 (t_sample_end - t_logits_end) * 1e3,
                 (t_bookkeeping_end - t_sample_end) * 1e3,
             )
@@ -819,6 +848,19 @@ class QaicModelRunner(GPUModelRunner):
                 self.model = self.load_lora_model(
                     self.model, self.model_config, self.scheduler_config,
                     self.lora_config, self.device)
+        # Fail-fast: the runtime paged_kv intent MUST match the loaded QPC. A legacy
+        # QPC silently ignores block_table (set_buffers only warns) and would run with
+        # wrong KV addressing; a paged QPC without paged_kv would be starved of
+        # block_table. Either mismatch is a misconfiguration.
+        qpc_paged = bool(getattr(self.model, "paged_kv", False))
+        if self._qaic_paged_kv and not qpc_paged:
+            raise RuntimeError(
+                "additional_config paged_kv=true but the loaded QPC has no 'block_table' "
+                "input (legacy/non-paged QPC). Re-export+compile with paged_kv=True.")
+        if qpc_paged and not self._qaic_paged_kv:
+            raise RuntimeError(
+                "The loaded QPC expects a 'block_table' input (paged) but additional_config "
+                "paged_kv is not set. Add '{\"paged_kv\":true,\"page_size\":...,\"num_blocks\":...}'.")
         logger.info("Model loading took %.6f seconds", time.perf_counter() - t0)
 
     def get_model(self) -> nn.Module:
