@@ -31,7 +31,7 @@ class MinPLogitsProcessor(LogitsProcessor):
         )
         self.min_p_cpu = self.min_p_cpu_tensor.numpy()
 
-        self.use_double_tensor = torch.device(device).type != "cpu"
+        self.use_double_tensor = device is not None and torch.device(device).type != "cpu"
 
         if self.use_double_tensor:
             # Pre-allocated device tensor

@@ -843,6 +843,16 @@ def _is_xpu() -> bool:
     return VLLM_TARGET_DEVICE == "xpu"
 
 
+def _is_qaic() -> bool:
+    qaic_sdk_installed = True
+    try:
+        subprocess.run(["/opt/qti-aic/tools/qaic-util", "-q"],
+                       capture_output=True, check=True)
+    except (FileNotFoundError, PermissionError, subprocess.CalledProcessError):
+        qaic_sdk_installed = False
+    return qaic_sdk_installed or VLLM_TARGET_DEVICE == "qaic"
+
+
 def _build_custom_ops() -> bool:
     return _is_cuda() or _is_hip()
 
@@ -934,6 +944,8 @@ def get_vllm_version() -> str:
             version += f"{sep}cpu"
     elif _is_xpu():
         version += f"{sep}xpu"
+    elif _is_qaic():
+        version += f"{sep}qaic"
     else:
         raise RuntimeError("Unknown runtime environment")
 
@@ -985,6 +997,8 @@ def get_requirements() -> list[str]:
         requirements = _read_requirements("cpu.txt")
     elif _is_xpu():
         requirements = _read_requirements("xpu.txt")
+    elif _is_qaic():
+        requirements = _read_requirements("qaic.txt")
     else:
         raise ValueError("Unsupported platform, please use CUDA, ROCm, or CPU.")
     return requirements
@@ -999,7 +1013,8 @@ if _is_cuda() or _is_hip():
     # copying the relevant .py files from the source repository.
     ext_modules.append(CMakeExtension(name="vllm.triton_kernels", optional=True))
 
-ext_modules.append(CMakeExtension(name="vllm.spinloop"))
+if not _is_qaic():
+    ext_modules.append(CMakeExtension(name="vllm.spinloop"))
 
 if _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))

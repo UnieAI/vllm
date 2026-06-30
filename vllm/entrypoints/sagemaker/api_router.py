@@ -5,7 +5,12 @@ from collections.abc import Awaitable, Callable
 from http import HTTPStatus
 from typing import Any
 
-import model_hosting_container_standards.sagemaker as sagemaker_standards
+try:
+    import model_hosting_container_standards.sagemaker as sagemaker_standards
+    _SAGEMAKER_AVAILABLE = True
+except ImportError:
+    sagemaker_standards = None  # type: ignore[assignment]
+    _SAGEMAKER_AVAILABLE = False
 import pydantic
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
@@ -33,6 +38,9 @@ def attach_router(
     supported_tasks: tuple["SupportedTask", ...],
     model_config: ModelConfig | None = None,
 ):
+    if not _SAGEMAKER_AVAILABLE:
+        return
+
     router = APIRouter()
 
     # NOTE: Construct the TypeAdapters only once
@@ -100,4 +108,6 @@ def attach_router(
 
 
 def sagemaker_standards_bootstrap(app: FastAPI) -> FastAPI:
+    if not _SAGEMAKER_AVAILABLE:
+        return app
     return sagemaker_standards.bootstrap(app)

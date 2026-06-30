@@ -684,8 +684,12 @@ class GPUModelRunner(
         # when async scheduling is enabled.
         self.prepare_inputs_event: torch.Event | None = None
         if self.use_async_scheduling:
-            self.async_output_copy_stream = torch.cuda.Stream()
-            self.prepare_inputs_event = torch.Event()
+            if torch.cuda.is_available():
+                self.async_output_copy_stream = torch.cuda.Stream()
+                self.prepare_inputs_event = torch.Event()
+            else:
+                self.async_output_copy_stream = None
+                self.prepare_inputs_event = None
 
         # self.cudagraph_batch_sizes sorts in ascending order.
         if (

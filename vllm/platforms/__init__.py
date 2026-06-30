@@ -4,7 +4,7 @@ import logging
 import os
 import traceback
 from itertools import chain
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from vllm import envs
 from vllm.plugins import PLATFORM_PLUGINS_GROUP, load_plugins_by_group
@@ -200,12 +200,30 @@ def cpu_platform_plugin() -> str | None:
     return "vllm.platforms.cpu.CpuPlatform"
 
 
+def qaic_platform_plugin() -> Optional[str]:
+    is_qaic = False
+    try:
+        try:
+            import qaicrt
+        except ImportError:
+            import platform as _platform
+            import sys
+            sys.path.append(f"/opt/qti-aic/dev/lib/{_platform.machine()}")
+            import qaicrt
+        from importlib.metadata import version
+        is_qaic = "qaic" in version("vllm")
+    except ImportError:
+        pass
+    return "vllm.platforms.qaic.QaicPlatform" if is_qaic else None
+
+
 builtin_platform_plugins = {
     "tpu": tpu_platform_plugin,
     "cuda": cuda_platform_plugin,
     "rocm": rocm_platform_plugin,
     "xpu": xpu_platform_plugin,
     "cpu": cpu_platform_plugin,
+    "qaic": qaic_platform_plugin,
 }
 
 

@@ -10,7 +10,11 @@ from compressed_tensors.transform import (
     TransformLocation,
     TransformScheme,
 )
-from compressed_tensors.utils import is_match
+try:
+    from compressed_tensors.utils import is_match
+except ImportError:
+    def is_match(*args, **kwargs) -> bool:  # type: ignore[misc]
+        return False
 
 from vllm.model_executor.layers.linear import (
     WEIGHT_LOADER_V2_SUPPORTED,

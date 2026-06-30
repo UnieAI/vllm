@@ -8,16 +8,23 @@
 from collections.abc import Callable
 from typing import Any, Literal
 
-from xgrammar import StructuralTag
-from xgrammar.structural_tag import (
-    AnyTextFormat,
-    ConstStringFormat,
-    JSONSchemaFormat,
-    SequenceFormat,
-    TagFormat,
-    TagsWithSeparatorFormat,
-    TriggeredTagsFormat,
-)
+try:
+    from xgrammar import StructuralTag
+    from xgrammar.structural_tag import (
+        AnyTextFormat,
+        ConstStringFormat,
+        JSONSchemaFormat,
+        SequenceFormat,
+        TagFormat,
+        TagsWithSeparatorFormat,
+        TriggeredTagsFormat,
+    )
+    _XGRAMMAR_STRUCTURAL_TAG_AVAILABLE = True
+except ImportError:
+    StructuralTag = None  # type: ignore[assignment, misc]
+    AnyTextFormat = ConstStringFormat = JSONSchemaFormat = None  # type: ignore
+    SequenceFormat = TagFormat = TagsWithSeparatorFormat = TriggeredTagsFormat = None  # type: ignore
+    _XGRAMMAR_STRUCTURAL_TAG_AVAILABLE = False
 
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,

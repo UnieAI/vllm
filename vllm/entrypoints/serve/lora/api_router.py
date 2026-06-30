@@ -2,7 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
-import model_hosting_container_standards.sagemaker as sagemaker_standards
+try:
+    import model_hosting_container_standards.sagemaker as sagemaker_standards
+    _SAGEMAKER_AVAILABLE = True
+except ImportError:
+    sagemaker_standards = None  # type: ignore[assignment]
+    _SAGEMAKER_AVAILABLE = False
 from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
