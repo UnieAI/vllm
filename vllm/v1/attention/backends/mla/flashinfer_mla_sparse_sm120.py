@@ -34,6 +34,11 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
 
     is_sparse = True
 
+    # DCP support: the trtllm sparse-MLA decode kernel can emit the softmax
+    # LSE which the DCP reducer needs to merge partial attention.
+    can_return_lse_for_decode: bool = True
+    lse_base_on_e: bool = False
+
     def __init__(
         self,
         num_heads: int,

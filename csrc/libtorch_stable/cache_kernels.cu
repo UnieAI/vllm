@@ -522,6 +522,19 @@ __global__ void concat_and_cache_ds_mla_kernel(
   // Compute the scale for the tile
   float tile_scale = fmaxf(max_abs / kFp8ScaleDivisor, FLT_MIN);
 
+  // Round the tile scale UP to the next power of two. The FlashMLA SM100
+  // sparse-decode kernel reinterprets stored per-tile scales as e8m0
+  // (power-of-two only); an arbitrary fp32 scale is truncated to
+  // 2^floor(log2(scale)), producing decode corruption. Storing an exact
+  // power of two makes the e8m0 read lossless and matches DeepSeek's pow2
+  // KV-scale convention.
+  {
+    int scale_exp = ilogbf(tile_scale);
+    float p2 = ldexpf(1.0f, scale_exp);  // largest power of two <= tile_scale
+    if (p2 < tile_scale) p2 *= 2.0f;     // smallest power of two >= tile_scale
+    tile_scale = p2;
+  }
+
   // The first lane of each half-warp writes the scale to kv_cache
   if ((lane_idx == 0) || (lane_idx == 16)) {
     float* kv_cache_32bit = reinterpret_cast<float*>(&kv_cache[dst_idx_start]);

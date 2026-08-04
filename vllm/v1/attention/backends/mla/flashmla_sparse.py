@@ -28,6 +28,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
+    triton_filter_and_convert_dcp_index,
 )
 from vllm.v1.attention.backends.utils import (
     reshape_attn_output_for_spec_decode,
@@ -512,6 +513,11 @@ class FlashMLASparseMetadataBuilder(
 
 
 class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
+    # DCP support: FlashMLA sparse fp8 decode kernel emits softmax LSE which
+    # the DCP reducer needs to merge partial attention across KV ranks.
+    can_return_lse_for_decode: bool = True
+    lse_base_on_e: bool = True
+
     @staticmethod
     def _compute_fp8_decode_padded_heads(num_heads: int) -> int:
         # FP8 decode kernel only supports h_q = 64 or 128
@@ -736,13 +742,28 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         """
         # Convert per-request indices to global slots (decode) or workspace
         # offsets (prefill).
-        topk_indices = triton_convert_req_index_to_global_index(
-            attn_metadata.req_id_per_token[: topk_indices.shape[0]],
-            attn_metadata.block_table,
-            topk_indices,
-            BLOCK_SIZE=attn_metadata.block_size,
-            NUM_TOPK_TOKENS=topk_indices.shape[1],
-        )
+        if self.dcp_world_size > 1:
+            # Under DCP, filter top-k indices to this rank's KV shard.
+            topk_indices = triton_filter_and_convert_dcp_index(
+                attn_metadata.req_id_per_token[: topk_indices.shape[0]],
+                attn_metadata.block_table,
+                topk_indices,
+                dcp_size=self.dcp_world_size,
+                dcp_rank=self.dcp_rank,
+                cp_kv_cache_interleave_size=(
+                    attn_metadata.cp_kv_cache_interleave_size),
+                BLOCK_SIZE=attn_metadata.block_size,
+                NUM_TOPK_TOKENS=topk_indices.shape[1],
+                return_valid_counts=False,
+            )
+        else:
+            topk_indices = triton_convert_req_index_to_global_index(
+                attn_metadata.req_id_per_token[: topk_indices.shape[0]],
+                attn_metadata.block_table,
+                topk_indices,
+                BLOCK_SIZE=attn_metadata.block_size,
+                NUM_TOPK_TOKENS=topk_indices.shape[1],
+            )
 
         assert attn_metadata.fp8_extra_metadata is not None
         assert isinstance(
