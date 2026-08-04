@@ -187,6 +187,7 @@ if TYPE_CHECKING:
     VLLM_MOE_USE_DEEP_GEMM: bool = True
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
+    VLLM_DEEPSEEK_V4_USE_DEEPGEMM_SM12X_KERNELS: bool = False
     VLLM_DCP_Q_REPLICATE: bool = False
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
@@ -1495,6 +1496,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to create TMA-aligned scale tensor when DeepGEMM is used.
     "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES": lambda: bool(
         int(os.getenv("VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", "1"))
+    ),
+    # Restore externally pinned DeepGEMM SM12x kernels for DeepSeek V4 instead
+    # of the experimental vLLM Triton/scalar compatibility kernels.
+    "VLLM_DEEPSEEK_V4_USE_DEEPGEMM_SM12X_KERNELS": lambda: (
+        os.getenv("VLLM_DEEPSEEK_V4_USE_DEEPGEMM_SM12X_KERNELS", "0").lower()
+        in ("1", "true", "yes", "on")
     ),
     # Opt-in MLA DCP query replication: skip the decode query all-gather.
     "VLLM_DCP_Q_REPLICATE": lambda: bool(int(os.getenv("VLLM_DCP_Q_REPLICATE", "0"))),
