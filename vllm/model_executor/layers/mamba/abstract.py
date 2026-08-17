@@ -7,10 +7,31 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.selector import get_mamba_attn_backend
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
+
+
+def _align_retain_stride_blocks(vllm_config: VllmConfig, block_size: int) -> int:
+    """Blocks between retained "align" state snapshots, or 0 to retain none.
+
+    Sized from ``max_model_len`` so the retained count stays bounded whatever
+    the prompt length, which is what keeps the per-request charge flat.
+
+    Args:
+        vllm_config: Full config; reads ``mamba_align_retained_states``.
+        block_size: Mamba block size in tokens.
+
+    Returns:
+        Stride in blocks, or 0 when retention is disabled.
+    """
+    retained = vllm_config.cache_config.mamba_align_retained_states
+    if retained <= 0 or block_size <= 0:
+        return 0
+    total_blocks = cdiv(vllm_config.model_config.max_model_len, block_size)
+    return max(1, cdiv(total_blocks, retained))
 
 
 class MambaBase(AttentionLayerBase):
@@ -52,6 +73,9 @@ class MambaBase(AttentionLayerBase):
             page_size_padded=page_size_padded,
             mamba_type=self.mamba_type,
             mamba_cache_mode=vllm_config.cache_config.mamba_cache_mode,
+            align_retain_stride_blocks=_align_retain_stride_blocks(
+                vllm_config, mamba_block_size
+            ),
             num_speculative_blocks=(
                 vllm_config.speculative_config.num_speculative_tokens
                 if vllm_config.speculative_config

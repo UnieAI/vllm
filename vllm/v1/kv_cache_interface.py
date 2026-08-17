@@ -673,6 +673,7 @@ class MambaSpec(KVCacheSpec):
     mamba_type: MambaAttentionBackendEnum = MambaAttentionBackendEnum.MAMBA2
     mamba_cache_mode: str = "none"
     num_speculative_blocks: int = 0
+    align_retain_stride_blocks: int = 0
 
     @property
     def page_size_bytes(self) -> int:
@@ -692,6 +693,13 @@ class MambaSpec(KVCacheSpec):
                 cdiv(max_model_len, self.block_size) + self.num_speculative_blocks
             ) * self.page_size_bytes
         elif vllm_config.cache_config.mamba_cache_mode == "align":
+            # Retained state snapshots are shared prefix cache, not private
+            # working set: requests over a common prefix resume from the same
+            # blocks, and any of them can be evicted. Charging each request for
+            # its own copy would understate concurrency by
+            # `mamba_align_retained_states` pages per request and could reject a
+            # startup configuration that runs. A request privately holds only
+            # the current and previous state block.
             return self.page_size_bytes * (2 + self.num_speculative_blocks)
         else:
             return self.page_size_bytes * (1 + self.num_speculative_blocks)

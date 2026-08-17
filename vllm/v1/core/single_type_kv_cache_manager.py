@@ -1032,6 +1032,7 @@ class MambaManager(SingleTypeKVCacheManager):
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
+        self.align_retain_stride = kv_cache_spec.align_retain_stride_blocks
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
             # allocated in the previous step
@@ -1172,11 +1173,22 @@ class MambaManager(SingleTypeKVCacheManager):
                 last_state_block_idx is not None
                 and last_state_block_idx
                 < cdiv(num_computed_tokens, self.block_size) - 1
+                and not self._retains_state_block(last_state_block_idx)
             ):
                 blocks = self.req_to_blocks[request_id]
                 if blocks[last_state_block_idx] != self._null_block:
                     self.block_pool.free_blocks([blocks[last_state_block_idx]])
                     blocks[last_state_block_idx] = self._null_block
+
+    def _retains_state_block(self, block_idx: int) -> bool:
+        """Whether an "align" per-step state block is kept instead of freed.
+
+        Retained blocks stay hashed and cached, so a later partial prefix
+        match can resume from inside the prompt rather than only at its end.
+        The stride bounds how many survive per request.
+        """
+        stride = self.align_retain_stride
+        return stride > 0 and (block_idx + 1) % stride == 0
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """

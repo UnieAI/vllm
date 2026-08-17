@@ -145,6 +145,12 @@ class CacheConfig:
     - "align": only cache the mamba state of the last token of each scheduler step and
            when the token is at position i * block_size.
     """
+    mamba_align_retained_states: int = 0
+    """Mamba state snapshots to retain per request in "align" mode, beyond the
+    rolling pair. "align" frees every earlier per-step state block, so a partial
+    prefix match has nothing to resume from inside a long prompt. Retaining a
+    bounded number of them spreads resume points across the prompt at a fixed
+    cost. 0 keeps the current behavior."""
 
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)
