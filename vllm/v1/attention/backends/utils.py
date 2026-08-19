@@ -75,6 +75,87 @@ def compute_mm_prefix_range_tensor(
     return padded.view(num_seqs, max_ranges, 2)
 
 
+def compute_flashinfer_custom_mask(
+    mm_prefix_range: dict[int, list[tuple[int, int]]],
+    qo_indptr_cpu: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    num_prefills: int,
+    prefill_start: int,
+    window_left: int = -1,
+) -> torch.Tensor:
+    """Build a flattened boolean custom_mask for FlashInfer prefill.
+
+    FlashInfer's BatchPrefillWithPagedKVCacheWrapper.plan() accepts a
+    ``custom_mask`` parameter: a flattened 1-D boolean tensor of length
+    ``sum(q_len[i] * kv_len[i] for i in range(batch_size))``.
+
+    For mm_prefix (PrefixLM bidirectional attention), the mask encodes:
+      - Causal attention everywhere (q can attend to kv positions <= q)
+      - PLUS bidirectional attention within each mm_prefix range
+        (tokens in range can attend to all other tokens in the same range)
+      - If window_left > 0 (sliding-window group), the causal term is
+        windowed AND the bidirectional block is clamped to the window
+        (Gemma4 mm_prefix_clamp_sliding_window behavior).
+
+    Args:
+        mm_prefix_range: Maps request index (within the full batch) to
+            list of (start, end) token position ranges where bidirectional
+            attention applies.
+        qo_indptr_cpu: Query offset indptr for prefill requests only,
+            shape (num_prefills + 1,), starting from 0.
+        seq_lens_cpu: Per-request KV sequence lengths for prefill requests,
+            shape (num_prefills,).
+        num_prefills: Number of prefill requests.
+        prefill_start: Index offset of the first prefill request in the
+            original full-batch ordering (for mm_prefix_range lookup).
+        window_left: Sliding window size (left boundary, inclusive).
+            -1 means no window (full causal).
+
+    Returns:
+        Flattened boolean mask tensor on CPU, ready for plan().
+    """
+    mask_pieces: list[torch.Tensor] = []
+    q_lens = (qo_indptr_cpu[1:] - qo_indptr_cpu[:-1]).tolist()
+
+    for i in range(num_prefills):
+        q_len = q_lens[i]
+        kv_len = int(seq_lens_cpu[i].item())
+        # Context offset: absolute position of first query token
+        ctx_offset = kv_len - q_len
+
+        # Start with causal mask (optionally windowed)
+        # q_abs[r] = r + ctx_offset
+        # mask[r, c] = (c <= q_abs[r])
+        q_abs = torch.arange(q_len, dtype=torch.int32).unsqueeze(1) + ctx_offset
+        kv_pos = torch.arange(kv_len, dtype=torch.int32).unsqueeze(0)
+        mask = kv_pos <= q_abs  # causal
+
+        if window_left > 0:
+            # Sliding window: only attend within [q_abs - window_left + 1, q_abs]
+            mask = mask & ((q_abs - kv_pos) < window_left)
+
+        # Apply mm_prefix bidirectional ranges
+        req_idx = prefill_start + i
+        ranges = mm_prefix_range.get(req_idx, [])
+        for r_start, r_end in ranges:
+            if r_start >= r_end:
+                continue
+            # Tokens in [r_start, r_end] attend bidirectionally to each other
+            q_in_range = (q_abs >= r_start) & (q_abs <= r_end)
+            k_in_range = (kv_pos >= r_start) & (kv_pos <= r_end)
+            bidi_block = q_in_range & k_in_range
+
+            if window_left > 0:
+                # Gemma4: clamp bidirectional block to sliding window
+                bidi_block = bidi_block & ((q_abs - kv_pos) < window_left)
+
+            mask = mask | bidi_block
+
+        mask_pieces.append(mask.flatten())
+
+    return torch.cat(mask_pieces, dim=0)
+
+
 def is_valid_kv_cache_layout(value: str) -> bool:
     return value in get_args(KVCacheLayoutType)
 

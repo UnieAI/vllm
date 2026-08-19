@@ -378,6 +378,13 @@ class FlashInferBackend(AttentionBackend):
         return "FLASHINFER"
 
     @classmethod
+    def supports_mm_prefix(cls) -> bool:
+        # mm_prefix is implemented via FlashInfer's custom_mask on the
+        # native FA2 prefill path.  Decode tokens are always causal (single
+        # new token) so no mask is needed there.
+        return True
+
+    @classmethod
     def supports_non_causal(cls) -> bool:
         return True
 
@@ -614,6 +621,11 @@ class FlashInferMetadata:
     """
 
     cascade_wrapper: MultiLevelCascadeAttentionWrapper | None
+
+    uses_custom_mask: bool = False
+    """True when mm_prefix custom_mask was passed to plan(), meaning
+    prefill_wrapper._causal is False even though the batch is logically
+    causal + bidirectional."""
 
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
@@ -1396,6 +1408,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     prefill_start : num_reqs + 1
                 ]
                 assert paged_kv_indptr_prefill_cpu.shape[0] == num_prefills + 1
+                custom_mask: torch.Tensor | None = None
                 if self.use_dcp:
                     assert isinstance(prefill_wrapper, BatchDCPPrefillWrapper)
                     prefill_wrapper.plan(
@@ -1427,18 +1440,48 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     o_dtype = (
                         FP8_DTYPE if self.is_kvcache_nvfp4 else self.model_config.dtype
                     )
+
+                    # mm_prefix: build a custom_mask encoding the
+                    # bidirectional ranges so FlashInfer can handle
+                    # PrefixLM models (Gemma 3/4 multimodal).
+                    mm_ranges = common_attn_metadata.mm_req_doc_ranges
+                    plan_causal = attn_metadata.causal
+                    if mm_ranges and attn_metadata.causal:
+                        from vllm.v1.attention.backends.utils import (
+                            compute_flashinfer_custom_mask,
+                        )
+
+                        assert seq_lens_cpu is not None
+                        custom_mask = compute_flashinfer_custom_mask(
+                            mm_prefix_range=mm_ranges,
+                            qo_indptr_cpu=qo_indptr_prefill_cpu,
+                            seq_lens_cpu=seq_lens_cpu[prefill_start:num_reqs],
+                            num_prefills=num_prefills,
+                            prefill_start=prefill_start,
+                            window_left=self.window_left,
+                        ).to(self.device)
+                        # custom_mask supersedes the causal flag
+                        plan_causal = False
+
                     prefill_wrapper.plan(
-                        qo_indptr=qo_indptr_prefill_cpu,
-                        paged_kv_indptr=paged_kv_indptr_prefill_cpu,
+                        qo_indptr=qo_indptr_prefill_cpu
+                        if custom_mask is None
+                        else qo_indptr_prefill_cpu.to(self.device),
+                        paged_kv_indptr=paged_kv_indptr_prefill_cpu
+                        if custom_mask is None
+                        else paged_kv_indptr_prefill_cpu.to(self.device),
                         paged_kv_indices=paged_kv_indices,
-                        paged_kv_last_page_len=paged_kv_last_page_len_prefill_cpu,
+                        paged_kv_last_page_len=paged_kv_last_page_len_prefill_cpu
+                        if custom_mask is None
+                        else paged_kv_last_page_len_prefill_cpu.to(self.device),
                         num_qo_heads=self.num_qo_heads,
                         num_kv_heads=self.num_kv_heads,
                         head_dim_qk=self.head_dim,
                         page_size=self.page_size,
-                        causal=attn_metadata.causal,
+                        causal=plan_causal,
+                        custom_mask=custom_mask,
                         sm_scale=self.sm_scale,
-                        window_left=self.window_left,
+                        window_left=self.window_left if custom_mask is None else -1,
                         logits_soft_cap=self.logits_soft_cap,
                         q_data_type=self.q_data_type_prefill,
                         kv_data_type=self.kv_cache_dtype,
@@ -1447,6 +1490,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         disable_split_kv=self.disable_split_kv,
                     )
                 attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)
+                if custom_mask is not None:
+                    attn_metadata.uses_custom_mask = True
 
         ## DECODE PATHWAY
         if num_decodes > 0:
@@ -1896,12 +1941,22 @@ class FlashInferImpl(AttentionImpl):
                     assert isinstance(
                         prefill_wrapper, BatchPrefillWithPagedKVCacheWrapper
                     )
-                    assert prefill_wrapper._window_left == self.window_left
+                    if attn_metadata.uses_custom_mask:
+                        # custom_mask encodes the window; plan() was
+                        # called with window_left=-1.
+                        assert prefill_wrapper._window_left == -1
+                    else:
+                        assert prefill_wrapper._window_left == self.window_left
                     assert prefill_wrapper._logits_soft_cap == (
                         self.logits_soft_cap or 0.0
                     )
                     assert prefill_wrapper._sm_scale == self.scale
-                    assert prefill_wrapper._causal == attn_metadata.causal
+                    if attn_metadata.uses_custom_mask:
+                        # custom_mask was used: plan() was called with
+                        # causal=False even though batch is logically causal.
+                        assert not prefill_wrapper._causal
+                    else:
+                        assert prefill_wrapper._causal == attn_metadata.causal
 
                     if self.is_kvcache_nvfp4:
                         kv_cache_for_fi = nvfp4_kv_data
