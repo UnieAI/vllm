@@ -977,6 +977,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     def _get_flashinfer_trtllm_api_decode_kernel() -> FlashInferDecodeKernel:
         if current_platform.is_device_capability(90):
             return FlashInferDecodeKernel.XQA
+        if current_platform.is_device_capability_family(120):
+            return FlashInferDecodeKernel.XQA
         assert current_platform.is_device_capability_family(100)
         return FlashInferDecodeKernel.TRTLLM_GEN
 
@@ -1446,7 +1448,18 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     # PrefixLM models (Gemma 3/4 multimodal).
                     mm_ranges = common_attn_metadata.mm_req_doc_ranges
                     plan_causal = attn_metadata.causal
-                    if mm_ranges and attn_metadata.causal:
+                    # Only generate custom_mask when there are actual
+                    # non-trivial bidirectional ranges (not just empty
+                    # placeholders). This avoids unnecessary mask overhead
+                    # for text-only requests on mm_prefix models.
+                    has_real_mm_ranges = (
+                        mm_ranges is not None
+                        and any(
+                            any(s < e for s, e in ranges)
+                            for ranges in mm_ranges.values()
+                        )
+                    )
+                    if has_real_mm_ranges and attn_metadata.causal:
                         from vllm.v1.attention.backends.utils import (
                             compute_flashinfer_custom_mask,
                         )

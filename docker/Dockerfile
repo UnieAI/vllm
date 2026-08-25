@@ -807,13 +807,18 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') && \
     rm /tmp/requirements-cuda.txt /tmp/common.txt
 
-# Install FlashInfer JIT cache (requires CUDA-version-specific index URL)
+# Install FlashInfer from source (main branch includes SM120 XQA
+# head_dim=512 support from PR #4570, not yet in released wheels)
 # https://docs.flashinfer.ai/installation.html
-# From versions.json: .flashinfer.version
-ARG FLASHINFER_VERSION=0.6.15.post1
+ARG FLASHINFER_REPO=https://github.com/nctu6/flashinfer.git
+ARG FLASHINFER_BRANCH=nctu6/gemma
 RUN --mount=type=cache,target=/opt/uv/cache \
-    uv pip install --system flashinfer-jit-cache==${FLASHINFER_VERSION} \
-        --index-url https://flashinfer.ai/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
+    git clone --depth 1 --branch ${FLASHINFER_BRANCH} \
+        --recurse-submodules --shallow-submodules \
+        ${FLASHINFER_REPO} /tmp/flashinfer \
+    && cd /tmp/flashinfer \
+    && uv pip install --system --no-build-isolation . \
+    && cd / && rm -rf /tmp/flashinfer
 
 # ============================================================
 # OPENAI API SERVER DEPENDENCIES

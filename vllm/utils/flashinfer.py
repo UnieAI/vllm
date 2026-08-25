@@ -376,7 +376,9 @@ def supports_trtllm_attention(is_prefill: bool = False) -> bool:
     for the given attention phase.
 
     SM90 (Hopper) supports the XQA decode kernel but not TRTLLM prefill.
-    SM100+ supports TRTLLM for both phases. All others are unsupported.
+    SM100+ supports TRTLLM for both phases.
+    SM120 (RTX Blackwell) supports XQA decode but not TRTLLM prefill.
+    All others are unsupported.
     """
     # Batch-invariant mode disables TRTLLM attention
     if envs.VLLM_BATCH_INVARIANT:
@@ -391,7 +393,15 @@ def supports_trtllm_attention(is_prefill: bool = False) -> bool:
         return not is_prefill
 
     # SM100/SM103 has both prefill and decode TRTLLM kernels.
-    return current_platform.is_device_capability_family(100)
+    if current_platform.is_device_capability_family(100):
+        return True
+
+    # SM120 has XQA decode (JIT-compiled, head_dim<=512, FP8 KV);
+    # prefill is not supported.
+    if current_platform.is_device_capability_family(120):
+        return not is_prefill
+
+    return False
 
 
 def force_use_trtllm_attention() -> bool | None:
