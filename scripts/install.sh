@@ -4,17 +4,58 @@ set -euo pipefail
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+# Echo the venv path the given interpreter belongs to, or nothing if it is not
+# running inside a venv. Uses the authoritative interpreter signal
+# (sys.prefix != sys.base_prefix), so it detects a venv that was only put on
+# PATH (ENV PATH=/opt/venv/bin:$PATH) and never `source`d -- the Docker case
+# where $VIRTUAL_ENV stays empty. Prefers $VIRTUAL_ENV when set.
+venv_prefix_of() {
+    local interp="$1"
+
+    "${interp}" - <<'PY' 2>/dev/null
+import os, sys
+if sys.prefix != sys.base_prefix:
+    print(os.environ.get("VIRTUAL_ENV") or sys.prefix)
+PY
+}
+
 default_python_bin() {
+    local interp
+    local venv_root
+    local candidate
+
+    # 1. An explicitly activated venv (via `source bin/activate`): $VIRTUAL_ENV
+    #    is exported and points at it.
     if [[ -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/python" ]]; then
         printf '%s\n' "${VIRTUAL_ENV}/bin/python"
         return 0
     fi
 
-    if [[ -x ".venv/bin/python" ]]; then
-        printf '%s\n' ".venv/bin/python"
-        return 0
-    fi
+    # 2. A venv that is active only because its bin/ is on PATH (no activate
+    #    script sourced, so $VIRTUAL_ENV is empty). This is how containers
+    #    commonly enter a venv, e.g. a .venv_docker on PATH. Ask whichever
+    #    python/python3 is first on PATH whether it is inside a venv.
+    for interp in python python3; do
+        if command -v "${interp}" >/dev/null 2>&1; then
+            venv_root="$(venv_prefix_of "${interp}")"
+            if [[ -n "${venv_root}" && -x "${venv_root}/bin/python" ]]; then
+                printf '%s\n' "${venv_root}/bin/python"
+                return 0
+            fi
+            break
+        fi
+    done
 
+    # 3. A venv checked out in the repo root but not active. Accept the common
+    #    names, including .venv_docker (created inside a container).
+    for candidate in .venv .venv_docker; do
+        if [[ -x "${candidate}/bin/python" ]]; then
+            printf '%s\n' "${candidate}/bin/python"
+            return 0
+        fi
+    done
+
+    # 4. No venv anywhere: fall back to the system interpreter.
     if command -v python >/dev/null 2>&1; then
         printf '%s\n' "python"
         return 0
