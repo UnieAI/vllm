@@ -101,6 +101,51 @@ clean_stale_deepgemm_artifacts() {
     done
 }
 
+# Remove FetchContent build/subbuild trees whose CMake cache was generated under
+# a different absolute source path (e.g. the repo was copied or moved). CMake
+# refuses such caches with "The current CMakeCache.txt directory ... is
+# different than the directory ... where CMakeCache.txt was created".
+clean_relocated_cmake_caches() {
+    local cache
+    local recorded_dir=""
+    local actual_dir=""
+    local tree=""
+    local -a caches=()
+
+    while IFS= read -r cache; do
+        [[ -n "${cache}" ]] && caches+=("${cache}")
+    done < <(find .deps build -name CMakeCache.txt 2>/dev/null)
+
+    for cache in "${caches[@]}"; do
+        recorded_dir="$(sed -nE 's/^CMAKE_CACHEFILE_DIR:[^=]*=(.*)$/\1/p' "${cache}" | head -n1)"
+        if [[ -z "${recorded_dir}" ]]; then
+            continue
+        fi
+
+        actual_dir="$(cd -- "$(dirname -- "${cache}")" && pwd)"
+        if [[ "${recorded_dir}" == "${actual_dir}" ]]; then
+            continue
+        fi
+
+        # A *-subbuild cache belongs to the sibling populate tree; drop the
+        # whole <name>-* set so FetchContent repopulates cleanly.
+        tree="$(dirname -- "${cache}")"
+        case "${tree}" in
+            *-subbuild|*-build|*-src)
+                tree="${tree%-subbuild}"
+                tree="${tree%-build}"
+                tree="${tree%-src}"
+                echo "Removing relocated CMake caches for $(basename "${tree}") (was built in ${recorded_dir})." >&2
+                rm -rf -- "${tree}-subbuild" "${tree}-build" "${tree}-src"
+                ;;
+            *)
+                echo "Removing relocated CMake cache tree: ${tree} (was built in ${recorded_dir})." >&2
+                rm -rf -- "${tree}"
+                ;;
+        esac
+    done
+}
+
 ensure_uv() {
     local home_dir="${HOME:-/root}"
     local -a prefix=()
@@ -232,7 +277,65 @@ resolve_cuda_home() {
         return 0
     fi
 
+    # No explicit CUDA_HOME/CUDA_PATH and no nvcc on PATH. Fall back to a
+    # default toolkit root, preferring the one whose version matches the
+    # installed torch build (e.g. torch cu132 -> /usr/local/cuda-13.2). This
+    # avoids selecting an incompatible toolkit when several are installed.
+    local torch_version=""
+    local cuda_root=""
+    local root_version=""
+    local symlink_root=""
+    local newest_root=""
+    local newest_version=""
+
+    torch_version="$(torch_cuda_version || true)"
+
+    for cuda_root in $(find_default_cuda_roots); do
+        root_version="$(cuda_root_version "${cuda_root}" || true)"
+
+        if [[ -n "${torch_version}" && "${root_version}" == "${torch_version}" ]]; then
+            printf '%s\n' "${cuda_root}"
+            return 0
+        fi
+
+        if [[ "${cuda_root}" == "/usr/local/cuda" ]]; then
+            symlink_root="${cuda_root}"
+        fi
+
+        if [[ -n "${root_version}" ]]; then
+            if [[ -z "${newest_version}" ]] \
+                || [[ "$(printf '%s\n%s\n' "${root_version}" "${newest_version}" | sort -V | tail -n1)" == "${root_version}" ]]; then
+                newest_version="${root_version}"
+                newest_root="${cuda_root}"
+            fi
+        fi
+    done
+
+    if [[ -n "${symlink_root}" ]]; then
+        printf '%s\n' "${symlink_root}"
+        return 0
+    fi
+
+    if [[ -n "${newest_root}" ]]; then
+        printf '%s\n' "${newest_root}"
+        return 0
+    fi
+
     return 1
+}
+
+# Report the CUDA version (MAJOR.MINOR) that the installed torch was built
+# against, e.g. "13.2" for a cu132 wheel. Prints nothing on failure.
+torch_cuda_version() {
+    "${PYTHON_BIN}" - <<'PY' 2>/dev/null || true
+try:
+    import torch
+    v = torch.version.cuda
+except Exception:
+    v = None
+if v:
+    print(v)
+PY
 }
 
 find_cuda_header_dirs_by_scan() {
@@ -385,6 +488,75 @@ for root in roots:
 PY
 }
 
+# Resolve the CUDA toolkit version for a root directory. Prefers the
+# CUDA_VERSION macro in cuda.h (authoritative, matches what nvcc/headers
+# report) and falls back to the version encoded in the directory name.
+# Prints MAJOR.MINOR on success.
+cuda_root_version() {
+    local root="$1"
+    local header=""
+    local macro=""
+    local version=""
+
+    if [[ -z "${root}" ]]; then
+        return 1
+    fi
+
+    for header in \
+        "${root}/include/cuda.h" \
+        "${root}"/targets/*/include/cuda.h; do
+        if [[ -f "${header}" ]]; then
+            macro="$(sed -nE 's/^#define[[:space:]]+CUDA_VERSION[[:space:]]+([0-9]+).*/\1/p' "${header}" | head -n1)"
+            if [[ "${macro}" =~ ^[0-9]+$ ]]; then
+                printf '%s.%s\n' "$(( macro / 1000 ))" "$(( (macro / 10) % 100 ))"
+                return 0
+            fi
+        fi
+    done
+
+    if version="$(extract_cuda_major_minor "$(basename "${root}")")"; then
+        printf '%s\n' "${version}"
+        return 0
+    fi
+
+    return 1
+}
+
+# Decide whether a discovered CUDA root is compatible with the toolkit the
+# build will actually use (cuda_home / nvcc). Mixing include dirs from a
+# different CUDA version makes PyTorch's header-vs-nvcc version check abort
+# (e.g. nvcc says 13.2 but cuda-13.0 headers leak in via CPATH).
+cuda_root_matches_home() {
+    local root="$1"
+    local cuda_home="$2"
+    local root_resolved=""
+    local home_resolved=""
+    local root_version=""
+    local home_version=""
+
+    if [[ -z "${cuda_home}" ]]; then
+        return 0
+    fi
+
+    root_resolved="$(cd -- "${root}" 2>/dev/null && pwd)"
+    home_resolved="$(cd -- "${cuda_home}" 2>/dev/null && pwd)"
+    if [[ -n "${root_resolved}" && "${root_resolved}" == "${home_resolved}" ]]; then
+        return 0
+    fi
+
+    home_version="$(cuda_root_version "${cuda_home}" || true)"
+    if [[ -z "${home_version}" ]]; then
+        return 0
+    fi
+
+    root_version="$(cuda_root_version "${root}" || true)"
+    if [[ -z "${root_version}" ]]; then
+        return 0
+    fi
+
+    [[ "${root_version}" == "${home_version}" ]]
+}
+
 find_cuda_include_dirs() {
     local cuda_home="${1:-}"
     local candidates=()
@@ -414,13 +586,21 @@ find_cuda_include_dirs() {
         done < <(find_cuda_target_subdirs "${cuda_home}" "include")
     fi
 
+    if [[ -d /usr/local/cuda ]] && cuda_root_matches_home /usr/local/cuda "${cuda_home}"; then
+        candidates+=("/usr/local/cuda/include")
+    fi
     candidates+=(
-        "/usr/local/cuda/include"
         "/usr/include"
         "/usr/include/x86_64-linux-gnu"
     )
 
     for cuda_root in $(find_default_cuda_roots); do
+        # Skip toolkits whose version differs from the one the build will use;
+        # otherwise their headers leak into CPATH and PyTorch's CMake aborts
+        # with "FindCUDA says ... but the CUDA headers say ...".
+        if ! cuda_root_matches_home "${cuda_root}" "${cuda_home}"; then
+            continue
+        fi
         candidates+=("${cuda_root}/include")
         scan_roots+=("${cuda_root}")
         while IFS= read -r candidate; do
@@ -461,6 +641,14 @@ find_cuda_include_dirs() {
 
         candidate="$(cd -- "${candidate}" && pwd)"
         if [[ -n "${seen[${candidate}]:-}" ]]; then
+            continue
+        fi
+
+        # Drop include dirs carrying a cuda.h from a different CUDA version so
+        # a stray cuda-13.0 path (e.g. inherited via CPATH) cannot override the
+        # cuda_home the build selected.
+        if [[ -n "${cuda_home}" && -f "${candidate}/cuda.h" ]] \
+            && ! cuda_root_matches_home "${candidate%/include}" "${cuda_home}"; then
             continue
         fi
 
@@ -1480,6 +1668,7 @@ if ! run_logged truncate pip_install -r requirements/build/cuda.txt numpy; then
 fi
 
 clean_stale_deepgemm_artifacts
+clean_relocated_cmake_caches
 
 echo "Installing vLLM editable package."
 if run_logged append pip_install --no-build-isolation -e . "$@"; then
