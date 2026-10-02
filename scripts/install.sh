@@ -40,6 +40,10 @@ AUTO_INSTALL_MODERN_GXX="${AUTO_INSTALL_MODERN_GXX:-1}"
 UV_TORCH_BACKEND="${UV_TORCH_BACKEND:-${TORCH_BACKEND:-auto}}"
 LOG_FLASH_ATTN_BUILD="${LOG_FLASH_ATTN_BUILD:-1}"
 REFRESH_DEEPGEMM="${REFRESH_DEEPGEMM:-1}"
+# Build and install the vLLM Rust artifacts after a successful editable
+# install. Set to 0/false to skip. Pass BUILD_RUST_DEBUG=1 for a debug build.
+BUILD_RUST="${BUILD_RUST:-1}"
+BUILD_RUST_SCRIPT="${BUILD_RUST_SCRIPT:-build_rust.sh}"
 
 if [[ "${VLLM_USE_PRECOMPILED:-}" =~ ^(1|true)$ ]]; then
     echo "error: scripts/install.sh only supports installing vLLM from source." >&2
@@ -182,6 +186,91 @@ ensure_uv() {
     command -v uv >/dev/null 2>&1
 }
 
+# True when every torch-ecosystem package that vLLM pulls in publishes a wheel
+# for the given CUDA backend tag (e.g. cu130). uv's `--torch-backend=auto` only
+# looks at torch itself, so it can select a tag (e.g. cu132) for which the
+# companion packages have no matching wheel, leaving the environment with a
+# torch cu132 next to a torchaudio cu130 that refuses to load.
+torch_backend_has_full_set() {
+    local backend="$1"
+    local index="https://download.pytorch.org/whl/${backend}"
+    local pkg
+
+    local output
+
+    for pkg in torch torchaudio torchvision torchcodec; do
+        # `pip index versions` emits either a multi-line "Available versions:"
+        # list (TTY) or a compact "pkg (x.y.z+tag)" line (non-TTY); both carry
+        # the "+<backend>" marker. Capture output first (rather than piping into
+        # `grep -q`) so `set -o pipefail` doesn't trip on pip's SIGPIPE when grep
+        # closes the pipe early.
+        output="$("${PYTHON_BIN}" -m pip index versions "${pkg}" --index-url "${index}" 2>/dev/null || true)"
+        if ! printf '%s\n' "${output}" | grep -qiE "\+${backend}([^0-9a-z]|$)"; then
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+# Resolve UV_TORCH_BACKEND=auto to a concrete CUDA tag that has a *consistent*
+# set of torch wheels. Probes tags derived from the detected CUDA version and
+# descends to lower CUDA minor versions until one publishes torch and all of
+# its companions. Leaves non-auto values (cpu, explicit cuXYZ, etc.) untouched.
+resolve_torch_backend() {
+    if [[ "${UV_TORCH_BACKEND}" != "auto" ]]; then
+        return 0
+    fi
+
+    if ! uv pip install --help 2>/dev/null | grep -q -- "--torch-backend"; then
+        return 0
+    fi
+
+    local cuda_version=""
+    local major=""
+    local minor=""
+    local detected_tag=""
+    local -a candidates=()
+    local -A seen=()
+    local backend
+    local m
+
+    cuda_version="$(detect_cuda_version "${CUDA_HOME_DETECTED:-}" || true)"
+    if [[ "${cuda_version}" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
+        major="${BASH_REMATCH[1]}"
+        minor="${BASH_REMATCH[2]}"
+        detected_tag="cu${major}${minor}"
+        # Prefer the exact detected tag, then step down through lower minors of
+        # the same major (cu132 -> cu131 -> cu130), which is where the complete
+        # torch stack is published.
+        for (( m = minor; m >= 0; m-- )); do
+            candidates+=("cu${major}${m}")
+        done
+    fi
+
+    # Fallback sweep of known CUDA tags (newest first) in case detection is off
+    # or the detected major has no complete set.
+    candidates+=(cu132 cu131 cu130 cu129 cu128 cu126)
+
+    for backend in "${candidates[@]}"; do
+        if [[ -n "${seen[${backend}]:-}" ]]; then
+            continue
+        fi
+        seen["${backend}"]=1
+
+        if torch_backend_has_full_set "${backend}"; then
+            if [[ -n "${detected_tag}" && "${backend}" != "${detected_tag}" ]]; then
+                echo "note: torch '${backend}' has a complete wheel set; using it instead of the auto-detected ${detected_tag} (which lacks matching torchaudio/torchvision/torchcodec)." >&2
+            fi
+            export UV_TORCH_BACKEND="${backend}"
+            return 0
+        fi
+    done
+
+    echo "warning: could not find a CUDA torch backend with a complete torch/torchaudio/torchvision/torchcodec set; leaving --torch-backend=auto." >&2
+    return 0
+}
+
 pip_install() {
     local -a uv_args=()
 
@@ -211,6 +300,30 @@ run_logged() {
         "$@" 2>&1 | tee "${INSTALL_LOG}"
     fi
     return "${PIPESTATUS[0]}"
+}
+
+# Build and install the vLLM Rust artifacts. Runs only after the rest of the
+# install succeeds. Honors BUILD_RUST (enable/disable) and BUILD_RUST_DEBUG
+# (debug vs release). Output is appended to INSTALL_LOG.
+run_rust_build() {
+    if [[ ! "${BUILD_RUST}" =~ ^(1|true)$ ]]; then
+        echo "Skipping Rust build (BUILD_RUST=${BUILD_RUST})."
+        return 0
+    fi
+
+    local script_path="${ROOT_DIR}/${BUILD_RUST_SCRIPT}"
+    if [[ ! -f "${script_path}" ]]; then
+        echo "error: Rust build script not found: ${script_path}" >&2
+        return 1
+    fi
+
+    if [[ "${BUILD_RUST_DEBUG:-}" =~ ^(1|true)$ ]]; then
+        echo "Building vLLM Rust artifacts (${BUILD_RUST_SCRIPT} --debug)."
+        run_logged append bash "${script_path}" --debug
+    else
+        echo "Building vLLM Rust artifacts (${BUILD_RUST_SCRIPT})."
+        run_logged append bash "${script_path}"
+    fi
 }
 
 install_log_indicates_flash_attn_fetch_failure() {
@@ -1659,6 +1772,12 @@ if [[ "${LOG_FLASH_ATTN_BUILD}" =~ ^(1|true)$ ]]; then
     echo "Verbose flash-attention build logging is enabled."
 fi
 
+# Pin an auto torch backend to a CUDA tag with a consistent wheel set so torch
+# and its companions (torchaudio/torchvision/torchcodec) share one CUDA version.
+if ensure_uv; then
+    resolve_torch_backend
+fi
+
 # When build isolation is disabled, setuptools.build_meta imports run inside the
 # active environment. Install the mirrored build requirements first so setup.py
 # can import torch during editable metadata generation.
@@ -1672,7 +1791,13 @@ clean_relocated_cmake_caches
 
 echo "Installing vLLM editable package."
 if run_logged append pip_install --no-build-isolation -e . "$@"; then
-    exit 0
+    # Editable install (and everything before it) succeeded; now build the Rust
+    # artifacts. A Rust build failure fails the installer.
+    if run_rust_build; then
+        exit 0
+    fi
+    echo "error: vLLM editable install succeeded but the Rust build failed." >&2
+    exit 1
 fi
 
 if install_log_indicates_flash_attn_fetch_failure; then
